@@ -48,6 +48,14 @@ from r20_gateway.telemetry import ModelCallTelemetry
 
 TARGET_INSTRUMENTS = load_instruments()
 
+# Keep the live decision request bounded enough for an unattended trading cycle.
+# The newest candles and derived indicators carry the signal; older candles add
+# prompt size without improving the execution decision proportionally.
+PROMPT_15M_CANDLE_LIMIT = 8
+PROMPT_1H_CANDLE_LIMIT = 8
+PROMPT_4H_CANDLE_LIMIT = 6
+TRADING_LLM_TIMEOUT_SECONDS = 90.0
+
 def atomic_write_json(path: str, payload: Any) -> None:
     """Replace JSON atomically so readers never observe a partial cache."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -559,9 +567,9 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
 - ⚅ 概率论与统计风险: {prob_line}
 - ∂ 分周期速度/加速度/冲量: {calc_tf_line or 'UNKNOWN'}
 - 衍生品博弈: 资金费率: {p['fundingRate']}% | OI未平仓: {p['oiUsd']} | 多空比: {p['lsRatio']} | 5M主动吃单净差: {p['takerNetUsd']}
-- 15M K线(倒序12根 [O,H,L,C,V]): {k15}
-- 1H K线(倒序12根 [O,H,L,C,V]): {k1h}
-- 4H K线(倒序8根 [O,H,L,C,V]): {k4h}"""
+- 15M K线(倒序{PROMPT_15M_CANDLE_LIMIT}根 [O,H,L,C,V]): {k15[:PROMPT_15M_CANDLE_LIMIT]}
+- 1H K线(倒序{PROMPT_1H_CANDLE_LIMIT}根 [O,H,L,C,V]): {k1h[:PROMPT_1H_CANDLE_LIMIT]}
+- 4H K线(倒序{PROMPT_4H_CANDLE_LIMIT}根 [O,H,L,C,V]): {k4h[:PROMPT_4H_CANDLE_LIMIT]}"""
         market_lines.append(info)
 
     all_market_str = "\n".join(market_lines)
@@ -945,7 +953,7 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
                     reasoning_effort=effort,
                     temperature=0.2,
                     response_format={"type": "json_object"},
-                    timeout=50.0,
+                    timeout=TRADING_LLM_TIMEOUT_SECONDS,
                 )
                 raw_res = {"usage": usage_dict} if isinstance(usage_dict, dict) else {}
             else:

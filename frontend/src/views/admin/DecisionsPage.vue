@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useApi } from '../../composables/useApi'
 import { Terminal, RefreshCw } from 'lucide-vue-next'
 
@@ -9,6 +9,7 @@ const logs = ref<string[]>([])
 const activeLogTab = ref<'trader' | 'backend' | 'scheduler'>('trader')
 const logContent = ref<string>('')
 const logLoading = ref(false)
+let logRefreshTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadDecisions() {
   loading.value = true
@@ -36,8 +37,15 @@ async function fetchLogStream(type: 'trader' | 'backend' | 'scheduler') {
   }
 }
 
-onMounted(() => {
-  loadDecisions()
+onMounted(async () => {
+  await loadDecisions()
+  logRefreshTimer = setInterval(() => {
+    fetchLogStream(activeLogTab.value)
+  }, 3000)
+})
+
+onUnmounted(() => {
+  if (logRefreshTimer) clearInterval(logRefreshTimer)
 })
 </script>
 

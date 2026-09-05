@@ -77,7 +77,7 @@ const tabs = [
         <span
           class="w-1.5 h-1.5 rounded-full shrink-0"
           :class="store.isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'"
-          title="OKX V5 PROD 运行状态"
+                   :title="'OKX V5 ' + (store.data?.okx_environment || 'UNKNOWN').toUpperCase() + ' 运行状态'"
         ></span>
         <span
           v-if="store.isStale"

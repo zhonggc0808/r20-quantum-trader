@@ -528,7 +528,10 @@ def upsert_model(provider_id: str, model_data: Dict[str, Any]) -> Dict[str, Any]
     api_format = str(model_data.get("api_format", "openai_chat")).strip()
     provider_name = str(model_data.get("provider_name", "")).strip()
     reasoning_type = str(model_data.get("reasoning_type", "auto")).strip()
-    default_effort = str(model_data.get("default_effort") or model_data.get("reasoning_effort", "high")).strip()
+    requested_effort = model_data.get("reasoning_effort")
+    if requested_effort is None:
+        requested_effort = model_data.get("default_effort")
+    default_effort = str(requested_effort or "high").strip()
     desc = str(model_data.get("description", "")).strip()
     caps = model_data.get("capabilities") or _detect_capabilities(mid)
     ctx_len = model_data.get("context_length")

@@ -1,6 +1,7 @@
 """Single-owner process supervisor for the R20 Gateway worker."""
 from __future__ import annotations
 import os
+import pwd
 import signal
 import subprocess
 import sys
@@ -45,8 +46,13 @@ def ensure_worker() -> int:
     pid=current_pid()
     if pid: return pid
     LOG_FILE.parent.mkdir(parents=True,exist_ok=True)
+    child_env = os.environ.copy()
+    child_env.setdefault("HOME", str(Path.home()))
+    account_name = pwd.getpwuid(os.getuid()).pw_name
+    child_env.setdefault("USER", account_name)
+    child_env.setdefault("LOGNAME", account_name)
     with LOG_FILE.open("a",encoding="utf-8") as log:
-        process=subprocess.Popen([sys.executable,"-m","r20_gateway.worker"],cwd=ROOT,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT)
+        process=subprocess.Popen([sys.executable,"-m","r20_gateway.worker"],cwd=ROOT,env=child_env,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT)
     PID_FILE.write_text(str(process.pid),encoding="utf-8"); os.chmod(PID_FILE,0o600); _owned_pid=process.pid
     return process.pid
 

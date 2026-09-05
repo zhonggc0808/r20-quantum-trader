@@ -68,7 +68,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     api_format: 'openai_chat',
   })
   const logs = computed(() => data.value?.logs || [])
-  const isStale = computed(() => data.value?.is_stale ?? false)
+  const isStale = computed(() => data.value?.is_stale ?? data.value?.data_health?.status === 'STALE')
 
   // Actions
   async function fetchDashboard(silent = false) {

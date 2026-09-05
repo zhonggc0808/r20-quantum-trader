@@ -103,6 +103,17 @@ export interface LLMRuntime {
 
 export interface DashboardResponse {
   timestamp: string
+  okx_environment?: 'demo' | 'live'
+  account_source?: string
+  data_health?: {
+    status?: string
+    partial?: boolean
+    errors?: string[]
+    last_success_at?: string
+    attempted_at?: string
+    cache_age_seconds?: number | null
+    environment?: 'demo' | 'live'
+  }
   is_stale: boolean
   account: AccountSummary
   positions_summary: {

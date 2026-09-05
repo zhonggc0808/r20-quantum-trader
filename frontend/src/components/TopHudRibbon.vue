@@ -6,6 +6,7 @@ import { Wallet, TrendingUp, Calendar, Activity, ShieldCheck, ArrowDownRight } f
 const store = useDashboardStore()
 const account = computed(() => store.data?.account || {})
 const today = computed(() => store.data?.today_stats || {})
+const environment = computed(() => (store.data?.okx_environment || 'unknown').toUpperCase())
 
 const totalEq = computed(() => Number(account.value.total_eq || 0).toFixed(2))
 const availEq = computed(() => Number(account.value.avail_eq || 0).toFixed(2))
@@ -69,7 +70,7 @@ const allProtected = computed(() =>
           class="text-[9px] font-mono px-1.5 py-0.5 rounded border font-bold"
           style="background-color: var(--bg-badge); color: var(--text-muted); border-color: var(--border-subtle);"
         >
-          OKX V5 PROD
+          OKX V5 {{ environment }}
         </span>
       </div>
 

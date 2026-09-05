@@ -4,7 +4,7 @@ Web Dashboard Application Module
 from __future__ import annotations
 from typing import Any
 from pathlib import Path
-from scripts.okx_runtime import replace_cli_prefix as okx_private_command
+from scripts.okx_runtime import replace_cli_prefix as okx_private_command, selected_environment
 from scripts.instrument_pool import load_instruments
 import os
 import json
@@ -409,6 +409,7 @@ def update_cache_cycle():
     now_bj = datetime.datetime.now(tz_beijing)
     today_bj_str = now_bj.strftime("%Y-%m-%d")
     timestamp_full = now_bj.strftime("%Y-%m-%d %H:%M:%S (北京时间)")
+    okx_environment = selected_environment().mode
 
     source_errors = []
 
@@ -596,13 +597,14 @@ def update_cache_cycle():
 
     # A failed core account query must never overwrite last-known-good data with zeros.
     if not balance_ok or not positions_ok:
-        if _is_meaningful_dashboard_snapshot(CACHE_DATA):
+        if _is_meaningful_dashboard_snapshot(CACHE_DATA) and CACHE_DATA.get("okx_environment") == okx_environment:
             stale = dict(CACHE_DATA)
             stale_positions = (stale.get("positions_summary") or {}).get("items", [])
             enrich_position_risk_fields(stale_positions, trackers)
             stale["data_health"] = {
                 "status": "STALE",
                 "partial": True,
+                "environment": okx_environment,
                 "errors": source_errors,
                 "last_success_at": CACHE_DATA.get("timestamp"),
                 "attempted_at": timestamp_full,
@@ -617,6 +619,7 @@ def update_cache_cycle():
             return
         CACHE_DATA = {
             "timestamp": timestamp_full,
+            "okx_environment": okx_environment,
             "data_health": {"status": "OFFLINE", "partial": True, "errors": source_errors},
             "account": {}, "today_stats": {}, "performance": {},
             "positions_summary": {"total": 0, "max_positions": len(load_instruments()), "items": []},
@@ -1094,9 +1097,12 @@ def update_cache_cycle():
     CACHE_DATA = {
         "timestamp": timestamp_full,
         "date": today_bj_str,
+        "okx_environment": okx_environment,
+        "account_source": "OKX V5 " + okx_environment.upper(),
         "data_health": {
             "status": "LIVE" if not source_errors else "PARTIAL",
             "partial": bool(source_errors),
+            "environment": okx_environment,
             "errors": source_errors,
             "last_success_at": timestamp_full,
             "cache_age_seconds": 0,

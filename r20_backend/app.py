@@ -216,7 +216,7 @@ class LLMModelUpsertRequest(BaseModel):
     api_key: str | None = None
     api_format: str = "openai_chat"
     reasoning_type: str = "auto"
-    default_effort: str = "high"
+    default_effort: str | None = None
     reasoning_effort: str | None = None
     capabilities: list[str] | None = None
     context_length: int | None = None

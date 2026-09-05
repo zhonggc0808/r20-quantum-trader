@@ -31,6 +31,12 @@ from typing import Tuple, Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if not os.environ.get("HOME"):
+    os.environ["HOME"] = os.path.expanduser("~")
+if not os.environ.get("USER"):
+    os.environ["USER"] = os.environ.get("LOGNAME") or "root"
+if not os.environ.get("LOGNAME"):
+    os.environ["LOGNAME"] = os.environ["USER"]
 DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
 LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 

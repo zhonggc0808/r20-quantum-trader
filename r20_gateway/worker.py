@@ -55,6 +55,8 @@ def run() -> None:
     scheduler = GatewayScheduler(store)
     scheduler.initialize_migration_baseline()
     log("gateway worker started with scheduler ownership")
+    if scheduler.run_now("trader"):
+        log("startup immediate job=trader")
     while RUNNING:
         launched = scheduler.tick()
         for job_name in launched:

@@ -164,6 +164,20 @@ class LLMMultiProviderTests(unittest.TestCase):
         deleted = llm_manager.delete_model("custom", "claude-3-7-custom")
         self.assertTrue(deleted)
 
+    def test_explicit_reasoning_effort_overrides_legacy_default(self):
+        llm_manager.upsert_model("custom", {
+            "id": "reasoning-test",
+            "name": "Reasoning Test",
+            "base_url": "https://api.openai.com/v1",
+            "api_format": "openai_chat",
+            "default_effort": "high",
+            "reasoning_effort": "medium",
+        })
+
+        config = json.loads(llm_manager.LLM_CONFIG_FILE.read_text(encoding="utf-8"))
+        saved = next(model for model in config["models"] if model["id"] == "reasoning-test")
+        self.assertEqual(saved["reasoning_effort"], "medium")
+
     @patch("urllib.request.urlopen")
     def test_connection_test_claude_messages(self, mock_urlopen):
         mock_response = MagicMock()

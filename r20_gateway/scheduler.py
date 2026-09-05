@@ -115,6 +115,15 @@ class GatewayScheduler:
             return False
         return not last or last.date() != now.date() or last.strftime("%H:%M") != minute
 
+    def run_now(self, name: str) -> bool:
+        """Queue one immediate run, used for startup diagnostics/health checks."""
+        spec = next((item for item in current_jobs() if item.name == name), None)
+        if spec is None or name in self.running:
+            return False
+        self.store.set_state(f"job.last.{name}", datetime.now(BJ_TZ).isoformat())
+        self.running[name] = self.executor.submit(self._execute, spec)
+        return True
+
     def _execute(self, spec: JobSpec) -> None:
         run_id = self.store.begin_job(spec.name)
         try:
