@@ -32,6 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 COUNCIL_CONFIG_FILE = DATA_DIR / "council_config.json"
 
+VALID_CONSENSUS_MODES = {"standard", "cross_examination"}
+DEFAULT_CONSENSUS_MODE = "standard"
+MIN_SAFE_REASONING_TIME: float = 5.0
+DEFAULT_COUNCIL_TIMEOUT: float = 60.0
+
 DEFAULT_PRESET_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "trader_trend": {
         "id": "trader_trend",
@@ -141,8 +146,8 @@ COUNCIL_PRESET_SUITES: Dict[str, Dict[str, Any]] = {
     "hedge_fund_desk": {
         "id": "hedge_fund_desk",
         "name": "对冲基金投委会标准台 (Hedge Fund Desk)",
-        "desc": "全息审阅账户资金、持仓与挂单，Trader A/B/C 提交完整方案互相质询，CIO 交易总监终审裁定",
-        "consensus_mode": "weighted",
+        "desc": "全息审阅账户资金、持仓与挂单，Trader A/B/C 提案与 CIO 终审查决",
+        "consensus_mode": "standard",
         "roles": ["trader_trend", "trader_momentum", "trader_quant", "cio"],
     },
 }
@@ -165,14 +170,17 @@ def load_council_config() -> Dict[str, Any]:
             if isinstance(data, dict) and "roles" in data:
                 roles = data.get("roles", {})
                 if "trader_trend" in roles or "cio" in roles:
+                    mode = str(data.get("consensus_mode", DEFAULT_CONSENSUS_MODE)).strip().lower()
+                    if mode not in VALID_CONSENSUS_MODES:
+                        data["consensus_mode"] = DEFAULT_CONSENSUS_MODE
                     return data
         except Exception:
             pass
 
     default_config: Dict[str, Any] = {
         "enabled": False,
-        "consensus_mode": "weighted",
-        "timeout_seconds": 60.0,
+        "consensus_mode": DEFAULT_CONSENSUS_MODE,
+        "timeout_seconds": DEFAULT_COUNCIL_TIMEOUT,
         "roles": {k: dict(v) for k, v in DEFAULT_PRESET_TEMPLATES.items()},
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -200,9 +208,10 @@ def save_council_config(config: Dict[str, Any]) -> Dict[str, Any]:
         role.setdefault("reasoning_effort", "medium")
         role.setdefault("temperature", 0.2)
 
-    config["consensus_mode"] = str(config.get("consensus_mode", "weighted")).lower()
-    if config["consensus_mode"] not in {"strict", "weighted", "aggressive"}:
-        config["consensus_mode"] = "weighted"
+    mode = str(config.get("consensus_mode", DEFAULT_CONSENSUS_MODE)).strip().lower()
+    if mode not in VALID_CONSENSUS_MODES:
+        mode = DEFAULT_CONSENSUS_MODE
+    config["consensus_mode"] = mode
 
     config["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     _atomic_write_json(COUNCIL_CONFIG_FILE, config)
@@ -231,7 +240,7 @@ def apply_preset_suite(suite_id: str) -> Dict[str, Any]:
             preset["model_id"] = old_model
             new_roles[r_id] = preset
 
-    config["consensus_mode"] = suite.get("consensus_mode", "weighted")
+    config["consensus_mode"] = suite.get("consensus_mode", DEFAULT_CONSENSUS_MODE)
     config["roles"] = new_roles
     return save_council_config(config)
 
@@ -290,6 +299,7 @@ def _call_single_trader(
 
     prompt_content = role_spec.get("prompt", "")
     role_name = role_spec.get("name", role_id)
+    proposal_id = f"{role_id}_prop"
 
     trader_system_prompt = (
         f"【最高交易宪法与策略纪律】\n"
@@ -297,13 +307,14 @@ def _call_single_trader(
         f"====================================================\n"
         f"【你的交易员身份与操盘职责】\n"
         f"{prompt_content}\n"
-        f"注意：你作为专业交易员，必须在上述【最高交易宪法】框架内提交实战作战提案（Pitch），重点覆盖【账户可用余额】、【在途持仓动态处理】、【在途未成交挂单撤留】与【新标的点位规划】！"
+        f"注意：你作为专业交易员，必须在上述【最高交易宪法】框架内提交实战作战提案（提案标识: {proposal_id}），"
+        f"重点覆盖【账户可用余额】、【在途持仓动态处理】、【在途未成交挂单撤留】与【新标的点位规划】！"
     )
 
     trader_user_prompt = (
         f"【当前全景市场数据、账户资金与在途持仓挂单】\n"
         f"{market_prompt}\n\n"
-        f"请以你「{role_name}」的专业视角，向首席投资官 (CIO) 提交本轮实操审查与作战方案：\n"
+        f"请以你「{role_name}」（提案标识: {proposal_id}）的专业视角，向首席投资官 (CIO) 提交本轮实操审查与作战方案：\n"
         f"1. 账户持仓与挂单审查：\n"
         f"   - 对在途持仓逐一给出管理建议：HOLD（波段完好继续持有）、CLOSE_MARKET（结构破位斩仓）或 UPDATE_SL（浮盈锁定移动止损）；\n"
         f"   - 对在途未成交限价挂单逐一给出建议：CANCEL（偏离盘口或动能失效立即撤单）或 KEEP（继续保留）；\n"
@@ -329,6 +340,7 @@ def _call_single_trader(
             timeout=timeout,
         )
         return {
+            "proposal_id": proposal_id,
             "role_id": role_id,
             "role_name": role_name,
             "model_used": override_model or get_active_llm_runtime().get("model", "default"),
@@ -340,6 +352,7 @@ def _call_single_trader(
         }
     except Exception as e:
         return {
+            "proposal_id": proposal_id,
             "role_id": role_id,
             "role_name": role_name,
             "model_used": override_model or "unknown",
@@ -351,6 +364,100 @@ def _call_single_trader(
         }
 
 
+def _call_single_trader_critique(
+    role_id: str,
+    role_spec: Dict[str, Any],
+    my_proposal: str,
+    peer_proposals: str,
+    master_constitutional_rules: str,
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """Invokes a senior trader role to cross-examine peer proposals for hidden risks, timing, or sizing flaws."""
+    from r20_backend.llm_manager import execute_llm_request, get_active_llm_runtime, load_llm_config
+
+    model_id = role_spec.get("model_id") or ""
+    override_model = None
+    override_url = None
+    override_key = None
+    override_format = None
+    override_effort = role_spec.get("reasoning_effort") or "medium"
+    temperature = float(role_spec.get("temperature", 0.2))
+
+    cfg = load_llm_config(mask_keys=False)
+    if model_id:
+        for item in cfg.get("models", []):
+            if item.get("id") == model_id:
+                override_model = item.get("id")
+                override_url = item.get("base_url")
+                override_key = item.get("api_key")
+                override_format = item.get("api_format")
+                override_effort = item.get("reasoning_effort") or override_effort
+                break
+    else:
+        override_effort = cfg.get("active_reasoning_effort", "medium")
+
+    prompt_content = role_spec.get("prompt", "")
+    role_name = role_spec.get("name", role_id)
+
+    critique_system_prompt = (
+        f"【最高交易宪法与策略纪律】\n"
+        f"{master_constitutional_rules}\n\n"
+        f"====================================================\n"
+        f"【你的交易员身份与操盘职责】\n"
+        f"{prompt_content}\n"
+        f"注意：你现在进入第二轮「同行方案交叉漏洞质询（Cross-Examination）」。你的职责是站在你的专业立场，严肃审查同行交易员的方案，指出其盲区、追高风险或防插针止损不足！"
+    )
+
+    critique_user_prompt = (
+        f"【你第一轮提交的作战提案】\n"
+        f"{my_proposal}\n\n"
+        f"====================================================\n"
+        f"【同行交易员提交的第一轮作战提案卷宗】\n"
+        f"{peer_proposals}\n\n"
+        f"====================================================\n"
+        f"请以你「{role_name}」的专业视角，对同行的方案展开针对性质询（Cross-Examination）：\n"
+        f"1. 逐一质询同行方案在点位入场（是否追高）、2.0x ATR 止损距离、拟用保证金或假突破风险上的漏洞；\n"
+        f"2. 明确论证为何你的方案在当前资金与市场环境下更安全或盈亏比更优；\n"
+        f"3. 保持专业精炼，直击漏洞要害。"
+    )
+
+    messages = [
+        {"role": "system", "content": critique_system_prompt},
+        {"role": "user", "content": critique_user_prompt},
+    ]
+
+    try:
+        content, reasoning, usage, latency = execute_llm_request(
+            messages=messages,
+            model=override_model,
+            base_url=override_url,
+            api_key=override_key,
+            api_format=override_format,
+            reasoning_effort=override_effort,
+            temperature=temperature,
+            timeout=timeout,
+        )
+        return {
+            "role_id": role_id,
+            "role_name": role_name,
+            "model_used": override_model or get_active_llm_runtime().get("model", "default"),
+            "status": "ok",
+            "content": content.strip(),
+            "reasoning": reasoning.strip() if reasoning else "",
+            "latency_ms": latency,
+        }
+    except Exception as e:
+        return {
+            "role_id": role_id,
+            "role_name": role_name,
+            "model_used": override_model or "unknown",
+            "status": "error",
+            "content": f"质询提交异常/超时降级: {e}",
+            "reasoning": "",
+            "latency_ms": 0,
+        }
+
+
 def execute_council_debate(
     market_prompt: str,
     original_system_prompt: str,
@@ -358,19 +465,38 @@ def execute_council_debate(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Execute Hedge Fund Investment Committee Deliberation:
 
-    1. All Senior Traders review available balance, positions, orders, and submit complete trade proposals.
-    2. CIO reviews proposals, cross-examinations, arbitrates which trader's plan to fund,
-       and outputs the final standard trading JSON contract covering decisions,
-       position_management, and pending_orders_management.
+    Converged Real Modes:
+    - "standard": 1-round trader proposals -> compiled docket -> CIO final verdict.
+    - "cross_examination": Round 1 proposals -> Round 2 peer cross-examination -> CIO verdict.
+
+    Strict Timeout Control:
+    - Anchored on deadline = t_start + timeout.
+    - Dynamically evaluates rem = deadline - time.time() before every stage.
+    - Safely downgrades or raises TimeoutError if remaining budget < MIN_SAFE_REASONING_TIME (5.0s).
+
+    Structured Contract & Adoption Traceability:
+    - Proposals are tagged with proposal_id (e.g. trader_trend_prop).
+    - CIO decisions must include adopted_role (e.g. 'trader_trend' or 'REJECT_ALL'/None).
     """
     from r20_backend.llm_manager import execute_llm_request, get_active_llm_runtime, load_llm_config
 
     config = load_council_config()
     roles = config.get("roles", {})
-    consensus_mode = config.get("consensus_mode", "weighted")
-    t_start = time.time()
+    consensus_mode = str(config.get("consensus_mode", DEFAULT_CONSENSUS_MODE)).strip().lower()
+    if consensus_mode not in VALID_CONSENSUS_MODES:
+        consensus_mode = DEFAULT_CONSENSUS_MODE
 
-    # Step 1: Identify CIO (Arbitrator) and Active Traders
+    t_start = time.time()
+    effective_timeout = max(1.0, float(timeout))
+    deadline = t_start + effective_timeout
+
+    rem = deadline - time.time()
+    if rem < MIN_SAFE_REASONING_TIME:
+        raise TimeoutError(
+            f"Council deliberation timeout: remaining time {rem:.2f}s is below safety threshold {MIN_SAFE_REASONING_TIME}s"
+        )
+
+    # Identify CIO (Arbitrator) and Active Traders
     cio_key = next(
         (k for k, r in roles.items() if r.get("is_arbitrator") or k in {"cio", "arbitrator"}),
         "cio",
@@ -382,8 +508,106 @@ def execute_council_debate(
     ]
 
     trader_proposals: Dict[str, Dict[str, Any]] = {}
-    if trader_keys:
-        member_timeout = max(15.0, timeout * 0.50)
+    trader_critiques: Dict[str, Dict[str, Any]] = {}
+
+    if not trader_keys:
+        # Fallback: Solo CIO decision if no active traders enabled
+        pass
+    elif consensus_mode == "cross_examination":
+        # === MODE: Cross-Examination (Double-Round Real Debate) ===
+        rem = deadline - time.time()
+        if rem < MIN_SAFE_REASONING_TIME * 2.0:
+            raise TimeoutError(
+                f"Council timeout: remaining time {rem:.2f}s insufficient for cross-examination mode (requires >= {MIN_SAFE_REASONING_TIME * 2.0}s)"
+            )
+
+        # Stage 1: Round 1 Independent Proposals
+        round1_budget = max(2.0, min(rem * 0.35, rem - (MIN_SAFE_REASONING_TIME * 2.0)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(trader_keys))) as pool:
+            futures = {
+                pool.submit(
+                    _call_single_trader,
+                    key,
+                    roles[key],
+                    market_prompt,
+                    original_system_prompt,
+                    round1_budget,
+                ): key
+                for key in trader_keys
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                key = futures[fut]
+                try:
+                    trader_proposals[key] = fut.result()
+                except Exception as exc:
+                    trader_proposals[key] = {
+                        "proposal_id": f"{key}_prop",
+                        "role_id": key,
+                        "role_name": roles[key].get("name", key),
+                        "status": "error",
+                        "content": f"Proposal exception: {exc}",
+                        "weight": 0.0,
+                    }
+
+        # Stage 2: Round 2 Cross-Examination Critiques
+        rem = deadline - time.time()
+        if rem < MIN_SAFE_REASONING_TIME + 2.0:
+            # Insufficient budget for second round -> safe degradation: skip critiques to preserve CIO verdict
+            for k in trader_keys:
+                trader_critiques[k] = {
+                    "role_id": k,
+                    "role_name": roles[k].get("name", k),
+                    "status": "skipped",
+                    "content": f"时间预算紧缺 (剩余 {rem:.2f}s < 7.0s)，安全降级跳过交叉质询以确保 CIO 终审",
+                    "latency_ms": 0,
+                }
+        else:
+            round2_budget = max(2.0, min(rem * 0.40, rem - MIN_SAFE_REASONING_TIME))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(trader_keys))) as pool:
+                critique_futures = {}
+                for k in trader_keys:
+                    my_prop = trader_proposals.get(k, {}).get("content", "（该交易员第一轮未提交有效提案）")
+                    peers_text_list = []
+                    for pk in trader_keys:
+                        if pk != k:
+                            p_res = trader_proposals.get(pk, {})
+                            p_id = p_res.get("proposal_id", f"{pk}_prop")
+                            p_name = p_res.get("role_name", pk)
+                            peers_text_list.append(
+                                f"=== 【{p_name}】(提案标识: {p_id}) ===\n"
+                                f"{p_res.get('content', '（未提交）')}"
+                            )
+                    peers_text = "\n\n".join(peers_text_list) if peers_text_list else "（无其他同行提案）"
+                    critique_futures[pool.submit(
+                        _call_single_trader_critique,
+                        k,
+                        roles[k],
+                        my_prop,
+                        peers_text,
+                        original_system_prompt,
+                        round2_budget,
+                    )] = k
+                for fut in concurrent.futures.as_completed(critique_futures):
+                    k = critique_futures[fut]
+                    try:
+                        trader_critiques[k] = fut.result()
+                    except Exception as exc:
+                        trader_critiques[k] = {
+                            "role_id": k,
+                            "role_name": roles[k].get("name", k),
+                            "status": "error",
+                            "content": f"质询异常: {exc}",
+                            "latency_ms": 0,
+                        }
+    else:
+        # === MODE: Standard (Single-Round Proposals -> CIO Verdict) ===
+        rem = deadline - time.time()
+        if rem < MIN_SAFE_REASONING_TIME + 2.0:
+            raise TimeoutError(
+                f"Council timeout: remaining time {rem:.2f}s insufficient for standard deliberation (requires >= {MIN_SAFE_REASONING_TIME + 2.0}s)"
+            )
+
+        member_timeout = max(2.0, min(rem * 0.50, rem - MIN_SAFE_REASONING_TIME))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(trader_keys))) as pool:
             futures = {
                 pool.submit(
@@ -402,6 +626,7 @@ def execute_council_debate(
                     trader_proposals[key] = fut.result()
                 except Exception as exc:
                     trader_proposals[key] = {
+                        "proposal_id": f"{key}_prop",
                         "role_id": key,
                         "role_name": roles[key].get("name", key),
                         "status": "error",
@@ -409,18 +634,42 @@ def execute_council_debate(
                         "weight": 0.0,
                     }
 
-    # Step 2: Compile the Structured Investment Committee Docket
+    # Compile the Structured Investment Committee Docket
     transcript_blocks = []
     for k in trader_keys:
         res = trader_proposals.get(k, {})
         weight_str = f" [绩效权重: {res.get('weight', 1.0)}]" if res.get("weight") is not None else ""
+        p_id = res.get("proposal_id", f"{k}_prop")
         transcript_blocks.append(
-            f"=== 【{res.get('role_name', k)}】实操审查与作战提案（模型：{res.get('model_used', 'default')}{weight_str}）===\n"
+            f"=== 【{res.get('role_name', k)}】实操审查与作战提案 [提案标识: {p_id}]（模型：{res.get('model_used', 'default')}{weight_str}）===\n"
             f"{res.get('content', '（该交易员本轮未提交有效提案）')}\n"
         )
     compiled_proposals = "\n".join(transcript_blocks) if transcript_blocks else "（无其他交易员提交方案，首席投资官独立决策）"
 
-    # Step 3: CIO Final Review & Funding Verdict
+    if consensus_mode == "cross_examination" and trader_critiques:
+        critique_blocks = []
+        for k in trader_keys:
+            c_res = trader_critiques.get(k, {})
+            critique_blocks.append(
+                f"=== 【{c_res.get('role_name', k)}】针对同行方案的交叉漏洞质询 ===\n"
+                f"{c_res.get('content', '（该交易员未提交质询）')}\n"
+            )
+        compiled_critiques = "\n".join(critique_blocks)
+        docket_content = (
+            f"【第一轮：各交易员独立作战提案卷宗】\n{compiled_proposals}\n\n"
+            f"====================================================\n"
+            f"【第二轮：同行方案交叉漏洞质询与攻防辩论】\n{compiled_critiques}"
+        )
+    else:
+        docket_content = f"【交易员实战作战提案卷宗】\n{compiled_proposals}"
+
+    # CIO Final Review & Funding Verdict
+    rem = deadline - time.time()
+    if rem < MIN_SAFE_REASONING_TIME:
+        raise TimeoutError(
+            f"Council deliberation timeout before CIO arbitration: {rem:.2f}s remaining is below safety threshold {MIN_SAFE_REASONING_TIME}s"
+        )
+
     cio_model_id = cio_spec.get("model_id") or ""
     override_model = None
     override_url = None
@@ -453,12 +702,16 @@ def execute_council_debate(
         "1. 【持仓与挂单闭环管理】：\n"
         "   - 在 position_management 中对所有活动持仓下达权威指令（HOLD / CLOSE_MARKET / UPDATE_SL）及理由；\n"
         "   - 在 pending_orders_management 中对所有在途未成交挂单下达处理指令（CANCEL / KEEP）及理由；\n"
-        "2. 【6 大标的开仓点位裁决 (decisions)】：\n"
-        "   - 仔细比对各位交易员就 6 大标的提交的方案与互评，评估逻辑最扎实者采纳，存在漏洞者驳回；\n"
-        "   - 在 reasoning 中明确写出你的仲裁批复（如「【CIO批复】采纳交易员 A 对 BTC 稳健回踩买多方案，驳回交易员 B 的追多」或「【CIO批复】驳回全员方案，市场震荡全员空仓 WAIT」）；\n"
-        "   - 若批准对某标的开仓（BUY_LONG 或 SELL_SHORT），必须输出完整的四维点位：\n"
+        "2. 【6 大标的开仓方案终审 (decisions) 与采纳归属 (adopted_role)】：\n"
+        f"   - 仔细比对各位交易员提交的方案{'与交叉质询辩论' if consensus_mode == 'cross_examination' else ''}，评估逻辑最扎实者采纳，存在漏洞者驳回；\n"
+        "   - decisions 必须是标的字典（如 \"BTC-USDT-SWAP\"），每个标的必须包含 \"adopted_role\" 字段：\n"
+        "     * 采纳某位交易员方案时填写其 role_id（例如 \"trader_trend\"、\"trader_momentum\"、\"trader_quant\"）；\n"
+        "     * 全员驳回或无人被采纳时填写 \"REJECT_ALL\" 或 null；\n"
+        "   - 在 reasoning 中明确写出你的仲裁依据（如「【CIO批复】采纳交易员 A 对 BTC 稳健回踩买多方案，驳回交易员 B 的追多」或「【CIO批复】驳回全员方案，市场震荡全员空仓 WAIT」）；\n"
+        "   - 若批准对某标的开仓（BUY_LONG 或 SELL_SHORT），必须输出完整的四维点位与采纳归属：\n"
         "     {\n"
         '       "action": "BUY_LONG" 或 "SELL_SHORT",\n'
+        '       "adopted_role": "trader_trend",  // 明确采纳的交易员 ID（如 trader_trend / trader_momentum / trader_quant），若无则填写 null\n'
         '       "confidence": 82,  // 最终核定置信度整数 0~100\n'
         '       "entry_price": 78250.0,  // 挂单入场限价（数字），严禁市价追高\n'
         '       "limit_price": 78250.0,  // 入场限价同义兼容\n'
@@ -470,7 +723,7 @@ def execute_council_debate(
         '       "margin_usdt": 150.0,  // 拟投入保证金（须在可用余额安全范围内）\n'
         '       "reasoning": "【CIO批复】采纳/驳回了哪位交易员的提案，资金与风控考量"\n'
         "     }\n"
-        "   - 若判定为 WAIT 观望，输出: {\"action\": \"WAIT\", \"confidence\": 50, \"reasoning\": \"【CIO批复】驳回理由与资金保全考量\"}\n\n"
+        '   - 若判定为 WAIT 观望，输出: {"action": "WAIT", "adopted_role": "REJECT_ALL", "confidence": 50, "reasoning": "【CIO批复】驳回理由与资金保全考量"}\n\n'
         "3. 最终必须且只能输出严格符合交易契约的 JSON 格式，绝不包含任何 markdown 代码块外部的多余文本！\n"
         "必须包含三个顶层键：\"macro_assessment\", \"position_management\", \"decisions\"（可选包含 \"pending_orders_management\"）。"
     )
@@ -479,16 +732,15 @@ def execute_council_debate(
         "【市场实时全景数据、账户可用资金与在途持仓挂单】\n"
         f"{market_prompt}\n\n"
         "====================================================\n"
-        "【各交易员实战作战提案与互评质询卷宗】\n"
-        f"{compiled_proposals}\n\n"
+        f"{docket_content}\n\n"
         "====================================================\n"
         "请作为首席投资官 (CIO) 审阅卷宗，统筹资金安全，裁定本轮发单并输出标准 JSON：\n"
         "1. 在 macro_assessment 中给出全局资金偏好、仓位总敞口与宏观裁定总括。\n"
         "2. 在 position_management 中落实每一个现有持仓的动态处理。\n"
-        "3. 在 decisions 中对 6 大标的逐一下达方案采纳或驳回批复，并给出完整四维点位！"
+        "3. 在 decisions 中对 6 大标的逐一下达方案采纳或驳回批复（包含 adopted_role 与 reasoning），并给出完整四维点位！"
     )
 
-    rem_time = max(25.0, timeout - (time.time() - t_start))
+    cio_timeout = max(MIN_SAFE_REASONING_TIME, deadline - time.time())
     content, reasoning, usage, latency = execute_llm_request(
         messages=[
             {"role": "system", "content": cio_system_prompt},
@@ -501,7 +753,7 @@ def execute_council_debate(
         reasoning_effort=override_effort,
         temperature=cio_temperature,
         response_format={"type": "json_object"},
-        timeout=rem_time,
+        timeout=cio_timeout,
     )
 
     clean_content = content.strip()
@@ -517,6 +769,37 @@ def execute_council_debate(
     if not isinstance(brain_output, dict):
         raise ValueError("CIO output root must be a JSON object")
 
+    # Post-process & normalize adopted_role in decisions for traceability
+    decisions = brain_output.get("decisions")
+    if isinstance(decisions, dict):
+        for sym, dec in decisions.items():
+            if isinstance(dec, dict):
+                act = str(dec.get("action", "")).upper()
+                ar = dec.get("adopted_role")
+                if ar is None or str(ar).strip() == "" or str(ar).strip().lower() == "none":
+                    if act == "WAIT":
+                        dec["adopted_role"] = "REJECT_ALL"
+                    else:
+                        # Attempt to resolve from reasoning text
+                        reasoning_text = str(dec.get("reasoning", ""))
+                        matched_role = None
+                        for r_k in trader_keys:
+                            r_name = roles.get(r_k, {}).get("name", "")
+                            alias_candidates = [r_k, r_name]
+                            if "trend" in r_k:
+                                alias_candidates.extend(["交易员 A", "交易员A", "Trader A", "trader a", "稳健型"])
+                            elif "momentum" in r_k:
+                                alias_candidates.extend(["交易员 B", "交易员B", "Trader B", "trader b", "动能型"])
+                            elif "quant" in r_k:
+                                alias_candidates.extend(["交易员 C", "交易员C", "Trader C", "trader c", "量化型"])
+
+                            if any(alias and alias.lower() in reasoning_text.lower() for alias in alias_candidates):
+                                matched_role = r_k
+                                break
+                        dec["adopted_role"] = matched_role
+                else:
+                    dec["adopted_role"] = str(ar).strip()
+
     council_transcript = {
         "council_mode": True,
         "council_architecture": "Hedge Fund Investment Committee",
@@ -529,6 +812,7 @@ def execute_council_debate(
             "reasoning": reasoning,
         },
         "advisors": trader_proposals,
+        "cross_examinations": trader_critiques if consensus_mode == "cross_examination" else {},
     }
 
     brain_output["council_transcript"] = council_transcript

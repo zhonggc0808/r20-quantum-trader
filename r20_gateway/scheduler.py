@@ -32,7 +32,7 @@ JOBS = (
     JobSpec("factor_library", "factor_library.py", 60, 55),
     JobSpec("news", "news_sentiment_harvester.py", 10 * 60, 300),
     JobSpec("daily_briefing", "daily_summary_and_backup.py", None, 600, "briefing_times", ("08:00", "20:00")),
-    JobSpec("self_improvement", "self_improvement_engine.py", None, 1200, "self_improvement_time", ("02:00", "08:00", "14:00", "20:00")),
+    JobSpec("self_improvement", "self_improvement_engine.py", None, 1200, "self_improvement_times", ("02:00", "08:00", "14:00", "20:00")),
 )
 
 
@@ -96,6 +96,9 @@ class GatewayScheduler:
         if spec.schedule_key.startswith("backup_job:"):
             return spec.default_times
         value = schedule.get(spec.schedule_key)
+        # Also check fallback keys if list key not found
+        if value is None and spec.schedule_key == "self_improvement_times":
+            value = schedule.get("self_improvement_time")
         if isinstance(value, list):
             return tuple(str(item) for item in value)
         if isinstance(value, str):

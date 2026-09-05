@@ -38,6 +38,7 @@ const workingModules = ref<any[]>([])
 
 // Structured White-Box Memory state
 const structuredLessons = ref<any[]>([])
+const memoryVersion = ref<string | null>(null)
 const newMemoryText = ref('')
 const newCategory = ref('TACTICAL')
 
@@ -48,6 +49,7 @@ const selectedProfile = computed(() => (lib.value?.profiles || []).find((p: any)
 
 async function loadData() {
   loading.value = true
+  memoryVersion.value = null
   try {
     const [libRes, memRes] = await Promise.all([
       api('/api/v1/admin/prompt-library'),
@@ -56,6 +58,7 @@ async function loadData() {
     lib.value = libRes
     selectedProfileId.value = libRes.active_profile_id || 'stable'
     structuredLessons.value = memRes.structured_lessons || []
+    memoryVersion.value = memRes.version || null
     syncWorkingModules()
   } catch (e: any) {
     bannerMsg.value = { text: `加载失败: ${e.message}`, type: 'err' }
@@ -75,16 +78,42 @@ function switchTab(tab: 'settings' | 'evolution_system' | 'evolution_user') {
   syncWorkingModules()
 }
 
+// Never retry writes: on failure require an explicit reload before another attempt.
+function expectedMemoryVersion() {
+  if (!memoryVersion.value) throw new Error('请重新加载心法后再操作')
+  return memoryVersion.value
+}
+
+async function refreshMemory() {
+  memoryVersion.value = null
+  const res = await api('/api/v1/admin/memory')
+  structuredLessons.value = res.structured_lessons || []
+  memoryVersion.value = res.version || null
+}
+
+async function reloadMemory() {
+  if (busy.value || loading.value) return
+  loading.value = true
+  bannerMsg.value = null
+  try {
+    await refreshMemory()
+  } catch (e: any) {
+    bannerMsg.value = { text: `重新加载心法失败: ${e.message}`, type: 'err' }
+  } finally {
+    loading.value = false
+  }
+}
+
 async function toggleLessonStatus(lessonId: string) {
+  if (busy.value || loading.value) return
   busy.value = 'toggle'
   bannerMsg.value = null
   try {
-    const res = await api(`/api/v1/admin/memory/toggle/${lessonId}`, { method: 'POST' })
-    if (res?.structured_lessons) {
-      structuredLessons.value = res.structured_lessons
-    }
+    await api(`/api/v1/admin/memory/toggle/${encodeURIComponent(lessonId)}?expected_version=${encodeURIComponent(expectedMemoryVersion())}`, { method: 'POST' })
+    await refreshMemory()
     bannerMsg.value = { text: `✅ 心法状态已切换（大模型下次决策立即感知）`, type: 'ok' }
   } catch (e: any) {
+    memoryVersion.value = null
     bannerMsg.value = { text: `状态切换失败: ${e.message}`, type: 'err' }
   } finally {
     busy.value = ''
@@ -93,15 +122,15 @@ async function toggleLessonStatus(lessonId: string) {
 
 async function rollbackToBaseline() {
   if (!confirm('【防污染紧急回滚】确定要清除非基准的过期或被污染心法，重置回官方基准黄金心法库吗？')) return
+  if (busy.value || loading.value) return
   busy.value = 'rollback'
   bannerMsg.value = null
   try {
-    const res = await api('/api/v1/admin/memory/rollback', { method: 'POST' })
-    if (res?.structured_lessons) {
-      structuredLessons.value = res.structured_lessons
-    }
+    await api(`/api/v1/admin/memory/rollback?expected_version=${encodeURIComponent(expectedMemoryVersion())}`, { method: 'POST' })
+    await refreshMemory()
     bannerMsg.value = { text: '🛡️ 已成功执行宪法级防污染回滚，系统已重置为黄金基准认知！', type: 'ok' }
   } catch (e: any) {
+    memoryVersion.value = null
     bannerMsg.value = { text: `回滚失败: ${e.message}`, type: 'err' }
   } finally {
     busy.value = ''
@@ -111,33 +140,37 @@ async function rollbackToBaseline() {
 async function addMemoryItem() {
   const text = newMemoryText.value.trim()
   if (!text) return
+  if (busy.value || loading.value) return
   busy.value = 'add'
   bannerMsg.value = null
   try {
     const res = await api('/api/v1/admin/memory', {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, expected_version: expectedMemoryVersion() }),
     })
     // Reload full structured list
-    await loadData()
+    await refreshMemory()
     newMemoryText.value = ''
     bannerMsg.value = { text: '✅ 新心法已通过防偏见审查，并成功同步写入决策注入层', type: 'ok' }
   } catch (e: any) {
+    memoryVersion.value = null
     bannerMsg.value = { text: `添加心法失败: ${e.message}`, type: 'err' }
   } finally {
     busy.value = ''
   }
 }
 
-async function deleteMemoryItem(idx: number) {
+async function deleteMemoryItem(idx: number, lessonId: string) {
   if (!confirm('确定删除此条自进化心法吗？')) return
+  if (busy.value || loading.value) return
   busy.value = 'delete'
   bannerMsg.value = null
   try {
-    await api(`/api/v1/admin/memory/${idx}`, { method: 'DELETE' })
-    await loadData()
+    await api(`/api/v1/admin/memory/${idx}?lesson_id=${encodeURIComponent(lessonId)}&expected_version=${encodeURIComponent(expectedMemoryVersion())}`, { method: 'DELETE' })
+    await refreshMemory()
     bannerMsg.value = { text: '✅ 该条自进化心法已成功移除', type: 'ok' }
   } catch (e: any) {
+    memoryVersion.value = null
     bannerMsg.value = { text: `删除失败: ${e.message}`, type: 'err' }
   } finally {
     busy.value = ''
@@ -265,6 +298,14 @@ onMounted(loadData)
       </div>
 
       <div class="flex items-center space-x-2">
+        <button
+          @click="reloadMemory"
+          :disabled="busy !== '' || loading"
+          class="flex items-center space-x-1 px-3 py-1.5 rounded-lg text-xs font-mono cursor-pointer disabled:opacity-40 border"
+        >
+          <RefreshCw class="w-3.5 h-3.5" />
+          <span>重新加载心法</span>
+        </button>
         <button
           v-if="auth.isSuperadmin"
           @click="rollbackToBaseline"
@@ -439,7 +480,7 @@ onMounted(loadData)
 
                   <!-- Delete -->
                   <button
-                    @click="deleteMemoryItem(idx)"
+                    @click="deleteMemoryItem(idx, item.id)"
                     class="p-1 rounded hover:bg-rose-500/20 text-rose-400 opacity-60 hover:opacity-100 transition-opacity cursor-pointer"
                     title="移除该心法"
                   >

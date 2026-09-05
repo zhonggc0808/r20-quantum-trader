@@ -11,8 +11,11 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+import logging
 from typing import Any
 from scripts.okx_runtime import OKXEnvironment, selected_environment
+
+logger = logging.getLogger(__name__)
 
 _INTENTS: dict[str, dict[str, Any]] = {}
 _INTENT_LOCK = threading.Lock()
@@ -74,8 +77,13 @@ def _request(method: str, path: str, params: dict[str, Any] | None = None, env: 
     timestamp = _timestamp(); prehash = timestamp + method + request_path + body_text
     signature = base64.b64encode(hmac.new(selected.secret_key.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
     headers = {
-        "Content-Type":"application/json", "User-Agent":"R20-OKX-V5/6.6.2", "OK-ACCESS-KEY":selected.api_key,
-        "OK-ACCESS-SIGN":signature, "OK-ACCESS-TIMESTAMP":timestamp, "OK-ACCESS-PASSPHRASE":selected.passphrase,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "OK-ACCESS-KEY": selected.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": selected.passphrase,
     }
     if selected.simulated: headers["x-simulated-trading"] = "1"
     request = urllib.request.Request(selected.base_url + request_path, data=body_text.encode() if body_text else None, headers=headers, method=method)
@@ -135,6 +143,7 @@ def fast_close_confirmed(close_token: str, confirmation: str) -> dict[str, Any]:
     if abs(actual-intent["expected_size"])>tolerance: raise ValueError(f"仓位数量已从 {intent['expected_size']} 变化为 {actual}，请刷新")
     target_side=intent["posSide"] if intent["posSide"] in {"long","short"} else ("long" if float(target.get("pos",0) or 0)>0 else "short")
     canceled=[]; cancel_failures=[]
+    # Cancel active regular orders
     for order in _request("GET","/api/v5/trade/orders-pending",{"instType":"SWAP","instId":intent["instId"]},env):
         order_side=str(order.get("posSide") or "net").lower()
         if order_side not in {target_side,"net"}: continue
@@ -145,6 +154,24 @@ def fast_close_confirmed(close_token: str, confirmation: str) -> dict[str, Any]:
                 canceled.append(order_id)
             except Exception as exc:
                 cancel_failures.append(f"{order_id}: {exc}")
+
+    # Also cancel any attached/standalone algo orders (such as native cloud OCO orders) to avoid conflicts
+    try:
+        mode_flag = f"--{env.mode}"
+        algo_orders = _run_cli(["okx", mode_flag, "swap", "algo", "orders", "--instId", intent["instId"], "--json"])
+        for ao in algo_orders:
+            ao_side = str(ao.get("posSide") or "net").lower()
+            if ao_side in {target_side, "net"}:
+                algo_id = str(ao.get("algoId") or "")
+                if algo_id:
+                    try:
+                        _run_cli(["okx", mode_flag, "swap", "algo", "cancel", intent["instId"], "--algoId", algo_id, "--json"])
+                        canceled.append(f"algo:{algo_id}")
+                    except Exception as exc:
+                        logger.warning("Cancel algo order %s failed during close: %s", algo_id, exc)
+    except Exception as exc:
+        logger.warning("Scanning algo orders failed during close: %s", exc)
+
     if cancel_failures:
         raise RuntimeError("平仓前存在无法撤销的同仓位委托：" + "; ".join(cancel_failures))
     close_side = intent["posSide"] if intent["posSide"] in {"long", "short"} else "net"

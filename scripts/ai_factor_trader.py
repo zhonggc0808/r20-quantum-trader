@@ -437,6 +437,14 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: i
         except Exception:
             pass
 
+    # Final Non-Bypassable Verification: verify actual effective price, tp and sl
+    from scripts.order_risk import validate_quote_geometry_and_rr
+    action_type = "BUY_LONG" if pos_side == "long" else "SELL_SHORT"
+    is_valid, reason, _ = validate_quote_geometry_and_rr(action_type, effective_px, effective_tp, effective_sl)
+    if not is_valid:
+        print(f"[Order Rejected] 最终有效开仓报价未通过核心安全复验: {reason} (px={effective_px}, tp={effective_tp}, sl={effective_sl})")
+        return False, f"最终订单核心安全复验拒绝: {reason}"
+
     command = okx_private_command(
         f"okx swap place --instId {inst_id} --tdMode cross --side {side} "
         f"--posSide {pos_side} --ordType limit --px {effective_px} --sz {size} "
@@ -520,6 +528,14 @@ def ensure_cloud_position_protection(inst_id: str, pos_side: str, size: float, t
 
 
 def record_trade(trade_data):
+    if not isinstance(trade_data, dict):
+        return
+    if "policy_version" not in trade_data:
+        try:
+            from policy_snapshot import generate_policy_snapshot
+            trade_data["policy_version"] = generate_policy_snapshot().get("policy_version", "v7.3.0@unknown")
+        except Exception:
+            trade_data["policy_version"] = "v7.3.0@unknown"
     try:
         ledger = []
         if os.path.exists(LEDGER_JSON_FILE):
@@ -955,6 +971,8 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
             "instId": inst_id,
             "name": name,
             "side": curr_pos["side"],
+            "policy_version": f.get("policy_version", ""),
+            "policy_hash": f.get("policy_hash", ""),
             "strategy_tag": strat_tag if strat_tag != "⚪ 观望" else ("🌊 顺势回踩" if is_long else "⚡ 阻力抛压"),
             "entryPx": entry_px,
             "entryTs": now_ts,
@@ -969,6 +987,9 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
         }
 
     t = trackers[pos_key]
+    if not t.get("policy_version") and f.get("policy_version"):
+        t["policy_version"] = f.get("policy_version")
+        t["policy_hash"] = f.get("policy_hash", "")
     t["currentSz"] = pos_sz
     if "entryTs" not in t:
         t["entryTs"] = now_ts
@@ -1734,6 +1755,8 @@ def execute_portfolio():
             f["ai_thought"] = ai_info.get("thought_process", {})
             f["ai_reason"] = ai_reason
             f["ai_confidence"] = ai_conf
+            f["policy_version"] = ai_info.get("policy_version", "")
+            f["policy_hash"] = ai_info.get("policy_hash", "")
 
             # Direct Action Assignment from LLM
             if ai_act in ["BUY_LONG", "SELL_SHORT"]:

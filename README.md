@@ -2,61 +2,55 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v7.3.0-blue.svg?style=flat-square)](https://github.com/555cute/r20-quantum-trader/releases/tag/v7.3.0)
+[![Version](https://img.shields.io/badge/version-v7.4.0-blue.svg?style=flat-square)](https://github.com/555cute/r20-quantum-trader/releases/tag/v7.4.0)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg?style=flat-square)](https://fastapi.tiangolo.com/)
 [![Vue 3](https://img.shields.io/badge/Vue-3.x-4FC08D.svg?style=flat-square)](https://vuejs.org/)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.x-38B2AC.svg?style=flat-square)](https://tailwindcss.com/)
-[![Tests](https://img.shields.io/badge/tests-172%20passed-brightgreen.svg?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/tests-116%20passed-brightgreen.svg?style=flat-square)](tests/)
 
 **全新演进的 LLM 原生数字资产对冲量化交易系统**  
-*同等身份资深交易员博弈提案 · 首席投资官 (CIO) 资金终审 · 全息持仓挂单审查 · 微积分动力学 · 交易所原生云端 OCO 风控*
+*策略大一统版本快照 · 具名归档与一键原子回滚 · 同等身份交易员双轮质询 · 核心风控不可绕过底座 · 交易所原生云端 OCO 风控*
 
-[在线官网与实盘大屏](https://www.r20.cn) · [快速上手](#-快速启动指南) · [投委会架构](#-投委会决策架构) · [核心特性](#-系统核心架构与特性) · [版本日志](CHANGELOG.md)
+[在线官网与实盘大屏](https://www.r20.cn) · [快速上手](#-快速启动指南) · [策略版本控制台](#-四大单元策略版本快照工作台) · [投委会架构](#-投委会决策架构) · [核心特性](#-系统核心架构与特性) · [版本日志](CHANGELOG.md)
 
 </div>
 
 ---
 
-## 🏛️ v7.3.0 投委会架构重构（Trading Desk Council）
+## 🏛️ v7.4.0 重磅升级总览 (Release Highlights)
 
-在 **v7.3.0** 中，系统彻底淘汰了教条分工角色，全面重塑为符合真实顶级对冲基金的**交易员提案制与首席投资官终审制**：
+在 **v7.4.0** 中，系统迎来了四大策略核心单元的架构级大重构与策略版本控制中心的全面上线：
 
-1. **同等身份资深交易员 (Peer Senior Traders)**：
-   - **Trader A (顺势稳健型)**：专注 4H/1H 大级别多空通道与打折低吸点，全盘审查可用资金，坚守保本移损与高胜率；
-   - **Trader B (动能突破型)**：专注微积分速度 $v$ 与加速度 $a$ 爆发，捕捉高爆发动量波段与大盈亏比机会；
-   - **Trader C (数理筹码型)**：专注定积分做功 $E$、聪明钱主力真实动向与盘口深度比，严格防范流动性滑点陷阱；
-   - **自定义交易员扩展**：支持无限添加具备专属 System Prompt、数据插槽与采样温度的定制交易员席位。
-2. **账户全要素在途审阅 (Account & Portfolio Awareness)**：
-   - 必须优先评估**当前账户可用资金 (USDT)** 与持仓槽位，开仓保证金严格控制在可用资金的 5%~15%；
-   - **在途持仓动态裁决**：对每个持仓逐一下达 `HOLD`（顺势持有）、`CLOSE_MARKET`（结构破位止损）或 `UPDATE_SL`（浮盈锁定移动止损）；
-   - **在途挂单生命周期**：对每个挂单逐一下达 `CANCEL`（偏离盘口撤单）或 `KEEP`（保留有效挂单）。
-3. **首席投资官 (CIO / Head of Trading) 权威终审**：
-   - 审阅全体交易员提案与质询辩论卷宗；
-   - 裁定采纳哪位交易员的方案（并输出标准入场限价 `limit_price`、2.0x ATR 止损、2.0R 止盈与保证金规划）或全员驳回观望 `WAIT`。
+1. **策略大一统版本快照控制台 (Policy Snapshot Workbench)**：
+   - **指纹聚合 (Policy Fingerprinting)**：实时聚合提示词工作室、自进化心法库、物理拦截插件与模型委员会四大核心单元的不可变指纹，生成确定性策略版本号（如 `v7.4.0@4aa048db`）；
+   - **具名策略归档入库 (Archive Vault)**：支持一键将当前生效的完整策略打包固化为具名里程碑（如《顺势打折高胜率版》）；
+   - **一键秒级原子回滚 (One-Click Rollback)**：任何时候调乱参数，0.5 秒内将四大单元真实配置全盘恢复回历史瞬间；支持归档删除与版本管理；
+   - **实盘交易台账 100% 绑定追溯**：在监控大屏的「交易台账」中实时展示订单对应的策略版本哈希徽标，彻底告别“事后复盘说不清楚当时用了什么策略”。
+
+2. **四大策略单元深度加固与去伪存真**：
+   - **自进化心法防线 (Evolution Shield)**：彻底根治白盒审核全部拒绝仍被发布的漏洞，实现跨进程原子写锁与 CAS 乐观并发锁（428/409 拦截过期覆盖）；
+   - **提示词策略工作室 (Prompt Studio)**：模板占位符单次延迟显式渲染，彻底杜绝配置阶段提前吃掉真实数据或伪装成虚假空仓；
+   - **物理拦截器核心底座 (Core Risk Guardrails)**：确立了有限数值、正确几何、最低 75%/80% 置信度与 2.0R 盈亏比**不可被任何可选插件绕过**的物理安全底座，并在最终下单前对真实生效报价进行严格二次复验；
+   - **模型委员会 (Trading Desk Council)**：剔除无代码分支的虚假共识选项，收敛为 `standard`（标准提案裁决）与 `cross_examination`（双轮真实交叉质询找茬）两种硬核模式，落地 `adopted_role` 采纳追踪与毫秒级截止时间安全降级。
+
+3. **OKX 手动平仓 502 报错彻底根治**：
+   - 快速平仓模块全面对齐现代 Chrome 浏览器 User-Agent 与 Accept 标头，杜绝被 OKX Cloudflare WAF 误杀拦截；
+   - 平仓前同步扫描并预先清理同标的在途云端 OCO 策略委托，消除交易所撮合冲突。
 
 ---
 
-## 📸 实盘大屏与投委会中枢实景
+## 📸 实景截图矩阵
 
-### 1. 真实量化实盘监控终端全景
-![实盘监控终端全景](docs/images/dashboard_trading.png)
+### 1. 策略大一统版本快照控制台 (Policy Snapshot Workbench)
+![策略版本快照控制台](docs/images/admin_policy_snapshot.png)
 
 ### 2. 对冲基金投委会决策中枢 (Trading Desk Council)
 ![对冲基金投委会中枢](docs/images/admin_council.png)
 
-### 3. 提示词策略工作室与最高交易宪法
-![提示词策略工作室](docs/images/admin_prompt_studio.png)
-
-### 4. 自进化心法库与防中毒审查 (Evolution Shield)
-![自进化心法库](docs/images/admin_evolution.png)
-
-### 5. 物理拦截门禁插件中心
-![物理拦截插件中心](docs/images/admin_interceptors.png)
-
-### 6. 多模型连接与供应商动态探测矩阵
-![模型连接与供应商矩阵](docs/images/admin_llm.png)
+### 3. 真实量化实盘监控终端全景
+![实盘监控终端全景](docs/images/dashboard_trading.png)
 
 ---
 
@@ -115,10 +109,10 @@ python3 -m uvicorn r20_backend.app:app --host 0.0.0.0 --port 8080 --reload
 
 ## 🧪 自动化测试验证
 
-系统包含覆盖策略引擎、投委会机制、拦截器插件与安全鉴权的 172 项自动化单元测试：
+系统包含覆盖策略引擎、投委会机制、拦截器插件与安全鉴权的自动化单元测试：
 ```bash
 python3 -m unittest discover -s tests/
-# 输出: Ran 172 tests ... OK (100% 通过)
+# 输出: Ran 116 tests ... OK (100% 通过)
 ```
 
 ---

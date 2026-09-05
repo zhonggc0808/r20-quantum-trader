@@ -240,8 +240,15 @@ def call_llm_evolution_review(closed_trades: List[Dict[str, Any]], existing_memo
 """
 
     profile = active_profile()
-    effective_evolution_system = apply_module_layout(EVOLUTION_SYSTEM_PROMPT, profile, "evolution_system", f"{profile.get('name', '稳健')}自进化系统提示词模板")
-    effective_evolution_user = apply_module_layout(prompt, profile, "evolution_user", f"{profile.get('name', '稳健')}自进化用户提示词模板")
+    runtime_context = {
+        "decision_timestamp": now_bj_str, "timestamp": now_bj_str,
+        "trading_memory": existing_memory_md.strip(),
+        "active_instruments": ",".join(TARGET_INSTRUMENTS),
+        "profile_name": profile.get("name", ""), "timezone": "Asia/Shanghai",
+        "strategy_version": os.getenv("R20_VERSION", "6.8.1"),
+    }
+    effective_evolution_system = apply_module_layout(EVOLUTION_SYSTEM_PROMPT, profile, "evolution_system", f"{profile.get('name', '稳健')}自进化系统提示词模板", context=runtime_context)
+    effective_evolution_user = apply_module_layout(prompt, profile, "evolution_user", f"{profile.get('name', '稳健')}自进化用户提示词模板", context=runtime_context)
     try:
         snapshot = f"【SYSTEM PROMPT】:\n{effective_evolution_system.strip()}\n\n{'='*70}\n【USER PROMPT ({now_bj_str})】：\n{effective_evolution_user.strip()}"
         fd, temp_path = tempfile.mkstemp(prefix=".evolution-prompt-", suffix=".tmp", dir=DATA_DIR)
@@ -362,23 +369,9 @@ def run_self_evolution(force: bool = False):
     total_fees_amt = sum(t["fee"] for t in closed_trades)
     profit_factor = round(total_win_amt / total_loss_amt, 2) if total_loss_amt > 0 else (99.0 if total_win_amt > 0 else 0.0)
 
-    # 1. Read existing memory to enable smart evolution & overwriting
-    existing_memory_md = ""
-    existing_core_lessons = []
-    if os.path.exists(AI_MEMORY_MD_FILE):
-        try:
-            with open(AI_MEMORY_MD_FILE, "r", encoding="utf-8") as f:
-                existing_memory_md = f.read()
-        except Exception:
-            pass
-    if os.path.exists(AI_MEMORY_FILE):
-        try:
-            with open(AI_MEMORY_FILE, "r", encoding="utf-8") as f:
-                existing_payload = json.load(f)
-            if isinstance(existing_payload.get("core_lessons"), list):
-                existing_core_lessons = existing_payload["core_lessons"]
-        except Exception:
-            pass
+    from scripts import evolution_shield as memory_service
+    memory_snapshot, existing_memory_md, existing_core_lessons = memory_service.read_trading_context(
+        AI_MEMORY_MD_FILE, AI_MEMORY_FILE)
 
     # 2. Call LLM for Cognitive Review & Memory Overwriting
     llm_review = call_llm_evolution_review(closed_trades, existing_memory_md=existing_memory_md, timestamp_str=timestamp_str)
@@ -404,73 +397,39 @@ def run_self_evolution(force: bool = False):
         change_status, llm_review.get("ai_long_term_memory", []), existing_core_lessons
     )
 
-    # Evolution Shield Audit Gate: Filter out poison / biased / single-event lessons
-    try:
-        from scripts.evolution_shield import audit_proposed_lesson, load_structured_memory, save_structured_memory
-        current_structured = load_structured_memory()
-        shielded_memory = []
-        for proposed_text in long_term_memory:
-            passed, reason = audit_proposed_lesson(proposed_text, sample_size=max(total_trades, 3))
-            if passed:
-                shielded_memory.append(proposed_text)
+    if not preserve_existing_memory:
+        # Safe extraction: convert potential dicts {"rule_text": "..."} to string safely
+        safe_long_term = []
+        for item in long_term_memory:
+            if isinstance(item, dict):
+                val = str(item.get("rule_text") or item.get("text") or item.get("lesson") or "").strip()
             else:
-                log_msg(f"🛡️ [Evolution Shield] 阻断毒心法写入长期记忆: {reason} | 违规内容: {proposed_text[:50]}...")
-        if shielded_memory:
-            long_term_memory = shielded_memory
-    except Exception as exc:
-        log_msg(f"Evolution shield audit warning: {exc}")
+                val = str(item or "").strip()
+            if val:
+                safe_long_term.append(val)
 
-    # 3. Save Long-Term Memory (Both JSON and Human/LLM-readable Markdown)
-    memory_payload = {
-        "updated_at": timestamp_str,
-        "total_trades_reviewed": total_trades,
-        "win_rate": win_rate,
-        "core_lessons": long_term_memory,
-        "favored_assets": ["ETH", "SOL", "LINK"]
-    }
-    if not preserve_existing_memory or not os.path.exists(AI_MEMORY_FILE):
-        atomic_write_json(AI_MEMORY_FILE, memory_payload)
+        try:
+            published = memory_service.publish_review(
+                safe_long_term, expected_version=memory_snapshot["version"],
+                sample_size=total_trades, change_status=change_status)
+            preserve_existing_memory = not published
+        except Exception as exc:
+            preserve_existing_memory = True
+            log_msg(f"Memory publication rejected; retaining authority: {exc}")
 
-    # Save as durable R20 Markdown memory file: update timestamp and insights while keeping core lessons if no overwrite
-    md_content = f"""# R20 AI 交易大脑长期记忆与启发式心法 (AI Trading Memory)
-
-> **最新覆盖与修订时间**: {timestamp_str} (北京时间)  
-> **复盘样本覆盖**: 最近平仓 {total_trades} 笔 | 样本胜率: {win_rate}%  
-> **模式说明**: 本文档由每日交易认知复盘（Cognitive Post-Mortem）基于最新实盘流水自动迭代沉淀。具备**智能时效覆盖机制**，动态淘汰被证伪的旧认知，保留并更新最新有效心法，不设死板硬编码限制。
-
----
-
-## 🧠 核心实战心法与直觉提示词 (Heuristic Lessons)
-
-"""
-    for idx, item in enumerate(long_term_memory, 1):
-        clean_item = item.strip()
-        # Strip any existing leading bracket timestamp
-        if clean_item.startswith("[") and "]" in clean_item:
-            clean_item = clean_item.split("]", 1)[1].strip()
-        md_content += f"{idx}. [{timestamp_str}] {clean_item}\n"
-
-    md_content += f"""
----
-
-## 🔍 痛点归因与记忆更新依据 (Diagnosis & Evolution Rationale)
-
-- 🔄 **本轮认知迭代覆盖摘要**: {llm_review.get('memory_overwrites_reason', '结合最新平仓损益完成记忆时效性检验与动态覆盖')}
-"""
-    for ins in insights:
-        clean_ins = ins.strip()
-        if clean_ins.startswith("[") and "]" in clean_ins:
-            clean_ins = clean_ins.split("]", 1)[1].strip()
-        md_content += f"- 💡 [{timestamp_str}] {clean_ins}\n"
-
+    # Persist asset multipliers to data/asset_multipliers.json so brain trader can consume
     try:
-        tmp_md = AI_MEMORY_MD_FILE + ".tmp"
-        with open(tmp_md, "w", encoding="utf-8") as f:
-            f.write(md_content)
-        os.replace(tmp_md, AI_MEMORY_MD_FILE)
-        log_msg(f"📝 长期记忆已同步更新至 Markdown 文件: {AI_MEMORY_MD_FILE}")
-    except Exception as e:
-        log_msg(f"Markdown 记忆写入异常: {e}")
+        mults_payload = {
+            "timestamp": timestamp_str,
+            "multipliers": asset_mults,
+            "updated_by": "self_improvement_engine",
+        }
+        atomic_write_json(ROOT / "data" / "asset_multipliers.json", mults_payload)
+    except Exception as exc:
+        log_msg(f"Failed to persist asset multipliers: {exc}")
+
+    # Reflect concurrent toggle/rollback even when the model returns NO_CHANGE.
+    _, _, long_term_memory = memory_service.read_trading_context(AI_MEMORY_MD_FILE, AI_MEMORY_FILE)
 
     # 4. Save Dashboard Report
     report_payload = {
@@ -483,6 +442,8 @@ def run_self_evolution(force: bool = False):
         "change_status": change_status,
         "memory_preserved": preserve_existing_memory,
         "insights": insights,
+        "diagnosis_insights": insights,
+        "memory_overwrites_reason": llm_review.get("memory_overwrites_reason", ""),
         "actions_taken": actions_taken,
         "core_lessons": long_term_memory
     }

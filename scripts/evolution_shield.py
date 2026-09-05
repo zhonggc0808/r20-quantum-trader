@@ -20,7 +20,15 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import re
+import copy
+import fcntl
+import hashlib
+import os
+import tempfile
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -112,89 +120,307 @@ def audit_proposed_lesson(rule_text: str, sample_size: int = 1) -> Tuple[bool, s
     return True, "PASSED"
 
 
+class MemoryCorruptError(ValueError):
+    """Invalid authority is never replaced implicitly."""
+
+
+class MemoryVersionRequiredError(ValueError):
+    """Administrative writes require the version from GET."""
+
+
+class MemoryConflictError(ValueError):
+    """The snapshot used to prepare an update is stale."""
+
+
+def _validate(lessons):
+    if not isinstance(lessons, list):
+        raise MemoryCorruptError("Expected a lesson list")
+    ids = set()
+    for item in lessons:
+        if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                or not item["id"] or item["id"] in ids
+                or not isinstance(item.get("rule_text"), str) or not item["rule_text"].strip()
+                or type(item.get("enabled")) is not bool):
+            raise MemoryCorruptError("Invalid lesson schema or duplicate id")
+        for key in ("health_score", "ttl_days", "sample_size"):
+            if key in item and (type(item[key]) not in (int, float) or not math.isfinite(item[key]) or item[key] < 0):
+                raise MemoryCorruptError(f"Invalid numeric field: {key}")
+        for key in ("category", "created_at", "shield_status"):
+            if key in item and not isinstance(item[key], str):
+                raise MemoryCorruptError(f"Invalid text field: {key}")
+        ids.add(item["id"])
+    return lessons
+
+
+def read_memory_snapshot():
+    """Pure read: missing != empty; legacy lists remain readable without migration."""
+    try:
+        raw = STRUCTURED_MEMORY_FILE.read_bytes()
+    except FileNotFoundError:
+        return {"exists": False, "version": "missing", "lessons": []}
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, list):
+            lessons = payload
+        else:
+            if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+                    or not isinstance(payload.get("revision"), str)):
+                raise MemoryCorruptError("Invalid memory envelope")
+            lessons = payload["lessons"]
+        _validate(lessons)
+    except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+        raise MemoryCorruptError("Structured memory is damaged; retained unchanged") from exc
+    return {"exists": True, "version": hashlib.sha256(raw).hexdigest(), "lessons": lessons}
+
+
 def load_structured_memory() -> List[Dict[str, Any]]:
-    """Loads all structured lessons, falling back to baseline golden lessons."""
-    if STRUCTURED_MEMORY_FILE.is_file():
-        try:
-            data = json.loads(STRUCTURED_MEMORY_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
-                return data
-        except Exception:
-            pass
-    # Initialize from baseline
-    save_structured_memory(BASELINE_LESSONS)
-    return BASELINE_LESSONS
+    return read_memory_snapshot()["lessons"]
 
 
-def save_structured_memory(lessons: List[Dict[str, Any]]) -> None:
-    """Saves structured memory to JSON and automatically syncs to human/LLM-readable Markdown."""
+def is_lesson_expired(item: Dict[str, Any], now: Optional[datetime.datetime] = None) -> bool:
+    """Checks if a non-baseline lesson has exceeded its natural half-life (TTL days)."""
+    if item.get("is_baseline"):
+        return False
+    created_at_str = item.get("created_at")
+    ttl_days = float(item.get("ttl_days") or 7)
+    if not created_at_str:
+        return False
+    try:
+        if created_at_str.endswith("Z"):
+            created_at_str = created_at_str[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(created_at_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        cur = now or datetime.datetime.now(datetime.timezone.utc)
+        return (cur - dt).total_seconds() > (ttl_days * 86400)
+    except Exception:
+        return False
+
+
+def render_lessons(lessons):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    active = []
+    for item in lessons:
+        if not item.get("enabled"):
+            continue
+        # If natural half-life expired, suppress from active trading prompt injection
+        if is_lesson_expired(item, now):
+            continue
+        active.append(item)
+    # Capacity limit: strictly select at most top 8 active lessons (baseline first, then recent)
+    sorted_active = sorted(active, key=lambda x: (1 if x.get("is_baseline") else 0, x.get("created_at", "")), reverse=True)
+    capped_active = sorted_active[:8]
+    return "\n".join(f"- {item['rule_text']}" for item in capped_active)
+
+
+def read_trading_context(legacy_md=None, legacy_json=None):
+    snapshot = read_memory_snapshot()
+    if snapshot["exists"]:
+        texts = [i["rule_text"] for i in snapshot["lessons"] if i["enabled"]]
+        return snapshot, render_lessons(snapshot["lessons"]), texts
+    # Compatibility is read-only and only used if the authority does not exist.
+    md_path = Path(legacy_md) if legacy_md is not None else AI_MEMORY_MD_FILE
+    text = md_path.read_text(encoding="utf-8") if md_path.is_file() else ""
+    texts = []
+    if legacy_json is not None and Path(legacy_json).is_file():
+        payload = json.loads(Path(legacy_json).read_text(encoding="utf-8"))
+        texts = payload.get("core_lessons", [])
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise MemoryCorruptError("Invalid legacy lessons")
+    return snapshot, text or "\n".join(f"- {t}" for t in texts), texts
+
+
+def render_trading_memory(legacy_md=None, legacy_json=None):
+    text = read_trading_context(legacy_md, legacy_json)[1]
+    if not text.strip():
+        return ""
+    return "======================= 【R20 启发式实战认知与长期记忆】 =======================\n" + text
+
+
+@contextmanager
+def _memory_lock():
     STRUCTURED_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STRUCTURED_MEMORY_FILE.write_text(json.dumps(lessons, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # Generate Markdown for prompt ingestion
-    active_lessons = [l for l in lessons if l.get("enabled", True)]
-    tz_bj = datetime.timezone(datetime.timedelta(hours=8))
-    now_str = datetime.datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S")
-
-    md_lines = [
-        "# R20 AI 交易实战长期心法 (Heuristic Long-Term Memory)",
-        "",
-        f"> 状态：由自进化防污染认知中枢实时纳管 | 更新基准: {now_str} (UTC+8)",
-        "> 宪法安全护栏：已通过极端离群值过滤 (Outlier Rejection) 与防偏见白盒审查。",
-        "",
-    ]
-    for idx, l in enumerate(active_lessons, 1):
-        txt = l.get("rule_text", "").strip()
-        score = l.get("health_score", 90.0)
-        cat = l.get("category", "CORE")
-        md_lines.append(f"- 【{cat} · 评分 {score}分】{txt}")
-
-    md_lines.append("")
-    AI_MEMORY_MD_FILE.write_text("\n".join(md_lines), encoding="utf-8")
+    with open(str(STRUCTURED_MEMORY_FILE) + ".lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def toggle_lesson(lesson_id: str) -> Optional[Dict[str, Any]]:
-    """Toggle a lesson between active and disabled."""
-    lessons = load_structured_memory()
-    target = None
-    for l in lessons:
-        if l.get("id") == lesson_id:
-            l["enabled"] = not l.get("enabled", True)
-            target = l
-            break
-    if target:
-        save_structured_memory(lessons)
-    return target
+def _commit(lessons):
+    _validate(lessons)
+    payload = {"schema_version": 1, "revision": uuid.uuid4().hex, "lessons": lessons}
+    fd, name = tempfile.mkstemp(prefix=".memory-", suffix=".tmp", dir=STRUCTURED_MEMORY_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, STRUCTURED_MEMORY_FILE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    # Markdown is rendered on demand, never a second commit or an authority.
 
 
-def rollback_to_baseline() -> List[Dict[str, Any]]:
-    """Emergency Rollback: Reset all memory to unpolluted Golden Baseline Lessons."""
-    save_structured_memory(BASELINE_LESSONS)
-    return BASELINE_LESSONS
+def _check_version(snapshot, expected_version):
+    if expected_version is None or expected_version == "":
+        raise MemoryVersionRequiredError("缺少 expected_version，请重新加载心法后再操作")
+    if snapshot["version"] != expected_version:
+        raise MemoryConflictError("心法版本已变化，请重新加载后再操作；未覆盖当前数据")
 
 
-def add_safe_lesson(rule_text: str, category: str = "TACTICAL", sample_size: int = 3) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    """Adds a new lesson after rigorous Constitution & Outlier Shield auditing."""
-    passed, reason = audit_proposed_lesson(rule_text, sample_size=sample_size)
+def _new_lesson(text, sample_size, category="TACTICAL"):
+    return {"id": "lesson_" + uuid.uuid4().hex, "category": category,
+            "rule_text": text.strip(), "enabled": True, "health_score": 90.0,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "ttl_days": 7, "sample_size": sample_size, "is_baseline": False,
+            "shield_status": "PASSED"}
+
+
+def _review_candidates(texts, old, sample_size, strict):
+    if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+        raise ValueError("Expected text list")
+    by_text = {i["rule_text"].strip(): i for i in old}
+    result = []
+    seen = set()
+    for text in texts:
+        text = text.strip()
+        if text in seen:
+            continue
+        seen.add(text)
+        # Unchanged entries retain identity, audit metadata and disabled state.
+        if text in by_text:
+            result.append(copy.deepcopy(by_text[text]))
+            continue
+        passed, reason = audit_proposed_lesson(text, sample_size=sample_size)
+        if not passed:
+            if strict:
+                raise ValueError(reason)
+            continue
+        result.append(_new_lesson(text, sample_size))
+    # Preserve disabled tombstones even when omitted by a model or legacy editor.
+    result.extend(copy.deepcopy(i) for i in old if not i["enabled"] and i["rule_text"].strip() not in seen)
+    return result
+
+
+def publish_review(texts, *, expected_version, sample_size, change_status):
+    if change_status == "NO_CHANGE":
+        return False
+    if change_status not in {"ADD", "REVISE", "INVALIDATE"}:
+        raise ValueError("Invalid change status")
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        candidates = _review_candidates(texts, snapshot["lessons"], sample_size, True)
+        if not candidates or candidates == snapshot["lessons"]:
+            return False
+        # Rejected-only proposals must not remove existing active entries.
+        if not any(i["rule_text"].strip() in {t.strip() for t in texts} for i in candidates):
+            return False
+        _commit(candidates)
+        return True
+
+
+def save_structured_memory(lessons, *, expected_version):
+    """Compatibility publisher; changed/new records must pass the same audit."""
+    _validate(lessons)
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        disabled = {i["rule_text"].strip() for i in snapshot["lessons"] if not i["enabled"]}
+        for item in lessons:
+            if item["enabled"] and item["rule_text"].strip() in disabled:
+                raise ValueError("Disabled text requires explicit toggle, not republication")
+            if item not in snapshot["lessons"]:
+                passed, reason = audit_proposed_lesson(item["rule_text"], item.get("sample_size", 1))
+                if not passed:
+                    raise ValueError(reason)
+        _commit(lessons)
+
+
+def toggle_lesson(lesson_id, *, expected_version=None):
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        lessons = snapshot["lessons"]
+        for item in lessons:
+            if item["id"] == lesson_id:
+                item["enabled"] = not item["enabled"]
+                _commit(lessons)
+                return item
+    return None
+
+
+def rollback_to_baseline(*, expected_version=None):
+    with _memory_lock():
+        snapshot = read_memory_snapshot()  # Corruption is never overwritten.
+        _check_version(snapshot, expected_version)
+        lessons = copy.deepcopy(BASELINE_LESSONS)
+        _commit(lessons)
+        return lessons
+
+
+def admin_memory_view():
+    snapshot, raw, _ = read_trading_context()
+    items = [i["rule_text"] for i in snapshot["lessons"] if i["enabled"]]
+    if not snapshot["exists"]:
+        items = [line.strip()[2:].strip() for line in raw.splitlines() if line.strip().startswith("- ")]
+    return {"items": items, "count": len(items), "raw": raw,
+            "structured_lessons": snapshot["lessons"], "version": snapshot["version"],
+            "legacy_read_only": not snapshot["exists"]}
+
+
+def admin_mutate(operation, *, texts=None, index=None, lesson_id=None, expected_version=None):
+    with _memory_lock():
+        snapshot = read_memory_snapshot()
+        _check_version(snapshot, expected_version)
+        if not snapshot["exists"]:
+            raise MemoryConflictError("Legacy memory is read-only; explicit initialization required")
+        old = snapshot["lessons"]
+        active = [i["rule_text"] for i in old if i["enabled"]]
+        removed = None
+        if operation == "delete":
+            if lesson_id is not None:
+                target = next((i for i in old if i["id"] == lesson_id), None)
+                if target is None:
+                    raise IndexError("Memory id not found")
+                removed = target["rule_text"]
+            else:
+                if index is None or index < 0 or index >= len(active):
+                    raise IndexError("Memory index not found")
+                removed = active.pop(index)
+            # Deletion is a tombstone, so later review cannot resurrect it.
+            lessons = copy.deepcopy(old)
+            for item in lessons:
+                if item["rule_text"] == removed:
+                    item["enabled"] = False
+        elif operation in {"add", "replace"}:
+            candidates = list(texts or [])
+            if operation == "add":
+                candidates += active
+            lessons = _review_candidates(candidates, old, 3, True)
+        else:
+            raise ValueError("Unknown memory operation")
+        if lessons != old:
+            _commit(lessons)
+        result = {"saved": True, "items": [i["rule_text"] for i in lessons if i["enabled"]]}
+        if removed is not None:
+            result["removed"] = removed
+        return result
+
+
+def add_safe_lesson(rule_text, category="TACTICAL", sample_size=3):
+    passed, reason = audit_proposed_lesson(rule_text, sample_size)
     if not passed:
         return False, reason, None
-
-    lessons = load_structured_memory()
-    tz_bj = datetime.timezone(datetime.timedelta(hours=8))
-    now_str = datetime.datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S")
-
-    new_item = {
-        "id": f"lesson_{int(datetime.datetime.now().timestamp())}",
-        "category": category,
-        "rule_text": rule_text.strip(),
-        "health_score": 90.0,
-        "enabled": True,
-        "created_at": now_str,
-        "ttl_days": 7,
-        "sample_size": sample_size,
-        "is_baseline": False,
-        "shield_status": "PASSED",
-    }
-    lessons.append(new_item)
-    save_structured_memory(lessons)
-    return True, "心法审查通过并成功收录", new_item
+    with _memory_lock():
+        lessons = load_structured_memory()
+        for item in lessons:
+            if item["rule_text"].strip() == rule_text.strip():
+                return True, "条目已存在（保留启停状态）", item
+        item = _new_lesson(rule_text, sample_size, category)
+        lessons.append(item)
+        _commit(lessons)
+        return True, "心法审查通过并成功收录", item

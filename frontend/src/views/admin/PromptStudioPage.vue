@@ -346,7 +346,7 @@ onMounted(loadLib)
       <div class="flex items-center space-x-2">
         <Sparkles class="w-4 h-4 text-blue-400 shrink-0" />
         <p class="text-xs text-[#8A99AD] font-sans">
-          核心交易消息管线自由编排，支持标准语义变量插槽。右侧实时对照推演实发效果与源码。
+          核心交易消息管线自由编排，支持标准语义变量插槽。右侧仅对照模板拼接文本与源码，不代表实时发送消息。
         </p>
       </div>
       <div class="flex items-center space-x-1.5 shrink-0">
@@ -645,7 +645,7 @@ onMounted(loadLib)
         <div class="flex items-center justify-between pb-2 border-b" style="border-color: var(--border-subtle);">
           <div class="flex items-center space-x-2">
             <Eye class="w-4 h-4 text-cyan-400" />
-            <h3 class="text-xs font-bold uppercase tracking-wider font-mono" style="color: var(--text-main);">实时渲染对照</h3>
+            <h3 class="text-xs font-bold uppercase tracking-wider font-mono" style="color: var(--text-main);">模板组装预览</h3>
           </div>
           <div class="flex items-center space-x-1.5">
             <!-- Mode Switch -->
@@ -655,7 +655,7 @@ onMounted(loadLib)
                 class="px-2 py-0.5 rounded text-[9px] font-bold cursor-pointer transition-all"
                 :style="previewMode === 'rendered' ? { backgroundColor: 'var(--text-main)', color: 'var(--bg-card)' } : { color: 'var(--text-muted)' }"
               >
-                实发效果
+                拼接文本
               </button>
               <button
                 @click="previewMode = 'template'"
@@ -675,7 +675,7 @@ onMounted(loadLib)
           </div>
         </div>
         <div class="text-[10px] flex items-center justify-between font-mono" style="color: var(--text-faint);">
-          <span>{{ previewMode === 'rendered' ? '已代入当前真实盘口与自进化心法' : '显示模块包含的原始模版语法与插槽' }}</span>
+          <span>{{ previewMode === 'rendered' ? '仅本地拼接，未代入实时数据；base合并以发送阶段为准' : '显示模块包含的原始模版语法与插槽' }}</span>
           <span class="num-tabular font-bold" style="color: var(--color-brand);">{{ compiledPreview.length }} 字符</span>
         </div>
         <pre class="border rounded-xl p-3 text-[11px] font-mono whitespace-pre-wrap leading-relaxed max-h-[calc(100vh-280px)] overflow-y-auto select-text" style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle); color: var(--text-main);">{{ compiledPreview || '（空）' }}</pre>

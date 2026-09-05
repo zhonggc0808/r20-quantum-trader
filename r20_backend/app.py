@@ -96,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 
 from fastapi.middleware.gzip import GZipMiddleware
-app = FastAPI(title="R20 Quantum Trader Standalone Backend", version="7.3.0", lifespan=lifespan, docs_url="/api/docs", redoc_url="/api/redoc")
+app = FastAPI(title="R20 Quantum Trader Standalone Backend", version="7.4.0", lifespan=lifespan, docs_url="/api/docs", redoc_url="/api/redoc")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
@@ -231,7 +231,7 @@ class LLMFetchModelsRequest(BaseModel):
 
 class CouncilConfigUpdateRequest(BaseModel):
     enabled: bool
-    consensus_mode: str = Field(default="strict")
+    consensus_mode: str = Field(default="standard")
     timeout_seconds: float = Field(default=60.0, ge=10.0, le=300.0)
     roles: dict[str, Any]
 
@@ -431,10 +431,12 @@ class BackupRestoreRequest(BaseModel):
 
 
 class MemoryItemRequest(BaseModel):
+    expected_version: str | None = None
     text: str = Field(min_length=1, max_length=1000)
 
 
 class MemoryUpdateAllRequest(BaseModel):
+    expected_version: str | None = None
     items: list[str]
 
 
@@ -554,7 +556,7 @@ def runtime_overview() -> dict[str, Any]:
     }
     positions_payload = read_json("position_trackers.json", {})
     return {
-        "service": {"version": "7.3.0", "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)},
+        "service": {"version": "7.4.0", "pid": os.getpid(), "uptime_seconds": int(time.time() - STARTED_AT)},
         "credentials": {"okx": bool(settings.okx_api_key and settings.okx_secret_key and settings.okx_passphrase), "llm": bool(settings.llm_api_key)},
         "configuration": get_admin_configuration(),
         "data_health": health_payload,
@@ -1272,12 +1274,12 @@ def admin_test_council_debate(payload: CouncilTestRequest, x_r20_session: str | 
             )
         test_market = "\n".join(lines)
 
-    from scripts.prompt_library import active_profile, compile_modules
+    from scripts.prompt_library import active_profile, compile_modules, apply_module_layout
     # Inherit the master strategy prompt from prompt library
     try:
         prof = active_profile()
         sys_mods = prof.get("pipelines", {}).get("trading_system", [])
-        test_sys = compile_modules(sys_mods) if sys_mods else "你是 R20 Quantum Trader 首席量化官，执行多空对称顺势战法与 2.0x ATR 宽止损。"
+        test_sys = apply_module_layout(compile_modules(sys_mods), {}, "trading_system", "委员会测试", context={"market_matrix": test_market, "profile_name": prof.get("name", "")}) if sys_mods else "你是 R20 Quantum Trader 首席量化官，执行多空对称顺势战法与 2.0x ATR 宽止损。"
     except Exception:
         test_sys = "你是一个遵循多空对称顺势、1.8~2.2x ATR 宽止损与 0.8R 保本锁利的量化交易系统。"
 
@@ -1380,8 +1382,78 @@ def admin_test_interceptors(payload: InterceptorTestRequest, x_r20_session: str 
     from r20_backend.interceptor_manager import run_sandbox_test
     return run_sandbox_test(payload.scenario)
 
-    audit_record("llm.model.delete", "success", {"actor": actor["username"], "provider_id": provider_id, "model_id": model_id})
-    return {"deleted": True, "provider_id": provider_id, "model_id": model_id}
+
+# =========================================================================
+# Unified Policy Snapshot & Version Control Workbench API
+# =========================================================================
+
+class PolicyArchiveRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
+class PolicyRestoreRequest(BaseModel):
+    policy_hash: str = Field(min_length=6, max_length=64)
+
+
+@app.get("/api/v1/admin/policy/current-snapshot")
+def admin_get_policy_current_snapshot(x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    require_admin_header(x_r20_session=x_r20_session)
+    from r20_backend.policy_snapshot import generate_policy_snapshot
+    snapshot = generate_policy_snapshot()
+    return {
+        "ok": True,
+        "policy_version": snapshot.get("policy_version"),
+        "policy_hash": snapshot.get("policy_hash"),
+        "snapshot": snapshot,
+    }
+
+
+@app.get("/api/v1/admin/policy/archives")
+def admin_get_policy_archives(x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    require_admin_header(x_r20_session=x_r20_session)
+    from r20_backend.policy_snapshot import load_archive_index
+    archives = load_archive_index()
+    return {"ok": True, "archives": archives}
+
+
+@app.post("/api/v1/admin/policy/archive")
+def admin_archive_policy(payload: PolicyArchiveRequest, x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    actor = require_superadmin(REQUEST_SESSION.get())
+    from r20_backend.policy_snapshot import archive_current_policy
+    author = actor.get("username", "admin")
+    entry = archive_current_policy(name=payload.name, description=payload.description, author=author)
+    audit_record("policy.archive", "success", {"name": payload.name, "policy_hash": entry.get("policy_hash")})
+    return {"ok": True, "entry": entry}
+
+
+@app.post("/api/v1/admin/policy/restore")
+def admin_restore_policy(payload: PolicyRestoreRequest, x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    require_superadmin(REQUEST_SESSION.get())
+    from r20_backend.policy_snapshot import restore_archived_policy
+    try:
+        res = restore_archived_policy(policy_hash=payload.policy_hash)
+        audit_record("policy.restore", "success", {"policy_hash": payload.policy_hash})
+        return {"ok": True, **res}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"恢复策略版本失败: {exc}")
+
+
+@app.delete("/api/v1/admin/policy/archive/{policy_hash}")
+def admin_delete_policy_archive(policy_hash: str, x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+    require_superadmin(REQUEST_SESSION.get())
+    from r20_backend.policy_snapshot import delete_archived_policy
+    try:
+        res = delete_archived_policy(policy_hash=policy_hash)
+        audit_record("policy.delete", "success", {"policy_hash": policy_hash})
+        return {"ok": True, **res}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除策略归档失败: {exc}")
+
 
 
 @app.get("/api/v1/admin/okx/account-snapshot")
@@ -1482,10 +1554,10 @@ def admin_about(x_r20_admin_token: str | None = Header(default=None)) -> dict[st
     import platform
     store = GatewayStore(GATEWAY_DB_PATH)
     return {
-        "product": {"name": "R20 Quantum Trader", "version": "7.3.0", "control_plane": "R20 Gateway Runtime", "gateway_version": GATEWAY_VERSION},
+        "product": {"name": "R20 Quantum Trader", "version": "7.4.0", "control_plane": "R20 Gateway Runtime", "gateway_version": GATEWAY_VERSION},
         "runtime": {"python": platform.python_version(), "platform": platform.platform(), "backend_pid": os.getpid(), "gateway": gateway_status(x_r20_admin_token)},
         "components": [
-            {"name": "FastAPI Control Plane", "version": "7.3.0"},
+            {"name": "FastAPI Control Plane", "version": "7.4.0"},
             {"name": "Gateway Event Runtime", "version": GATEWAY_VERSION},
             {"name": "SQLite", "version": __import__("sqlite3").sqlite_version},
         ],
@@ -1560,6 +1632,7 @@ def prompt_library(x_r20_admin_token: str | None = Header(default=None)) -> dict
             "evolution_system": pipeline_view(EVOLUTION_SYSTEM_PROMPT, profile, "evolution_system"),
             "evolution_user": pipeline_view(EVOLUTION_USER_TEMPLATE, profile, "evolution_user"),
         },
+        "preview_mode": "template_only_not_runtime",
         "effective_templates": {
             "trading_system": apply_module_layout(SYSTEM_PROMPT, profile, "trading_system", "交易 System"),
             "trading_user": apply_module_layout(TRADING_USER_TEMPLATE, profile, "trading_user", "交易 User"),
@@ -2292,59 +2365,39 @@ def restore_backup_archive(payload: BackupRestoreRequest, x_r20_admin_token: str
 # -------------------------------------------------------------
 MEMORY_FILE = DATA_DIR / "AI_TRADING_MEMORY.md"
 
-def _parse_memory_items() -> list[str]:
-    if not MEMORY_FILE.exists():
-        return []
-    text = MEMORY_FILE.read_text(encoding="utf-8")
-    items = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("- "):
-            clean = line[2:].strip()
-            if clean:
-                items.append(clean)
-    return items
-
-def _save_memory_items(items: list[str]) -> None:
-    header = "# R20 AI 交易实战长期心法 (Heuristic Long-Term Memory)\n\n> 状态：由自进化引擎每 6 小时自动复盘提炼或管理员在后台直接增删维护。\n\n"
-    body = "\n".join(f"- {it.strip()}" for it in items if it.strip())
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MEMORY_FILE.write_text(header + body + "\n", encoding="utf-8")
+def _memory_service_call(name: str, *args, **kwargs):
+    from scripts import evolution_shield as service
+    try:
+        return getattr(service, name)(*args, **kwargs)
+    except service.MemoryVersionRequiredError as exc:
+        raise HTTPException(status_code=428, detail=str(exc)) from exc
+    except service.MemoryConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except service.MemoryCorruptError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except IndexError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/admin/memory")
 def get_admin_memory(x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     require_admin_header(x_r20_admin_token, x_r20_session)
-    items = _parse_memory_items()
-    raw_content = MEMORY_FILE.read_text(encoding="utf-8") if MEMORY_FILE.exists() else ""
-    
-    # Structured white-box evolution shield data
-    structured_lessons = []
-    try:
-        from scripts.evolution_shield import load_structured_memory
-        structured_lessons = load_structured_memory()
-    except Exception:
-        pass
-    return {
-        "items": items,
-        "count": len(items),
-        "raw": raw_content,
-        "structured_lessons": structured_lessons,
-    }
+    return _memory_service_call("admin_memory_view")
 
 
 @app.post("/api/v1/admin/memory/toggle/{lesson_id}")
-def toggle_admin_memory_lesson(lesson_id: str, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+def toggle_admin_memory_lesson(lesson_id: str, expected_version: str | None = None, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     actor = require_admin_header(x_r20_admin_token, x_r20_session)
     try:
-        from scripts.evolution_shield import toggle_lesson, load_structured_memory
-        target = toggle_lesson(lesson_id)
+        target = _memory_service_call("toggle_lesson", lesson_id, expected_version=expected_version)
         if not target:
             raise HTTPException(status_code=404, detail="未找到指定心法条目")
         audit_record("memory.lesson.toggle", "success", {"actor": actor.get("username", "admin"), "id": lesson_id, "enabled": target.get("enabled")})
-        return {"ok": True, "target": target, "structured_lessons": load_structured_memory()}
+        return {"ok": True, "target": target, "structured_lessons": _memory_service_call("load_structured_memory")}
     except HTTPException:
         raise
     except Exception as exc:
@@ -2352,14 +2405,15 @@ def toggle_admin_memory_lesson(lesson_id: str, x_r20_admin_token: str | None = H
 
 
 @app.post("/api/v1/admin/memory/rollback")
-def rollback_admin_memory_lessons(x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+def rollback_admin_memory_lessons(expected_version: str | None = None, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     actor = require_admin_header(x_r20_admin_token, x_r20_session)
     try:
-        from scripts.evolution_shield import rollback_to_baseline
-        res = rollback_to_baseline()
+        res = _memory_service_call("rollback_to_baseline", expected_version=expected_version)
         audit_record("memory.rollback_baseline", "success", {"actor": actor.get("username", "admin"), "count": len(res)})
         return {"ok": True, "message": "已成功防污染回滚至官方基准心法库", "structured_lessons": res}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"回滚失败: {exc}") from exc
 
@@ -2368,34 +2422,25 @@ def rollback_admin_memory_lessons(x_r20_admin_token: str | None = Header(default
 def add_admin_memory_item(payload: MemoryItemRequest, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     actor = require_admin_header(x_r20_admin_token, x_r20_session)
-    items = _parse_memory_items()
-    new_item = payload.text.strip()
-    if new_item in items:
-        return {"saved": True, "items": items, "message": "条目已存在"}
-    items.insert(0, new_item)
-    _save_memory_items(items)
-    audit_record("memory.item.add", "success", {"actor": actor.get("username", "admin"), "item": new_item[:50]})
-    return {"saved": True, "items": items}
+    result = _memory_service_call("admin_mutate", "add", texts=[payload.text], expected_version=payload.expected_version)
+    audit_record("memory.item.add", "success", {"actor": actor.get("username", "admin")})
+    return result
 
 @app.delete("/api/v1/admin/memory/{index}")
-def delete_admin_memory_item(index: int, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
+def delete_admin_memory_item(index: int, lesson_id: str | None = None, expected_version: str | None = None, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     actor = require_admin_header(x_r20_admin_token, x_r20_session)
-    items = _parse_memory_items()
-    if index < 0 or index >= len(items):
-        raise HTTPException(status_code=404, detail="指定索引的记忆条目不存在")
-    removed = items.pop(index)
-    _save_memory_items(items)
-    audit_record("memory.item.delete", "success", {"actor": actor.get("username", "admin"), "item": removed[:50]})
-    return {"saved": True, "items": items, "removed": removed}
+    result = _memory_service_call("admin_mutate", "delete", index=index, lesson_id=lesson_id, expected_version=expected_version)
+    audit_record("memory.item.delete", "success", {"actor": actor.get("username", "admin")})
+    return result
 
 @app.put("/api/v1/admin/memory")
 def update_admin_memory_all(payload: MemoryUpdateAllRequest, x_r20_admin_token: str | None = Header(default=None), x_r20_session: str | None = Header(default=None, alias="X-R20-Session")) -> dict[str, Any]:
     refresh_settings()
     actor = require_admin_header(x_r20_admin_token, x_r20_session)
-    _save_memory_items(payload.items)
-    audit_record("memory.update_all", "success", {"actor": actor.get("username", "admin"), "count": len(payload.items)})
-    return {"saved": True, "items": payload.items}
+    result = _memory_service_call("admin_mutate", "replace", texts=payload.items, expected_version=payload.expected_version)
+    audit_record("memory.update_all", "success", {"actor": actor.get("username", "admin"), "count": len(result["items"])})
+    return result
 
 
 @app.get("/health", include_in_schema=False)
@@ -2403,7 +2448,7 @@ def update_admin_memory_all(payload: MemoryUpdateAllRequest, x_r20_admin_token: 
 def health() -> dict[str, Any]:
     return {
         "service": "r20-standalone-backend",
-        "version": "7.3.0",
+        "version": "7.4.0",
         "status": "ok",
         "timestamp": int(time.time()),
         "credentials": {

@@ -11,7 +11,8 @@ SCHEDULE_FILE = ROOT / "data" / "notification_schedule.json"
 DEFAULT_SCHEDULE = {
     "timezone": "Asia/Shanghai",
     "briefing_times": ["08:00", "20:00"],
-    "self_improvement_time": "20:00",
+    "self_improvement_times": ["02:00", "08:00", "14:00", "20:00"],
+    "self_improvement_time": "20:00",  # backward compatibility fallback
     "backup_time": "02:00",
 }
 

@@ -173,12 +173,21 @@ function clean(v: any, fallback = '--'): string {
                 </span>
               </td>
               <td class="py-3 px-3">
-                <span
-                  class="px-2 py-0.5 rounded border text-[11px]"
-                  style="background-color: var(--bg-badge); border-color: var(--border-subtle); color: var(--text-muted);"
-                >
-                  {{ clean(t.strategy, '观望') }}
-                </span>
+                <div class="flex flex-col space-y-0.5">
+                  <span
+                    class="px-2 py-0.5 rounded border text-[11px] w-fit"
+                    style="background-color: var(--bg-badge); border-color: var(--border-subtle); color: var(--text-muted);"
+                  >
+                    {{ clean(t.strategy, '观望') }}
+                  </span>
+                  <span
+                    v-if="t.policy_version || t.policy_hash"
+                    class="text-[9px] font-mono px-1 py-0.2 rounded border w-fit text-cyan-400 border-cyan-500/30 bg-cyan-500/10"
+                    :title="t.policy_version || t.policy_hash"
+                  >
+                    #{{ (t.policy_hash || (t.policy_version || '').split('@')[1] || '').substring(0, 8) }}
+                  </span>
+                </div>
               </td>
               <td class="py-3 px-3 font-bold num-tabular" style="color: var(--text-main);">
                 {{ t.margin ? num(t.margin).toFixed(1) + ' U' : '--' }}

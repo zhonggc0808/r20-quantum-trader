@@ -1,4 +1,9 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from scripts import evolution_shield as shield
 from scripts.evolution_shield import (
     load_structured_memory,
     audit_proposed_lesson,
@@ -9,6 +14,23 @@ from scripts.evolution_shield import (
 
 
 class EvolutionShieldTests(unittest.TestCase):
+    def setUp(self):
+        network = patch("socket.socket", side_effect=AssertionError("network forbidden"))
+        network.start()
+        self.addCleanup(network.stop)
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        for name, value in {
+            "WORKSPACE_DIR": root,
+            "DATA_DIR": root / "data",
+            "STRUCTURED_MEMORY_FILE": root / "data" / "structured_trading_memory.json",
+            "AI_MEMORY_MD_FILE": root / "data" / "AI_TRADING_MEMORY.md",
+        }.items():
+            patcher = patch.object(shield, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_constitution_red_lines_block_extreme_biases(self):
         # Test 1: Block extreme long bias
         passed, reason = audit_proposed_lesson("【偏见】极端暴跌后未来绝对不要做多，所有买点都是陷阱", sample_size=10)
@@ -37,17 +59,17 @@ class EvolutionShieldTests(unittest.TestCase):
 
     def test_white_box_memory_crud_and_rollback(self):
         # Rollback initializes clean golden baseline
-        baseline = rollback_to_baseline()
+        baseline = rollback_to_baseline(expected_version=shield.read_memory_snapshot()["version"])
         self.assertGreaterEqual(len(baseline), 4)
 
         # Toggle first lesson
         first_id = baseline[0]["id"]
-        toggled = toggle_lesson(first_id)
+        toggled = toggle_lesson(first_id, expected_version=shield.read_memory_snapshot()["version"])
         self.assertIsNotNone(toggled)
         self.assertFalse(toggled["enabled"])
 
         # Toggle back
-        toggled_back = toggle_lesson(first_id)
+        toggled_back = toggle_lesson(first_id, expected_version=shield.read_memory_snapshot()["version"])
         self.assertTrue(toggled_back["enabled"])
 
 

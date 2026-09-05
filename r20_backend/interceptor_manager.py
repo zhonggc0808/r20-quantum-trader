@@ -48,8 +48,9 @@ def ensure_plugins_dir() -> None:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> dict[str, Any]:
-    ensure_plugins_dir()
+def load_config(create_if_missing: bool = True) -> dict[str, Any]:
+    if create_if_missing:
+        ensure_plugins_dir()
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -126,15 +127,16 @@ def parse_plugin_metadata(file_path: Path) -> dict[str, Any]:
     return res
 
 
-def list_plugins() -> list[dict[str, Any]]:
-    ensure_plugins_dir()
-    config = load_config()
+def list_plugins(create_if_missing: bool = True) -> list[dict[str, Any]]:
+    if create_if_missing:
+        ensure_plugins_dir()
+    config = load_config(create_if_missing=create_if_missing)
     enabled_map = config.get("enabled", {})
     pipeline_order = config.get("pipeline_order", [])
 
-    all_files = sorted([f.name for f in PLUGINS_DIR.glob("*.py")])
-    # Build complete order list
-    known_order = [f for f in pipeline_order if f in all_files]
+    all_files = sorted([f.name for f in PLUGINS_DIR.glob("*.py")]) if PLUGINS_DIR.exists() else []
+    # Build complete order list preserving configured items even if file is missing on disk
+    known_order = list(pipeline_order)
     new_files = [f for f in all_files if f not in known_order]
     full_order = known_order + new_files
 
@@ -273,33 +275,31 @@ def _load_module_from_file(file_path: Path) -> Any:
 
 def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], context: dict[str, Any]) -> tuple[str, str, float]:
     """
-    Executes all enabled interceptor plugins in sequence.
+    Executes core deterministic non-bypassable risk checks, then all enabled interceptor plugins in sequence.
     Returns: (final_action, rejection_reason, risk_reward_ratio)
-    - If all enabled plugins pass: returns (raw_action, "", rr)
-    - If any plugin rejects: returns ("WAIT", rejection_reason, rr)
+    - If all checks & enabled plugins pass: returns (raw_action, "", rr)
+    - If any check or plugin rejects: returns ("WAIT", rejection_reason, rr)
     """
-    inst_id = package.get("instId", "")
+    from scripts.order_risk import validate_quote_geometry_and_rr
+
+    inst_id = str(package.get("instId") or "")
     raw_action = str(decision.get("action", "WAIT")).upper()
     if raw_action not in {"BUY_LONG", "SELL_SHORT", "WAIT"}:
         raw_action = "WAIT"
 
-    entry = float(decision.get("entry_price", 0) or 0)
-    tp = float(decision.get("take_profit_price", 0) or 0)
-    sl = float(decision.get("stop_loss_price", 0) or 0)
-
-    rr = 0.0
-    if raw_action == "BUY_LONG" and entry > sl > 0 and tp > entry:
-        rr = (tp - entry) / (entry - sl)
-    elif raw_action == "SELL_SHORT" and sl > entry > tp > 0:
-        rr = (entry - tp) / (sl - entry)
+    entry = decision.get("entry_price")
+    tp = decision.get("take_profit_price")
+    sl = decision.get("stop_loss_price")
 
     # If already WAIT, return immediately
     if raw_action == "WAIT":
-        return "WAIT", "", rr
+        # Calculate rr if possible for telemetry, but never open
+        _, _, rr_val = validate_quote_geometry_and_rr("BUY_LONG" if str(entry or 0) > str(sl or 0) else "SELL_SHORT", entry, tp, sl)
+        return "WAIT", "", rr_val
 
     # 1. Base Core Pre-check: Data Completeness & Direction Collisions
     if package.get("data_quality") != "valid":
-        return "WAIT", "关键原始行情不完整，安全降级为 WAIT。", rr
+        return "WAIT", "关键原始行情不完整，安全降级为 WAIT。", 0.0
 
     active_inst_ids = context.get("active_inst_ids", set())
     active_position_sides = context.get("active_position_sides", {})
@@ -307,10 +307,25 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         pos_side = active_position_sides.get(inst_id, "")
         is_same = (pos_side == "long" and raw_action == "BUY_LONG") or (pos_side == "short" and raw_action == "SELL_SHORT")
         if not is_same:
-            return "WAIT", "已有反向或不兼容持仓，禁止借决策通道反向开仓，安全降级为 WAIT。", rr
+            return "WAIT", "已有反向或不兼容持仓，禁止借决策通道反向开仓，安全降级为 WAIT。", 0.0
 
-    # 2. Pipeline Execution across all enabled plugins
-    plugins = list_plugins()
+    # 2. Non-Bypassable Core Safety Floor: Finite values, Geometry & Global Minimum RR >= 2.0
+    quote_valid, quote_reason, rr = validate_quote_geometry_and_rr(raw_action, entry, tp, sl)
+    if not quote_valid:
+        return "WAIT", quote_reason, rr
+
+    # 3. Non-Bypassable Core Safety Floor: Confidence threshold (Global Floor: 75%, DOGE floor: 80%)
+    try:
+        conf = float(decision.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        return "WAIT", "核心风控拦截：置信度必须是有效数字", rr
+
+    conf_floor = 80.0 if "DOGE" in inst_id.upper() else 75.0
+    if conf < conf_floor:
+        return "WAIT", f"核心风控拦截：置信度低于安全底线 ({conf:.1f}% < {conf_floor:.1f}%)", rr
+
+    # 4. Pipeline Execution across all enabled plugins (with input isolation & fail-closed)
+    plugins = list_plugins(create_if_missing=False)
     for p_info in plugins:
         if not p_info.get("enabled"):
             continue
@@ -318,21 +333,23 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         filename = p_info["filename"]
         file_path = PLUGINS_DIR / filename
         if not file_path.exists():
-            continue
+            return "WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 文件缺失，安全降级为 WAIT", rr
 
         try:
             mod = _load_module_from_file(file_path)
             if not hasattr(mod, "check_risk"):
-                logger.warning("Plugin %s missing check_risk function, skipped", filename)
-                continue
+                return "WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 缺少 check_risk 入口，安全降级为 WAIT", rr
 
-            passed, reason = mod.check_risk(package, decision, context)
+            # Deepcopy inputs so user plugins cannot mutate decision/package to bypass core checks
+            p_pkg = copy.deepcopy(package)
+            p_dec = copy.deepcopy(decision)
+            p_ctx = copy.deepcopy(context)
+
+            passed, reason = mod.check_risk(p_pkg, p_dec, p_ctx)
             if not passed:
-                # Interception triggered!
                 return "WAIT", str(reason or f"触发风控拦截插件 [{p_info.get('name', filename)}] 规则"), rr
         except Exception as e:
             logger.error("Error executing interceptor plugin %s: %s", filename, e)
-            # Fail-closed or warn
             return "WAIT", f"风控插件 [{p_info.get('name', filename)}] 运行异常: {e}，安全降级为 WAIT", rr
 
     return raw_action, "", rr

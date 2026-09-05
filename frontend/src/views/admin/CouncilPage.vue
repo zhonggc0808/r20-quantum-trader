@@ -33,7 +33,7 @@ const bannerMsg = ref<{ text: string; type: 'ok' | 'err' | 'warn' } | null>(null
 
 const councilConfig = ref<any>({
   enabled: false,
-  consensus_mode: 'weighted',
+  consensus_mode: 'standard',
   timeout_seconds: 60.0,
   roles: {},
 })
@@ -46,22 +46,16 @@ const expandedReasoning = ref<Record<string, boolean>>({})
 
 const consensusModes = [
   {
-    id: 'strict',
-    name: '一票否决制',
-    tag: '稳健首选',
-    desc: '任一交易员提出严重假突破、逆势或流动性陷阱警告，强制观望。',
+    id: 'standard',
+    name: '标准提案模式 (Standard)',
+    tag: '高效终审',
+    desc: '各交易员提交首轮独立方案与审查汇报，汇编完整卷宗直接由 CIO 终审查决。',
   },
   {
-    id: 'weighted',
-    name: '加权共识制',
-    tag: '对冲基金标准',
-    desc: '根据交易员历史绩效权重综合裁决，两组以上提案共振时优先立项。',
-  },
-  {
-    id: 'aggressive',
-    name: '动能进取制',
-    tag: '突破进攻',
-    desc: '微积分动能一阶速度与加速度爆发时，允许由动能交易员主导小仓试探。',
+    id: 'cross_examination',
+    name: '双轮质询互评模式 (Cross-Exam)',
+    tag: '深度攻防',
+    desc: '第一轮独立方案 -> 第二轮同行交叉漏洞质询辩论 -> 第三轮 CIO 统筹审阅攻防并拍板。',
   },
 ]
 
@@ -113,7 +107,7 @@ async function saveConfig() {
       method: 'PUT',
       body: JSON.stringify({
         enabled: councilConfig.value.enabled,
-        consensus_mode: councilConfig.value.consensus_mode || 'weighted',
+        consensus_mode: councilConfig.value.consensus_mode || 'standard',
         timeout_seconds: Number(councilConfig.value.timeout_seconds) || 60.0,
         roles: councilConfig.value.roles,
       }),
@@ -121,7 +115,7 @@ async function saveConfig() {
     councilConfig.value = res.config
     bannerMsg.value = {
       text: councilConfig.value.enabled
-        ? `✅ 对冲基金投委会配置已保存并生效（${consensusModes.find((m) => m.id === councilConfig.value.consensus_mode)?.name}）`
+        ? `✅ 对冲基金投委会配置已保存并生效（${consensusModes.find((m) => m.id === councilConfig.value.consensus_mode)?.name || '标准提案模式'}）`
         : '✅ 投委会配置已保存（当前为单模型直连决策）',
       type: 'ok',
     }
@@ -304,7 +298,7 @@ onMounted(loadData)
       </div>
 
       <!-- Consensus Mode Selection Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div
           v-for="mode in consensusModes"
           :key="mode.id"
@@ -584,41 +578,69 @@ onMounted(loadData)
       </div>
 
       <!-- Traders' Proposals Grid -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <div
-          v-for="(adv, key) in testResult.transcript?.advisors || {}"
-          :key="key"
-          class="rounded-xl border p-3.5 space-y-2 flex flex-col justify-between"
-          style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);"
-        >
-          <div class="space-y-1">
-            <div class="flex items-center justify-between text-xs font-mono font-bold">
-              <span style="color: var(--text-main);">{{ adv.role_name }}</span>
-              <span class="text-[10px] text-purple-400 truncate max-w-[120px]">{{ adv.model_used }}</span>
+      <div class="space-y-1">
+        <div class="text-xs font-bold font-mono text-zinc-400">第一轮：交易员独立实操审查与作战提案</div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div
+            v-for="(adv, key) in testResult.transcript?.advisors || {}"
+            :key="key"
+            class="rounded-xl border p-3.5 space-y-2 flex flex-col justify-between"
+            style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);"
+          >
+            <div class="space-y-1">
+              <div class="flex items-center justify-between text-xs font-mono font-bold">
+                <span style="color: var(--text-main);">{{ adv.role_name }}</span>
+                <span class="text-[10px] text-purple-400 truncate max-w-[120px]">{{ adv.model_used }}</span>
+              </div>
+              <div class="flex items-center justify-between text-[10px] font-mono text-[#8A99AD]">
+                <span>响应: {{ adv.latency_ms }}ms</span>
+                <span v-if="adv.proposal_id" class="text-zinc-500 font-mono text-[9px]">ID: {{ adv.proposal_id }}</span>
+              </div>
+              <p class="text-xs font-mono whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto pr-1 select-text" style="color: var(--text-muted);">
+                {{ adv.content }}
+              </p>
             </div>
-            <div class="flex items-center justify-between text-[10px] font-mono text-[#8A99AD]">
-              <span>响应: {{ adv.latency_ms }}ms</span>
-              <span v-if="adv.weight !== undefined">权重: {{ adv.weight }}</span>
-            </div>
-            <p class="text-xs font-mono whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto pr-1 select-text" style="color: var(--text-muted);">
-              {{ adv.content }}
-            </p>
-          </div>
 
-          <div v-if="adv.reasoning" class="pt-2 border-t" style="border-color: var(--border-subtle);">
-            <button
-              @click="expandedReasoning[String(key)] = !expandedReasoning[String(key)]"
-              class="text-[10px] font-mono text-purple-400 cursor-pointer"
-            >
-              <span>{{ expandedReasoning[String(key)] ? '收起思考链' : '展开思考链 (Reasoning)' }}</span>
-            </button>
-            <div
-              v-if="expandedReasoning[String(key)]"
-              class="mt-1.5 p-2 rounded text-[10px] font-mono whitespace-pre-wrap max-h-36 overflow-y-auto select-text border"
-              style="background-color: var(--bg-card); border-color: var(--border-subtle); color: var(--text-muted);"
-            >
-              {{ adv.reasoning }}
+            <div v-if="adv.reasoning" class="pt-2 border-t" style="border-color: var(--border-subtle);">
+              <button
+                @click="expandedReasoning[String(key)] = !expandedReasoning[String(key)]"
+                class="text-[10px] font-mono text-purple-400 cursor-pointer"
+              >
+                <span>{{ expandedReasoning[String(key)] ? '收起思考链' : '展开思考链 (Reasoning)' }}</span>
+              </button>
+              <div
+                v-if="expandedReasoning[String(key)]"
+                class="mt-1.5 p-2 rounded text-[10px] font-mono whitespace-pre-wrap max-h-36 overflow-y-auto select-text border"
+                style="background-color: var(--bg-card); border-color: var(--border-subtle); color: var(--text-muted);"
+              >
+                {{ adv.reasoning }}
+              </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Optional: Round 2 Cross-Examinations Grid (only in cross_examination mode) -->
+      <div v-if="testResult.transcript?.cross_examinations && Object.keys(testResult.transcript.cross_examinations).length > 0" class="space-y-1 pt-2">
+        <div class="flex items-center space-x-2 text-xs font-bold font-mono text-amber-400">
+          <span>第二轮：同行方案交叉漏洞质询与攻防攻守实录 (Cross-Examination)</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div
+            v-for="(crit, cKey) in testResult.transcript.cross_examinations"
+            :key="cKey"
+            class="rounded-xl border p-3.5 space-y-2"
+            style="background-color: var(--bg-card-subtle); border-color: var(--border-subtle);"
+          >
+            <div class="flex items-center justify-between text-xs font-mono font-bold">
+              <span style="color: var(--text-main);">{{ crit.role_name || cKey }} 的质询</span>
+              <span class="text-[10px]" :class="crit.status === 'ok' ? 'text-amber-400' : 'text-zinc-500'">
+                {{ crit.status === 'ok' ? `${crit.latency_ms}ms` : (crit.status === 'skipped' ? '安全跳过' : '异常') }}
+              </span>
+            </div>
+            <p class="text-xs font-mono whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto pr-1 select-text" style="color: var(--text-muted);">
+              {{ crit.content }}
+            </p>
           </div>
         </div>
       </div>
@@ -649,18 +671,27 @@ onMounted(loadData)
               class="p-3 rounded-xl border flex flex-col justify-between space-y-2"
               style="background-color: var(--bg-card); border-color: var(--border-subtle);"
             >
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-1.5">
                 <span class="font-black text-sm" style="color: var(--text-main);">{{ sym }}</span>
-                <span
-                  class="px-2 py-0.5 rounded text-[10px] font-bold border"
-                  :style="{
-                    backgroundColor: dec.action?.includes('BUY') ? 'var(--color-up-bg)' : dec.action?.includes('SELL') ? 'var(--color-down-bg)' : 'var(--bg-badge)',
-                    borderColor: dec.action?.includes('BUY') ? 'var(--color-up-border)' : dec.action?.includes('SELL') ? 'var(--color-down-border)' : 'var(--border-subtle)',
-                    color: dec.action?.includes('BUY') ? 'var(--color-up)' : dec.action?.includes('SELL') ? 'var(--color-down)' : 'var(--text-muted)'
-                  }"
-                >
-                  {{ dec.action || 'WAIT' }} ({{ dec.confidence || 0 }}%)
-                </span>
+                <div class="flex items-center gap-1">
+                  <span
+                    v-if="dec.adopted_role"
+                    class="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border"
+                    :class="dec.adopted_role === 'REJECT_ALL' ? 'text-zinc-400 border-zinc-700 bg-zinc-800/40' : 'text-purple-300 border-purple-500/30 bg-purple-500/10'"
+                  >
+                    {{ dec.adopted_role === 'REJECT_ALL' ? '全员驳回' : `采纳: ${councilConfig.roles[dec.adopted_role]?.name || dec.adopted_role}` }}
+                  </span>
+                  <span
+                    class="px-2 py-0.5 rounded text-[10px] font-bold border"
+                    :style="{
+                      backgroundColor: dec.action?.includes('BUY') ? 'var(--color-up-bg)' : dec.action?.includes('SELL') ? 'var(--color-down-bg)' : 'var(--bg-badge)',
+                      borderColor: dec.action?.includes('BUY') ? 'var(--color-up-border)' : dec.action?.includes('SELL') ? 'var(--color-down-border)' : 'var(--border-subtle)',
+                      color: dec.action?.includes('BUY') ? 'var(--color-up)' : dec.action?.includes('SELL') ? 'var(--color-down)' : 'var(--text-muted)'
+                    }"
+                  >
+                    {{ dec.action || 'WAIT' }} ({{ dec.confidence || 0 }}%)
+                  </span>
+                </div>
               </div>
 
               <!-- Price & Risk Metrics -->

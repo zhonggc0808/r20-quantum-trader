@@ -509,7 +509,7 @@ P3 执行定位：15M K线、盘口与 Maker 限价挂单位置。P3 优化入�
 【自定义波段纪律】
 顺势回踩果断开仓，浮盈 1.0R 坚决上移保本止损，拒绝利润回吐。"""
 
-def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: str = "当前总持仓 0/6", active_positions_detail: List[Dict[str, Any]] = None, pending_orders_detail: List[Dict[str, Any]] = None, current_time_str: str = "", usdt_available: float = 0.0) -> str:
+def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: str = "[MISSING_CONTEXT:account_positions]", active_positions_detail: List[Dict[str, Any]] = None, pending_orders_detail: List[Dict[str, Any]] = None, current_time_str: str = "", usdt_available: float = None, runtime_context_out: Dict[str, Any] = None, policy_snapshot: Dict[str, Any] = None) -> str:
     tz_bj = datetime.timezone(datetime.timedelta(hours=8))
     now_bj_str = current_time_str or datetime.datetime.now(tz_bj).strftime("%Y-%m-%d %H:%M:%S (北京时间)")
     market_lines = []
@@ -581,7 +581,7 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
                 f"- 标的: {p.get('name') or p.get('instId')} | 方向: {p.get('side')} {p.get('lever', '3')}x | 开仓均价: {p.get('avgPx')} | 当前标记价: {p.get('markPx', p.get('lastPx'))} | 持仓量: {p.get('pos')}张 | 未结浮盈: {p.get('upl')} U (ROI: {round(safe_float(p.get('uplRatio')) * 100, 2)}%) | 动态止损线: {p.get('trailingStopPx', p.get('trailingSl', '--'))}"
             )
     else:
-        pos_lines.append("当前无任何在途持仓敞口 (100% 现金空仓状态)")
+        pos_lines.append("[MISSING_CONTEXT:account_positions]" if active_positions_detail is None else "当前无任何在途持仓敞口 (100% 现金空仓状态)")
 
     active_pos_text = "\n".join(pos_lines)
 
@@ -619,35 +619,13 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
                 f"- [挂单ID: {ord_id}] {inst_id} | {side_str} {sz_val}张 @ {px_val} | 挂单时间: {c_time_str}{tp_sl_info}"
             )
     else:
-        pending_lines.append("当前无任何在途未成交限价挂单 (挂单池为空)")
+        pending_lines.append("[MISSING_CONTEXT:pending_orders]" if pending_orders_detail is None else "当前无任何在途未成交限价挂单 (挂单池为空)")
 
     pending_orders_text = "\n".join(pending_lines)
 
-    memory_lessons = ""
-    # Priority 1: Read durable R20 Markdown trading memory
-    if os.path.exists(AI_MEMORY_MD_FILE):
-        try:
-            with open(AI_MEMORY_MD_FILE, "r", encoding="utf-8") as f:
-                md_text = f.read().strip()
-                if md_text:
-                    memory_lessons = f"""======================= 【R20 启发式实战认知与长期记忆 (Markdown)】 =======================
-{md_text}
-"""
-        except Exception:
-            pass
-    elif os.path.exists(AI_MEMORY_FILE):
-        try:
-            with open(AI_MEMORY_FILE, "r", encoding="utf-8") as f:
-                mem = json.load(f)
-                lessons = mem.get("core_lessons", [])
-                if lessons:
-                    formatted_lessons = "\n".join([f"  • {item}" for item in lessons])
-                    memory_lessons = f"""======================= 【R20 启发式实战认知与长期记忆】 =======================
-【每日复盘提炼的心法与直觉提示词 (供决策参考，不设死板禁令)】:
-{formatted_lessons}
-"""
-        except Exception:
-            pass
+    from scripts.evolution_shield import render_trading_memory
+    # Damaged authority raises; empty authority never falls back to legacy text.
+    memory_lessons = render_trading_memory(AI_MEMORY_MD_FILE, AI_MEMORY_FILE)
 
     # Harvest Latest Live News & Multi-Coin Sentiment
     news_briefs = []
@@ -664,7 +642,7 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
 
     news_text = "\n".join(news_briefs) if news_briefs else "无可验证新闻输入；不得据此推断市场平稳或不存在事件风险"
 
-    avail_balance_str = f"{usdt_available:.2f} USDT" if usdt_available > 0 else "根据系统风险自适应分配"
+    avail_balance_str = f"{usdt_available:.2f} USDT" if usdt_available is not None and usdt_available >= 0 else "[MISSING_CONTEXT:account_balance]"
 
     prompt = f"""======================= 【当前决策时间戳与市场时效】 =======================
 【推演基准时间】: {now_bj_str}
@@ -753,6 +731,20 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
         "market_matrix": all_market_str,
     }
     profile = active_profile()
+    policy_ver = (policy_snapshot or {}).get("policy_version") or os.getenv("R20_VERSION", "v7.3.0")
+    policy_hash = (policy_snapshot or {}).get("policy_hash") or ""
+    runtime_vars.update({
+        "timestamp": now_bj_str, "timezone": "Asia/Shanghai",
+        "active_instruments": ",".join(str(p.get("name") or p.get("instId") or "") for p in packages),
+        "strategy_version": policy_ver,
+        "policy_version": policy_ver,
+        "policy_hash": policy_hash,
+        "profile_name": profile.get("name", ""),
+    })
+    if runtime_context_out is not None:
+        runtime_context_out.update(runtime_vars)
+        if policy_snapshot:
+            runtime_context_out["policy_snapshot"] = policy_snapshot
     return apply_module_layout(prompt, profile, "trading_user", f"{profile.get('name', '稳健')}交易用户提示词模板", context=runtime_vars)
 
 def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], active_inst_ids: set, active_position_sides: Dict[str, str]) -> tuple[str, str, float]:
@@ -784,8 +776,121 @@ def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], acti
             rr = (entry - take_profit) / (stop_loss - entry)
         return "WAIT", f"拦截插件管线调用异常: {exc}，安全降级为 WAIT", rr
 
+
+def assemble_decision_cache(
+    packages: List[Dict[str, Any]],
+    decisions_dict: Dict[str, Any],
+    active_inst_ids: set,
+    active_position_sides: Dict[str, str],
+    time_str: str,
+    macro_summary: str,
+    policy_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Pure assembly of validated decisions into the standard cache contract, bound to policy snapshot."""
+    policy_snapshot = policy_snapshot or {}
+    p_ver = policy_snapshot.get("policy_version", "v7.3.0@unknown")
+    p_hash = policy_snapshot.get("policy_hash", "unknown")
+    p_summary = policy_snapshot.get("summary", "")
+
+    standard_cache = {}
+    # Load dynamic asset multipliers from self-improvement review if present
+    asset_multipliers = {}
+    try:
+        mult_file = ROOT / "data" / "asset_multipliers.json"
+        if mult_file.is_file():
+            with open(mult_file, "r", encoding="utf-8") as f:
+                mult_data = json.load(f)
+            asset_multipliers = mult_data.get("multipliers") or {}
+    except Exception:
+        pass
+
+    for p in packages:
+        inst_id = p["instId"]
+        d_item = decisions_dict.get(inst_id, {})
+        if not isinstance(d_item, dict):
+            d_item = {}
+        # Smooth field alias normalization (support both standard contract and council desk outputs)
+        entry = safe_float(d_item.get("entry_price") or d_item.get("limit_price"))
+        take_profit = safe_float(d_item.get("take_profit_price") or d_item.get("take_profit"))
+        stop_loss = safe_float(d_item.get("stop_loss_price") or d_item.get("stop_loss"))
+        confidence = max(0.0, min(100.0, safe_float(d_item.get("confidence"))))
+        ai_leverage = int(max(2, min(5, round(safe_float(d_item.get("leverage", 3))))))
+        raw_margin = safe_float(d_item.get("margin_usdt") or d_item.get("margin_usd", 0.0))
+
+        # Dynamically apply self-improvement asset multiplier (e.g. BTC 1.2x, DOGE 0.8x)
+        sym_key = inst_id.split("-")[0] if "-" in inst_id else inst_id
+        mult = float(asset_multipliers.get(sym_key, asset_multipliers.get(inst_id, 1.0)))
+        mult = max(0.5, min(1.5, mult))
+        ai_margin = round(raw_margin * mult, 2) if raw_margin > 0 else 0.0
+
+        # Ensure normalized keys exist for downstream interceptors
+        normalized_d_item = dict(d_item)
+        normalized_d_item["entry_price"] = entry
+        normalized_d_item["take_profit_price"] = take_profit
+        normalized_d_item["stop_loss_price"] = stop_loss
+        normalized_d_item["margin_usdt"] = ai_margin
+        normalized_d_item["leverage"] = ai_leverage
+
+        final_action, rejection_reason, rr = validate_and_filter_decision(
+            p, normalized_d_item, active_inst_ids, active_position_sides
+        )
+
+        standard_cache[inst_id] = {
+            "instId": inst_id,
+            "name": p["name"],
+            "timestamp": int(time.time()),
+            "time_str": time_str,
+            "policy_version": p_ver,
+            "policy_hash": p_hash,
+            "policy_snapshot": {
+                "policy_version": p_ver,
+                "policy_hash": p_hash,
+                "summary": p_summary,
+            },
+            "macro_assessment": macro_summary,
+            "thought_process": {
+                "market_structure": d_item.get("market_structure", "多周期结构中性"),
+                "calculus_dynamics": d_item.get("calculus_dynamics", "模型未提供具体微积分证据"),
+                "math_prob_rationale": d_item.get("math_prob_rationale", "模型未提供具体定积分与概率证据"),
+                "volume_and_oi": d_item.get("volume_and_oi", f"OI: {p.get('oiUsd', '--')}, Taker: {p.get('takerNetUsd', '--')}"),
+                "risk_reward_evaluation": "目标 R:R ≥ 2.5；执行底线 2.0"
+            },
+            "smart_money": p.get("smart_money", {}),
+            "adx_1h": p.get("adx_1h", "--"),
+            "decision": {
+                "action": final_action,
+                "confidence": confidence,
+                "leverage": ai_leverage,
+                "margin_usdt": ai_margin,
+                "entry_price": entry,
+                "take_profit_price": take_profit,
+                "stop_loss_price": stop_loss,
+                "risk_reward_ratio": f"{rr:.2f} : 1" if rr > 0 else "--",
+                "summary_reason": rejection_reason or str(d_item.get("summary_reason", "全市场矩阵综合评估中"))[:120]
+            },
+            "data_quality": p.get("data_quality", "invalid"),
+            "raw_ticker": {
+                "last": p.get("price"),
+                "bidPx": p.get("bidPx"),
+                "askPx": p.get("askPx"),
+                "chg24h": p.get("chg24h")
+            },
+            "raw_funding_rate": f"{p['fundingRate']}%" if p.get('fundingRate') else "--",
+            "raw_oi": p.get('oiUsd') or "--",
+            "raw_taker_vol": p.get('takerNetUsd') or "--",
+            "raw_ls_ratio": str(p.get('lsRatio')) if p.get('lsRatio') is not None else "--"
+        }
+
+    return standard_cache
+
+
 @single_brain_cycle
-def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", active_positions_detail: List[Dict[str, Any]] = None, usdt_available: float = 0.0) -> Optional[Dict[str, Any]]:
+def execute_batch_ai_brain_cycle(
+    pos_summary: str = "[MISSING_CONTEXT:account_positions]",
+    active_positions_detail: List[Dict[str, Any]] = None,
+    usdt_available: float = None,
+    policy_snapshot: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Fetch all six crypto symbols, call the LLM once, then persist an auditable result."""
     base_url, api_key = get_cpa_client_config()
     if not api_key:
@@ -795,6 +900,28 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
     tz_bj = datetime.timezone(datetime.timedelta(hours=8))
     now_bj = datetime.datetime.now(tz_bj)
     time_str = now_bj.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Capture immutable Policy Snapshot at start of decision cycle
+    if policy_snapshot is None:
+        try:
+            from policy_snapshot import generate_policy_snapshot
+            policy_snapshot = generate_policy_snapshot()
+        except Exception:
+            try:
+                from r20_backend.policy_snapshot import generate_policy_snapshot
+                policy_snapshot = generate_policy_snapshot()
+            except Exception as exc:
+                print(f"[AI Brain Batch] Policy snapshot warning: {exc}")
+                policy_snapshot = {
+                    "policy_version": "v7.3.0@unknown",
+                    "policy_hash": "unknown",
+                    "summary": "policy_snapshot_fallback",
+                    "units": {},
+                }
+    policy_version = policy_snapshot.get("policy_version", "v7.3.0@unknown")
+    policy_hash = policy_snapshot.get("policy_hash", "unknown")
+    policy_summary = policy_snapshot.get("summary", "")
+    print(f"[AI Brain Batch] 📌 当前决策策略快照: {policy_version} ({policy_hash})")
 
     print(f"[AI Brain Batch] 并行获取 {len(TARGET_INSTRUMENTS)} 币种原生行情、技术指标与顶级聪明钱数据...")
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -832,6 +959,7 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
     except Exception as e:
         print(f"[AI Brain Batch] SmartMoney fetch warning: {e}")
 
+    positions_context = active_positions_detail
     active_positions_detail = active_positions_detail or []
     active_inst_ids = {
         str(p.get("instId", "")) for p in active_positions_detail if p.get("instId")
@@ -851,14 +979,14 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
         print(f"[AI Brain Batch] Factor Library update warning: {e}")
 
     # Fetch live pending limit orders from exchange
-    pending_orders_list = []
+    pending_orders_list = None
     try:
         ord_cmd = okx_private_command("okx swap orders --json 2>/dev/null")
         ord_res = subprocess.run(ord_cmd, shell=True, capture_output=True, text=True, timeout=8)
-        if ord_res.stdout:
+        if ord_res.returncode == 0 and ord_res.stdout:
             pending_orders_list = json.loads(ord_res.stdout)
             if not isinstance(pending_orders_list, list):
-                pending_orders_list = []
+                pending_orders_list = None
     except Exception as e:
         print(f"[AI Brain Batch] Pending orders fetch warning: {e}")
 
@@ -878,11 +1006,12 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
     except Exception as exc:
         print(f"[AI Brain] Calculus snapshot warning: {exc}")
 
-    prompt = construct_full_market_prompt(packages, pos_summary, active_positions_detail, pending_orders_detail=pending_orders_list, current_time_str=time_str, usdt_available=usdt_available)
+    runtime_context = {}
+    prompt = construct_full_market_prompt(packages, pos_summary, positions_context, pending_orders_detail=pending_orders_list, current_time_str=time_str, usdt_available=usdt_available, runtime_context_out=runtime_context, policy_snapshot=policy_snapshot)
 
     profile = active_profile()
     effective_system_prompt = apply_module_layout(
-        get_effective_system_prompt(), profile, "trading_system", f"{profile.get('name', '稳健')}交易系统提示词模板"
+        get_effective_system_prompt(), profile, "trading_system", f"{profile.get('name', '稳健')}交易系统提示词模板", context=runtime_context
     )
 
     # Save Realtime Prompt Snapshot for Web Transparent Inspection
@@ -1042,82 +1171,33 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
                     cxl_res = subprocess.run(cxl_cmd, shell=True, capture_output=True, text=True, timeout=10)
                     print(f"[AI Brain Batch] 🛑 AI自主撤回失效/过时限价单: {p_inst_id} (ordId={p_ord_id}, 原因={p_reason})")
 
-        standard_cache = {}
-        for p in packages:
-            inst_id = p["instId"]
-            d_item = decisions_dict.get(inst_id, {})
-            if not isinstance(d_item, dict):
-                d_item = {}
-            # Smooth field alias normalization (support both standard contract and council desk outputs)
-            entry = safe_float(d_item.get("entry_price") or d_item.get("limit_price"))
-            take_profit = safe_float(d_item.get("take_profit_price") or d_item.get("take_profit"))
-            stop_loss = safe_float(d_item.get("stop_loss_price") or d_item.get("stop_loss"))
-            confidence = max(0.0, min(100.0, safe_float(d_item.get("confidence"))))
-            ai_leverage = int(max(2, min(5, round(safe_float(d_item.get("leverage", 3))))))
-            ai_margin = round(safe_float(d_item.get("margin_usdt") or d_item.get("margin_usd", 0.0)), 2)
-
-            # Ensure normalized keys exist for downstream interceptors
-            normalized_d_item = dict(d_item)
-            normalized_d_item["entry_price"] = entry
-            normalized_d_item["take_profit_price"] = take_profit
-            normalized_d_item["stop_loss_price"] = stop_loss
-            normalized_d_item["margin_usdt"] = ai_margin
-            normalized_d_item["leverage"] = ai_leverage
-
-            final_action, rejection_reason, rr = validate_and_filter_decision(
-                p, normalized_d_item, active_inst_ids, active_position_sides
-            )
-
-            standard_cache[inst_id] = {
-                "instId": inst_id,
-                "name": p["name"],
-                "timestamp": int(time.time()),
-                "time_str": time_str,
-                "macro_assessment": macro_summary,
-                "thought_process": {
-                    "market_structure": d_item.get("market_structure", "多周期结构中性"),
-                    "calculus_dynamics": d_item.get("calculus_dynamics", "模型未提供具体微积分证据"),
-                    "math_prob_rationale": d_item.get("math_prob_rationale", "模型未提供具体定积分与概率证据"),
-                    "volume_and_oi": d_item.get("volume_and_oi", f"OI: {p['oiUsd']}, Taker: {p['takerNetUsd']}"),
-                    "risk_reward_evaluation": "目标 R:R ≥ 2.5；执行底线 2.0"
-                },
-                "smart_money": p.get("smart_money", {}),
-                "adx_1h": p.get("adx_1h", "--"),
-                "decision": {
-                    "action": final_action,
-                    "confidence": confidence,
-                    "leverage": ai_leverage,
-                    "margin_usdt": ai_margin,
-                    "entry_price": entry,
-                    "take_profit_price": take_profit,
-                    "stop_loss_price": stop_loss,
-                    "risk_reward_ratio": f"{rr:.2f} : 1" if rr > 0 else "--",
-                    "summary_reason": rejection_reason or str(d_item.get("summary_reason", "全市场矩阵综合评估中"))[:120]
-                },
-                "data_quality": p.get("data_quality", "invalid"),
-                "raw_ticker": {
-                    "last": p["price"],
-                    "bidPx": p["bidPx"],
-                    "askPx": p["askPx"],
-                    "chg24h": p["chg24h"]
-                },
-                "raw_funding_rate": f"{p['fundingRate']}%" if p.get('fundingRate') else "--",
-                "raw_oi": p.get('oiUsd') or "--",
-                "raw_taker_vol": p.get('takerNetUsd') or "--",
-                "raw_ls_ratio": str(p.get('lsRatio')) if p.get('lsRatio') is not None else "--"
-            }
+        standard_cache = assemble_decision_cache(
+            packages=packages,
+            decisions_dict=decisions_dict,
+            active_inst_ids=active_inst_ids,
+            active_position_sides=active_position_sides,
+            time_str=time_str,
+            macro_summary=macro_summary,
+            policy_snapshot=policy_snapshot,
+        )
 
         atomic_write_json(AI_DECISION_CACHE_FILE, standard_cache)
         atomic_write_json(AI_POSITION_MANAGEMENT_FILE, {
             "timestamp": int(time.time()),
             "time_str": time_str,
+            "policy_version": policy_version,
+            "policy_hash": policy_hash,
             "instructions": pos_mgmt_list
         })
 
         # Record durable history for Web Audit
-        full_prompt_text = f"【SYSTEM PROMPT】：\n{effective_system_prompt.strip()}\n\n{'='*70}\n【USER PROMPT ({time_str})】：\n{prompt.strip()}"
+        full_prompt_text = f"【SYSTEM PROMPT ({policy_version})】：\n{effective_system_prompt.strip()}\n\n{'='*70}\n【USER PROMPT ({time_str})】：\n{prompt.strip()}"
         history_record = {
             "time": time_str,
+            "policy_version": policy_version,
+            "policy_hash": policy_hash,
+            "policy_snapshot": policy_snapshot,
+            "policy_snapshot_summary": policy_summary,
             "macro_assessment": macro_summary,
             "ai_last_prompt": full_prompt_text,
             "position_management": pos_mgmt_list,
@@ -1131,6 +1211,7 @@ def execute_batch_ai_brain_cycle(pos_summary: str = "当前总持仓 0/6", activ
                     "margin_usdt": standard_cache[p["instId"]]["decision"].get("margin_usdt", 0.0),
                     "risk_reward_ratio": standard_cache[p["instId"]]["decision"]["risk_reward_ratio"],
                     "data_quality": standard_cache[p["instId"]]["data_quality"],
+                    "policy_version": policy_version,
                     "reason": standard_cache[p["instId"]]["decision"]["summary_reason"]
                 }
                 for p in packages

@@ -163,7 +163,7 @@ def text_to_modules(text: str, source: str = "legacy", locked: bool = False) -> 
 
 
 def compile_modules(modules: list[dict[str, Any]]) -> str:
-    return "\n\n".join(render_variables(str(item.get("content") or "")) for item in modules if item.get("enabled",True) and str(item.get("content") or "").strip()).strip()
+    return "\n\n".join(str(item.get("content") or "") for item in modules if item.get("enabled",True) and str(item.get("content") or "").strip()).strip()
 
 
 def base_template_modules(text: str, pipeline: str) -> list[dict[str, Any]]:
@@ -301,6 +301,8 @@ def validate_profile(profile: dict[str, Any]) -> dict[str, Any]:
             if not module_id or module_id in seen: errors.append(f"{pipeline} 模块 ID 缺失或重复")
             seen.add(module_id)
             value=str(module.get("content") or ""); module_total += len(value)
+            unknown = sorted(set(_VAR_RE.findall(value)) - ALLOWED_VARIABLES)
+            if unknown: errors.append(f"{pipeline}/{module.get('title', '模块')} 包含未知变量：{', '.join(unknown)}")
             if module.get("source")=="base" and module.get("locked"): continue
             for pattern,message in _FORBIDDEN:
                 for match in pattern.finditer(value):
@@ -465,56 +467,26 @@ def all_profiles() -> list[dict[str, Any]]:
     return result
 
 
-def _variable_context(profile_name: str = "") -> dict[str, str]:
-    instruments = "BTC,ETH,SOL,DOGE,SUI,LINK"
-    try:
-        from scripts.instrument_pool import load_instrument_pool
-        instruments = ",".join(str(x.get("name") or x.get("instId") or "") for x in load_instrument_pool())
-    except Exception:
-        pass
+def render_variables(text: str, context: dict[str, Any] | None = None) -> str:
+    """Pure, single-pass substitution; never fetch account, news or memory data.
 
-    ctx = {
-        "strategy_version": os.getenv("R20_VERSION", "6.8.1"),
-        "timezone": "Asia/Shanghai",
-        "active_instruments": instruments,
-        "profile_name": profile_name,
-        "decision_timestamp": datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S (北京时间)"),
-        "account_balance": "根据系统风险自适应分配",
-        "account_positions": "当前无任何在途持仓敞口 (100% 现金空仓状态)",
-        "pending_orders": "当前无任何在途未成交限价挂单 (挂单池为空)",
-        "news_intelligence": "无可验证突发新闻；维持基准风控边界",
-        "trading_memory": "暂无自进化记忆",
-        "market_matrix": "【六币种原生行情、技术指标与筹码矩阵已就绪】",
-    }
+    Missing context means template preview. An explicit mapping means final
+    rendering; unavailable inputs are markers, not evidence of an empty account.
+    Replacement values are opaque and are never recursively interpreted.
+    """
+    if context is None:
+        return text or ""
+    values = {"timezone": "Asia/Shanghai", **context}
 
-    # Load durable R20 Markdown trading memory if present
-    ai_mem_md = ROOT / "data" / "AI_TRADING_MEMORY.md"
-    if ai_mem_md.exists():
-        try:
-            txt = ai_mem_md.read_text(encoding="utf-8").strip()
-            if txt:
-                ctx["trading_memory"] = txt
-        except Exception:
-            pass
+    def replace(match: re.Match) -> str:
+        key = match.group(1)
+        if key not in ALLOWED_VARIABLES:
+            return f"[UNKNOWN_VARIABLE:{key}]"
+        if key not in values or values[key] is None:
+            return f"[MISSING_CONTEXT:{key}]"
+        return str(values[key])
 
-    # Load news sentiment if present
-    news_file = ROOT / "data" / "news_sentiment.json"
-    if news_file.exists():
-        try:
-            ns_data = json.loads(news_file.read_text(encoding="utf-8"))
-            macro = ns_data.get("macro_sentiment", "中性平衡")
-            briefs = [f"- [{n.get('time', '')}] {n.get('title', '')} ({n.get('summary', '')[:80]}...)" for n in ns_data.get("latest_news", [])[:6]]
-            news_txt = "\n".join(briefs) if briefs else "无可验证突发新闻"
-            ctx["news_intelligence"] = f"【宏观环境基调】: {macro}\n【最新核心资讯要闻】:\n{news_txt}"
-        except Exception:
-            pass
-
-    return ctx
-
-
-def render_variables(text: str, context: dict[str, str] | None = None) -> str:
-    values = {**_variable_context(), **(context or {})}
-    return _VAR_RE.sub(lambda m: str(values.get(m.group(1), m.group(0))), text or "")
+    return _VAR_RE.sub(replace, text or "")
 
 
 def _trading_user_parent_groups(base_modules: list[dict[str, Any]], layout_titles: set[str]) -> dict[str, list[dict[str, Any]]]:
@@ -545,11 +517,8 @@ def apply_module_layout(base: str, profile: dict[str, Any], pipeline: str, label
     base_modules = base_template_modules(base, pipeline)
     layout = ((profile.get("pipelines") or {}).get(pipeline) if isinstance(profile.get("pipelines"), dict) else None)
     if not isinstance(layout, list) or not any(item.get("source") == "base" for item in layout):
-        custom = text_to_modules(str(profile.get(pipeline) or ""), "custom")
-        return compile_modules([
-            {**m, "content": render_variables(str(m.get("content") or ""), context)}
-            for m in (base_modules + custom)
-        ])
+        custom = layout if isinstance(layout, list) else text_to_modules(str(profile.get(pipeline) or ""), "custom")
+        return render_variables(compile_modules(base_modules + custom), context)
 
     base_by_title = {item["title"]: item for item in base_modules}
     layout_titles = {str(item.get("title") or "") for item in layout if item.get("source") == "base"}
@@ -560,7 +529,7 @@ def apply_module_layout(base: str, profile: dict[str, Any], pipeline: str, label
     for item in layout:
         if item.get("source") != "base":
             if item.get("enabled", True):
-                content = render_variables(str(item.get("content") or ""), context)
+                content = str(item.get("content") or "")
                 output.append({**item, "content": content})
             continue
 
@@ -577,23 +546,18 @@ def apply_module_layout(base: str, profile: dict[str, Any], pipeline: str, label
         if pipeline == "trading_user":
             raw_content = str(item.get("content") or "")
             if _VAR_RE.search(raw_content):
-                content = render_variables(raw_content, context)
+                content = raw_content
             else:
                 content = compile_modules(group)
         elif any(token in title for token in ("三重滤网裁决协议", "开仓与价格几何")):
             content = live["content"]
         else:
             content = str(item.get("content") if item.get("content") is not None else live["content"])
-            content = render_variables(content, context)
         output.append({**live, "content": content})
 
     # Fail closed: preserve every live value that an older layout does not know.
     output.extend(module for module in base_modules if module["title"] not in matched)
-    return compile_modules(output)
-
-    # Fail closed: preserve every live value that an older layout does not know.
-    output.extend(module for module in base_modules if module["title"] not in matched)
-    return compile_modules(output)
+    return render_variables(compile_modules(output), context)
 
 
 def pipeline_view(base: str, profile: dict[str, Any], pipeline: str) -> list[dict[str, Any]]:
@@ -608,5 +572,5 @@ def pipeline_view(base: str, profile: dict[str, Any], pipeline: str) -> list[dic
 
 
 def append_layer(base: str, layer: str, label: str) -> str:
-    layer = render_variables((layer or "").strip(), {"profile_name": label})
+    layer = (layer or "").strip()
     return base if not layer else f"{base.rstrip()}\n\n======================= 【{label}】 =======================\n{layer}"
