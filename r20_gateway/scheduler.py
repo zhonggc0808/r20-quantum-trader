@@ -114,7 +114,7 @@ class GatewayScheduler:
             if spec.name == "trader":
                 slot = int(now.timestamp()) // spec.interval_seconds
                 last_slot = int(last.timestamp()) // spec.interval_seconds if last else -1
-                return slot > last_slot and int(now.timestamp()) % spec.interval_seconds < 10
+                return slot > last_slot
             if spec.offset_seconds:
                 # Staggered execution aligned to clock with offset to prevent resource collisions
                 ts = int(now.timestamp())
