@@ -150,7 +150,11 @@ flowchart LR
 - `execution_risk_high`：费用、滑点、盘口或流动性是否足以破坏执行优势。
 - `tail_risk_present`：是否存在明显的事件或结构性尾部风险。
 
-这些 Noul 结果不能互相做概率加减。最终方向只取 `Choice`，其他问题由代码作为解释维度和门槛使用。
+TypeSafe 当前使用的接口无法稳定接受 `Choice`，实现因此暂用三个 Noul 兼容分
+（`would_buy_long` / `would_sell_short` / `would_wait`）选出最高分动作。三个值是
+独立分数，不是互斥分类概率：**不得归一化成和为 1 的分布**。代码必须同时检查
+最高原始分是否达到绝对门槛，以及它与次高原始分的启发式分离度；低绝对分不得因
+归一化而被放大成高置信方向。原始三票必须完整落盘。
 
 ### 5.2 独立持仓管理问题
 
@@ -187,7 +191,7 @@ flowchart LR
 - `jev_independent_data_status`
 - `jev_audit_verdict`
 - `jev_audit_flags`
-- `jev_relation_to_main`: `AGREE`、`WAIT_VS_ENTRY`、`OPPOSITE_DIRECTION`、`ABSTAIN`、`AUDIT_REJECT`
+- `jev_relation_to_main`: `AGREE`、`WAIT_VS_ENTRY`、`MAIN_WAIT_JEV_ENTRY`、`OPPOSITE_DIRECTION`、`ABSTAIN`、`AUDIT_REJECT`
 - `jev_enforcement`: `SHADOW`、`REVIEW`、`SOFT_VETO`、`HARD_VETO`
 
 第一阶段的合并规则：
@@ -195,9 +199,11 @@ flowchart LR
 1. 代码硬性风险门禁失败，直接记录 `AUDIT_REJECT`，不需要 Jev 证明。
 2. 主脑是 `WAIT` 时，Jev 可以独立给出方向，但只记录“潜在机会”，不执行。
 3. 主脑准备开仓且 Jev 给出相同方向，只记为 `AGREE`，不能自动批准。
-4. 主脑准备开仓且 Jev 为 `WAIT` 或反向，记录分歧，暂不改变主脑执行。
-5. Jev 为 `INSUFFICIENT_DATA` 时记录 `ABSTAIN`，不能当作反向信号。
-6. 审计发现结构性错误时记录 `AUDIT_REJECT`，第一阶段仍只影子记录。
+4. 主脑准备开仓且 Jev 明确选择 `WAIT`，记录 `WAIT_VS_ENTRY`；若方向票因
+   `low_confidence`、`ambiguous` 或 `not_ready` 被代码降级为 `WAIT`，记录 `ABSTAIN`。
+5. 主脑准备开仓且 Jev 给出反向方向，记录 `OPPOSITE_DIRECTION`，暂不改变主脑执行。
+6. Jev 为 `INSUFFICIENT_DATA` 时记录 `ABSTAIN`，不能当作反向信号。
+7. 审计发现结构性错误时记录 `AUDIT_REJECT`，第一阶段仍只影子记录。
 
 后续只有在影子评估证实有效后，才允许配置 `SOFT_VETO`。建议配置项为：
 
@@ -205,12 +211,25 @@ flowchart LR
 R20_JEV_INDEPENDENT_ENABLED=1
 R20_JEV_ENFORCEMENT=shadow
 R20_JEV_INDEPENDENT_MIN_CONFIDENCE=0.70
+R20_JEV_NO_EDGE_MIN_CONFIDENCE=0.54
 R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN=0.15
+R20_JEV_VETO_WAIT_MIN_CONFIDENCE=0.70
+R20_JEV_VETO_MIN_ACTION_MARGIN=0.15
 R20_JEV_AUDIT_MIN_CONFIDENCE=0.70
 R20_JEV_HARD_VETO_ONLY_CODE_GATES=1
 ```
 
 `shadow`、`review`、`soft_veto` 必须可配置回滚，不得通过修改代码切换。
+
+`R20_JEV_NO_EDGE_MIN_CONFIDENCE` 只负责生成可观测的 `no_edge` 标签，不得直接
+充当否决门槛。明确 WAIT 要成为软否决依据，还必须独立通过
+`R20_JEV_VETO_WAIT_MIN_CONFIDENCE` 和 `R20_JEV_VETO_MIN_ACTION_MARGIN`；反向方向
+同样必须重新通过通用的 `R20_JEV_VETO_MIN_ACTION_MARGIN`，不能只依赖分类门槛。
+
+截至 2026-09-26 的双通道观测样本中，WAIT 票最高值低于 `0.70`，因此明确 WAIT
+否决路径处于“休止”状态，预期不会产生候选。`SOFT_VETO_CANDIDATE=0` 只能说明
+当前门槛未被触及，不能据此证明否决逻辑有效；接通执行前必须基于已结算的样本外
+结果重新标定。
 
 ## 7. 推荐的代码落点
 

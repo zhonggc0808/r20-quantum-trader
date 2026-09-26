@@ -17,7 +17,8 @@
 
 本门钉住三件事：
 1. 任何通道的 payload 只允许出现 provider 能接受的类型；
-2. WAIT 提议不生成审计问题，也不被记成 REJECT，而是显式 `NOT_APPLICABLE`；
+2. WAIT 提议不生成审计问题，审计结论显式为 `NOT_APPLICABLE`，但独立通道的
+   关系分类仍必须保留（不能把潜在机会也覆盖成“不适用”）；
 3. 去掉 choice 之后，独立通道的动作仍由 `would_*` 票决**带 margin** 推导
    （而不是退化成永远 WAIT）。
 """
@@ -357,10 +358,10 @@ class WaitProposalIsNotAuditedTest(_Harness):
                          f"入场提议审计题数变了：{sorted(asked)}")
 
     def test_wait_is_reported_not_applicable_not_reject(self):
-        """WAIT 必须是显式 NOT_APPLICABLE，不得再冒充 AUDIT_REJECT。"""
+        """WAIT 的审计不适用，但低置信独立票应按弃权记录。"""
         btc = self.by_inst["BTC-USDT-SWAP"]
         self.assertEqual(btc["jev_audit_verdict"], "NOT_APPLICABLE")
-        self.assertEqual(btc["jev_relation_to_main"], "NOT_APPLICABLE")
+        self.assertEqual(btc["jev_relation_to_main"], "ABSTAIN")
         self.assertIsNone(btc["audit_proposal_complete"],
                           "未问过 proposal_complete 时不得编造一个值")
         self.assertEqual(btc["audit_flags"], [])
@@ -577,6 +578,55 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
                          "三个兼容票决必须仍在记录里（choice 的信息并未丢失）")
 
 
+    def test_main_wait_keeps_counterfactual_relation(self):
+        review = self.run_review({"ETH-USDT-SWAP": "WAIT"})
+        row = review["instrument_reviews"][0]
+        self.assertEqual(row["jev_audit_verdict"], "NOT_APPLICABLE")
+        self.assertEqual(row["jev_relation_to_main"], "MAIN_WAIT_JEV_ENTRY",
+                         "审计不适用不得覆盖独立通道的潜在机会关系")
+
+
+class IndependentVoteScaleGuardTest(unittest.TestCase):
+    """独立 Noul 是兼容分，不得归一化后把弱票放大成高置信方向。"""
+
+    def _rank(self, buy: float, sell: float, wait: float):
+        return abt._jev_rank_votes(
+            {"BUY_LONG": buy, "SELL_SHORT": sell, "WAIT": wait},
+            min_confidence=0.70, min_margin=0.15,
+            execution_ready=0.9, execution_ready_min=0.44,
+            wait_min_confidence=0.54,
+        )
+
+    def test_low_absolute_votes_cannot_become_confident_after_rescaling(self):
+        got = self._rank(0.20, 0.10, 0.00)
+        self.assertEqual(got["suggested_action"], "WAIT")
+        self.assertEqual(got["action_status"], "low_confidence")
+        self.assertAlmostEqual(got["confidence"], 0.20)
+        self.assertEqual(got["probabilities"], {
+            "BUY_LONG": 0.20, "SELL_SHORT": 0.10, "WAIT": 0.00,
+        })
+
+    def test_high_but_conflicting_votes_remain_ambiguous(self):
+        got = self._rank(0.90, 0.80, 0.70)
+        self.assertEqual(got["suggested_action"], "WAIT")
+        self.assertEqual(got["action_status"], "ambiguous")
+        self.assertAlmostEqual(got["confidence"], 0.90)
+        self.assertAlmostEqual(got["action_margin"], 0.10)
+
+
+    def test_wait_uses_the_separate_no_edge_threshold(self):
+        got = self._rank(0.20, 0.10, 0.60)
+        self.assertEqual(got["suggested_action"], "WAIT")
+        self.assertEqual(got["action_status"], "accepted")
+        self.assertAlmostEqual(got["confidence_threshold"], 0.54)
+
+    def test_same_absolute_score_cannot_open_a_direction(self):
+        got = self._rank(0.60, 0.20, 0.10)
+        self.assertEqual(got["suggested_action"], "WAIT")
+        self.assertEqual(got["action_status"], "low_confidence")
+        self.assertAlmostEqual(got["confidence_threshold"], 0.70)
+
+
 class EnforcementModeIsConfigurableTest(unittest.TestCase):
     """方案 §6：`shadow` / `review` / `soft_veto` 必须**可配置回滚**。
 
@@ -624,20 +674,63 @@ class EnforcementDecisionCriteriaTest(unittest.TestCase):
 
     def _decide(self, mode="soft_veto", main="BUY_LONG", action="SELL_SHORT",
                 status="accepted", data_status="valid", entry_mode="initial",
-                hard_gates=True):
+                hard_gates=True, confidence=0.80, margin=0.30,
+                veto_wait_confidence=0.70, veto_margin=0.15):
         return abt._jev_enforcement_decision(
             mode=mode, main_action=main,
             independent={"suggested_action": action, "data_status": data_status,
-                         "action_status": status},
-            entry_mode=entry_mode, hard_gates_passed=hard_gates)
+                         "action_status": status, "confidence": confidence,
+                         "action_margin": margin},
+            entry_mode=entry_mode, hard_gates_passed=hard_gates,
+            veto_wait_min_confidence=veto_wait_confidence,
+            veto_min_margin=veto_margin)
 
     def test_opposite_direction_past_thresholds_is_soft_veto_candidate(self):
         got = self._decide()
         self.assertEqual(got["decision"], "SOFT_VETO_CANDIDATE")
 
+    def test_opposite_direction_respects_independent_veto_margin(self):
+        got = self._decide(confidence=0.75, margin=0.20, veto_margin=0.30)
+        self.assertEqual(got["decision"], "NONE")
+        self.assertFalse(got["veto_eligible"])
+        self.assertFalse(got["veto_thresholds_passed"])
+        self.assertIn("opposite_veto_margin_below_threshold", got["reasons"])
+
     def test_explicit_wait_past_thresholds_is_soft_veto_candidate(self):
         got = self._decide(action="WAIT", status="no_edge")
         self.assertEqual(got["decision"], "SOFT_VETO_CANDIDATE")
+
+    def test_no_edge_below_veto_threshold_is_observed_but_not_eligible(self):
+        got = abt._jev_combine_candidate(
+            main_action="BUY_LONG",
+            independent={
+                "suggested_action": "WAIT", "data_status": "valid",
+                "action_status": "no_edge", "confidence": 0.60,
+                "action_margin": 0.30,
+            },
+            audit={"verdict": "APPROVE", "flags": []},
+            enforcement="soft_veto", entry_mode="initial",
+            veto_wait_min_confidence=0.70, veto_min_margin=0.15,
+        )
+        self.assertEqual(got["jev_relation_to_main"], "WAIT_VS_ENTRY")
+        self.assertEqual(got["jev_enforcement_decision"], "NONE")
+        self.assertFalse(got["jev_veto_eligible"])
+        self.assertIn("wait_veto_confidence_below_threshold",
+                      got["jev_enforcement_reasons"])
+
+    def test_wait_above_independent_veto_threshold_is_candidate(self):
+        got = self._decide(action="WAIT", status="no_edge",
+                           confidence=0.75, margin=0.30)
+        self.assertEqual(got["decision"], "SOFT_VETO_CANDIDATE")
+        self.assertTrue(got["veto_eligible"])
+        self.assertTrue(got["veto_thresholds_passed"])
+
+    def test_wait_with_small_margin_is_not_veto_eligible(self):
+        got = self._decide(action="WAIT", status="no_edge",
+                           confidence=0.75, margin=0.10)
+        self.assertEqual(got["decision"], "NONE")
+        self.assertFalse(got["veto_eligible"])
+        self.assertIn("wait_veto_margin_below_threshold", got["reasons"])
 
     def test_weak_vote_is_not_a_veto_ground(self):
         """弱票 WAIT 表示「拿不准」，不是「反对」—— 不得当作否决依据。"""
@@ -645,6 +738,20 @@ class EnforcementDecisionCriteriaTest(unittest.TestCase):
             got = self._decide(action="WAIT", status=status)
             self.assertEqual(got["decision"], "NONE", f"{status} 不应产生否决候选")
             self.assertIn("independent_thresholds_not_passed", got["reasons"])
+
+    def test_not_ready_is_abstain_in_relation_and_none_in_enforcement(self):
+        got = abt._jev_combine_candidate(
+            main_action="BUY_LONG",
+            independent={
+                "suggested_action": "WAIT", "data_status": "valid",
+                "action_status": "not_ready", "confidence": 0.82,
+                "action_margin": 0.40,
+            },
+            audit={"verdict": "APPROVE", "flags": []},
+            enforcement="soft_veto", entry_mode="initial",
+        )
+        self.assertEqual(got["jev_relation_to_main"], "ABSTAIN")
+        self.assertEqual(got["jev_enforcement_decision"], "NONE")
 
     def test_agreement_is_never_a_veto(self):
         got = self._decide(action="BUY_LONG")
@@ -679,11 +786,11 @@ class EnforcementDecisionCriteriaTest(unittest.TestCase):
         """`R20_JEV_HARD_VETO_ONLY_CODE_GATES=1` ⇒ Jev 自身最高只能软否决。"""
         capped = self._decide(mode="hard_veto")
         self.assertEqual(capped["decision"], "SOFT_VETO")
-        uncapped = self._decide(mode="hard_veto")
         uncapped = abt._jev_enforcement_decision(
             mode="hard_veto", main_action="BUY_LONG",
             independent={"suggested_action": "SELL_SHORT", "data_status": "valid",
-                         "action_status": "accepted"},
+                         "action_status": "accepted", "confidence": 0.80,
+                         "action_margin": 0.30},
             entry_mode="initial", hard_gates_passed=True, hard_veto_code_only=False)
         self.assertEqual(uncapped["decision"], "HARD_VETO")
 
@@ -730,11 +837,12 @@ class JevVerdictHelperTest(unittest.TestCase):
         self.assertEqual(got["flags"], [],
                          "没有提议时不得把传入的 flag 带出去")
 
-    def test_policy_relation_maps_not_applicable(self):
+    def test_policy_relation_preserves_counterfactual_when_audit_not_applicable(self):
         self.assertEqual(
             abt._jev_policy_relation("WAIT", "BUY_LONG", data_status="valid",
-                                     audit_verdict_value="NOT_APPLICABLE"),
-            "NOT_APPLICABLE")
+                                     audit_verdict_value="NOT_APPLICABLE",
+                                     action_status="accepted"),
+            "MAIN_WAIT_JEV_ENTRY")
 
     def test_not_applicable_is_not_a_reject(self):
         for main in ("WAIT", "BUY_LONG"):

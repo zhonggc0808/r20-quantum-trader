@@ -50,6 +50,29 @@
 
 ## 2026-09-26（下半场）
 
+### Jev 关系分类与兼容票绝对尺度修复
+
+- 修复主脑 `WAIT` 时审计 `NOT_APPLICABLE` 覆盖独立关系的问题：审计不适用只说明
+  没有提案可审，不再吞掉 `MAIN_WAIT_JEV_ENTRY`、`AGREE` 或 `ABSTAIN`。
+- 取消把三个独立 Noul 兼容票归一化为分类概率。`confidence` 改回最高原始分，
+  `action_margin` 为最高分与次高分的启发式分离度；`0.20/0.10/0.00` 这类整体弱票
+  不能再被放大成 `0.67` 的高置信方向。绝对 confidence 门槛同步恢复为 `0.70`。
+- `not_ready` 与 `low_confidence` / `ambiguous` 统一归为 `ABSTAIN`，避免关系字段
+  声称 `WAIT_VS_ENTRY`、执行档位却判定 `NONE` 的内部矛盾。
+- 将方向门槛与明确 WAIT/no_edge 门槛拆开：方向维持 `0.70`，no_edge 使用独立的
+  `R20_JEV_NO_EDGE_MIN_CONFIDENCE=0.54`，避免提高方向门槛后 no_edge 标签归零。
+- 进一步拆开 no_edge **分类门槛**与 WAIT **否决门槛**：`0.54` 仅用于保留
+  “市场平淡”标签；形成软否决候选必须另过
+  `R20_JEV_VETO_WAIT_MIN_CONFIDENCE=0.70` 和 `R20_JEV_VETO_MIN_ACTION_MARGIN=0.15`。
+  因此 `0.60` 的明确 WAIT 会记录为 `no_edge`，但不再获得否决资格。
+- 修复 `R20_JEV_VETO_MIN_ACTION_MARGIN` 只约束 WAIT、未约束反向方向的问题。现在
+  反向和明确 WAIT 两条否决路径都必须重新通过通用 veto margin；例如分类 margin
+  `0.20` 虽已超过 `0.15`，当 veto margin 配为 `0.30` 时仍不得形成候选。
+- 记录当前 WAIT 否决路径的休止状态：截至 2026-09-26，双通道 WAIT 观测最大值
+  低于 `0.70`，因此零个 WAIT 否决候选是门槛不可达的预期后果，不代表逻辑已验证。
+- 补齐方案中的 `MAIN_WAIT_JEV_ENTRY` relation 枚举，并新增低绝对票、高冲突票、
+  not_ready 一致性和主脑 WAIT 反事实关系的回归测试。
+
 ### Jev 独立通道：拆分「完整性 / 一致性 / 方向性优势」
 
 问题：代码侧 `data_quality` 恒为 `valid`（210/210），而模型被问的那道
@@ -140,16 +163,15 @@
   prompt**，校准只能进题面。为 `data_valid` / `execution_ready` / `would_*`
   写明量表语义，并明确「数据完整但行情平淡」不等于数据不足 —— 后者应体现在
   方向票里而不是数据题里。同真实 state 的 A/B：中位 0.52 → 0.65。
-- F confidence 改成真分布：原先拿三个**互相独立**的布尔问题（会不会做多/做空/
-  等待）的**最大值**当 confidence、差值当 margin，而方案 §5.1 明确禁止对 Noul
-  结果做概率加减。现先归一化成互斥分布再取最大分量与边际；原始票值与归一化前
-  最大值另存 `jev_raw_max_vote` / `jev_vote_sum`，信息不丢失。
+- F（已被同日后续修正替代）曾把三个独立布尔兼容票归一化成互斥分布。后续验证
+  发现这会把整体弱票放大成高置信方向，现已恢复按原始绝对分和启发式分离度判定；
+  原始最大值与票和继续保留在 `jev_raw_max_vote` / `jev_vote_sum`。
 - G 门槛可配置并重标：此前 4 处 `0.5` 是硬编码（`data_valid`、
   `execution_ready`、`audit_data_valid`、`protection`），是全项目唯一不可配置的
-  JEV 阈值。现全部走环境变量，默认值按实测分布推导 —— **规则：有效性门槛取该
-  通道分布中位数，接受门槛取归一化 confidence 的 p75**。取值：
-  `data_valid=0.36`、`execution_ready=0.44`、`min_confidence=0.54`；
-  `audit_data_valid` / `protection` / 审计旗标维持 0.50（审计分布未变）。
+  JEV 阈值。现全部走环境变量。`execution_ready=0.44` 沿用实测中位数；独立动作
+  confidence 在恢复原始绝对分后同步恢复为方案建议的 `0.70`，避免把题面定义为
+  “摇摆”的约 `0.5` 分数当作高置信方向；`audit_data_valid` / `protection` / 审计旗标
+  维持 0.50（审计分布未变）。
 
 **验证**
 

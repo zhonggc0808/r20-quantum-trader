@@ -2131,18 +2131,18 @@ def _jev_position_state_quality(position: Mapping[str, Any]) -> Dict[str, Any]:
 def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
                min_margin: float,
                execution_ready: Any = None,
-               execution_ready_min: float = 0.5) -> Dict[str, Any]:
-    """把三个兼容票决归一化成一个动作分布，再判断是否接受。
+               execution_ready_min: float = 0.5,
+               wait_min_confidence: Optional[float] = None) -> Dict[str, Any]:
+    """按三个兼容票的原始绝对分数排序，再保守判断是否接受。
 
-    2026-09-26 修正：这里原先拿「三个互相独立的布尔问题」的**最大值**当
-    confidence、拿它与次高者的差当 margin。那三个问题分别问「会不会做多 /
-    会不会做空 / 会不会等」，它们不是互斥选项，因此 max 不是概率、
-    差值也不是边际 —— 方案 §5.1 明确禁止对 Noul 结果做概率加减。
+    三个 Noul 分别是「会不会做多 / 会不会做空 / 会不会等待」的独立兼容分，
+    **不是**互斥类别概率。不能把它们除以总和后伪装成 categorical distribution：
+    `0.20 / 0.10 / 0.00` 会被错误放大成 `0.67 / 0.33 / 0.00`，从而把三个都很弱
+    的答案制造成高置信方向。
 
-    现在先把三票归一化成互斥分布（`probabilities`），confidence 取分布里的
-    最大分量，margin 取它与第二分量之差：两者都是真正定义良好的量。
-    原始票值仍然逐条记录在 `suggested_action_votes` 里，另外把归一化前的
-    最大值单独记为 `raw_max_vote`，所以没有任何信息丢失。
+    因此 `confidence` 保留最高原始兼容分，`action_margin` 只表示最高分与次高分
+    的启发式分离度；两者都不声称是校准后的分类概率。返回键 `probabilities` 为
+    兼容旧读取器而保留，但值就是原始分数，不再归一化。
     """
     raw = {str(key): _jev_policy_probability(value) for key, value in votes.items()}
     usable = {key: value for key, value in raw.items() if value >= 0}
@@ -2157,14 +2157,10 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
             "action_status": "missing_action_votes",
         }
     total = sum(usable.values())
-    if total > 0:
-        probabilities = {key: value / total for key, value in usable.items()}
-    else:
-        # 三票全为 0：没有任何方向倾向，保持全 0 而不是伪造均匀分布。
-        probabilities = dict(usable)
-    ranked = sorted(probabilities.values(), reverse=True)
-    suggested_action = max(probabilities, key=probabilities.get)
-    confidence = probabilities[suggested_action]
+    scores = dict(usable)
+    ranked = sorted(scores.values(), reverse=True)
+    suggested_action = max(scores, key=scores.get)
+    confidence = scores[suggested_action]
     second = ranked[1] if len(ranked) > 1 else -1.0
     margin = confidence - second if second >= 0 else -1.0
     raw_max_vote = max(usable.values())
@@ -2173,6 +2169,11 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
     # `INSUFFICIENT_DATA`。模型侧的答案改问「有没有方向性优势」，低分意味着
     # 「无优势」（一个市场判断），由调用方映射成 WAIT，不再冒充数据错误。
     ready_probability = _jev_policy_probability(execution_ready)
+    required_confidence = (
+        wait_min_confidence
+        if suggested_action == "WAIT" and wait_min_confidence is not None
+        else min_confidence
+    )
     if (suggested_action in ENTRY_ACTIONS and execution_ready is not None
           and ready_probability < 0):
         status = "missing_execution_ready"
@@ -2181,7 +2182,7 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
           and ready_probability < execution_ready_min):
         status = "not_ready"
         suggested_action = "WAIT"
-    elif confidence < min_confidence:
+    elif confidence < required_confidence:
         status = "low_confidence"
         suggested_action = "WAIT"
     elif margin >= 0 and margin < min_margin:
@@ -2191,10 +2192,12 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
         status = "accepted"
     return {
         "suggested_action": suggested_action,
-        "probabilities": probabilities,
+        # 兼容历史 schema；这些值是独立兼容分，不是和为 1 的分类概率。
+        "probabilities": scores,
         "confidence": confidence if confidence >= 0 else -1.0,
         "action_margin": margin if margin >= 0 else -1.0,
         "action_status": status,
+        "confidence_threshold": required_confidence,
         # 保留 -1.0「未作答」哨兵：max(0.0, x) 会把「没问过」压成 0.0，
         # 与「模型明确答 0.0」无法区分，下游任何求均值都会把未测量的行
         # 当成强烈否定（2026-09-26 的 98% 恒 REJECT 就是这个失效模式）。
@@ -2244,15 +2247,19 @@ def _jev_audit_verdict(flags: Iterable[str], *, data_complete: Any = None,
 
 
 def _jev_policy_relation(main_action: Any, independent_action: Any, *, data_status: str,
-             audit_verdict_value: str = "APPROVE") -> str:
+             audit_verdict_value: str = "APPROVE",
+             action_status: str = "") -> str:
     """Classify the independent Jev result relative to the main action."""
     main = _jev_normalize_choice(main_action)
     independent = _jev_normalize_choice(independent_action)
-    if audit_verdict_value == "NOT_APPLICABLE":
-        return "NOT_APPLICABLE"
     if audit_verdict_value == "REJECT":
         return "AUDIT_REJECT"
     if data_status not in {"valid", "accepted"} or independent in {"", "INSUFFICIENT_DATA"}:
+        return "ABSTAIN"
+    if str(action_status or "") in {
+        "low_confidence", "ambiguous", "not_ready",
+        "missing_action_votes", "missing_execution_ready",
+    }:
         return "ABSTAIN"
     if main in ENTRY_ACTIONS and independent == "WAIT":
         return "WAIT_VS_ENTRY"
@@ -2290,19 +2297,18 @@ def _jev_resolve_enforcement(configured: Any) -> Dict[str, Any]:
 
 def _jev_enforcement_decision(*, mode: str, main_action: Any, independent: Mapping[str, Any],
                               entry_mode: str, hard_gates_passed: bool,
-                              hard_veto_code_only: bool = True) -> Dict[str, Any]:
+                              hard_veto_code_only: bool = True,
+                              veto_wait_min_confidence: float = 0.70,
+                              veto_min_margin: float = 0.15) -> Dict[str, Any]:
     """按方案 §9 判定本候选在各档位下**应当**被如何处理（只判定，不执行）。
+
+    `no_edge` 是观测标签，只表示 WAIT 已通过较低的分类门槛；它不能自动成为否决
+    资格。明确 WAIT 还必须独立通过 veto confidence 和 margin，避免为了保留 no_edge
+    可观测性而意外降低风险门槛。
 
     返回的是「若该档位已启用，本候选会被怎么处理」，用于落盘与评估。它**不**改变
     主脑动作：阶段 C/D 的执行门控需要先有样本外证据（§9 阶段 D），在没有证据之前
     把判定接到执行上，等于用未标定的信号动真钱。
-
-    判据（§9 阶段 C，只针对主脑**新开仓**）：
-
-    - 主脑必须是入场动作，且 `entry_mode == "initial"`（加仓/持仓管理不适用）；
-    - Jev 的 `data_status` 必须是 `valid`（`INSUFFICIENT_DATA` 不得当反向信号）；
-    - 独立动作置信度与 margin 都已通过门槛（由调用方在 `data_status` 上体现）；
-    - 且与主脑**反向**，或明确 `WAIT`。
     """
     normalized_mode = str(mode or "shadow").strip().lower()
     if normalized_mode not in _JEV_ENFORCEMENT_MODES:
@@ -2311,22 +2317,45 @@ def _jev_enforcement_decision(*, mode: str, main_action: Any, independent: Mappi
     independent_action = _jev_normalize_choice(independent.get("suggested_action"))
     data_status = str(independent.get("data_status") or "invalid")
     action_status = str(independent.get("action_status") or "")
+    confidence = _jev_policy_probability(independent.get("confidence"))
+    action_margin = _jev_policy_probability(independent.get("action_margin"))
     reasons: List[str] = []
 
-    # 代码硬门禁失败时，否决由代码产生，与 Jev 无关（§6 规则 1 / §9 阶段 D）。
-    if not hard_gates_passed:
-        return {"decision": "HARD_VETO", "mode": normalized_mode,
-                "reasons": ["code_hard_gate_failed"],
-                "affects_execution": False}
-
-    # §9 阶段 C 要求「独立动作置信度和 margin 都过门槛」。票决未过门槛时
-    # action_status 是 low_confidence / ambiguous / not_ready —— 那表示 Jev
-    # **拿不准**（或执行条件不备），不是「明确 WAIT」。把它算作否决依据，等于
-    # 用弱信号推翻主脑，且会把「模型犹豫」误读成「模型反对」。
-    passed_thresholds = action_status in {"accepted", "no_edge"}
+    classification_thresholds_passed = action_status in {"accepted", "no_edge"}
     explicit_wait = action_status == "no_edge"
     opposite = (main in ENTRY_ACTIONS and independent_action in ENTRY_ACTIONS
                 and independent_action != main)
+    # VETO_MIN_ACTION_MARGIN 是通用 enforcement 门槛：反向方向和明确 WAIT
+    # 都必须重新通过，不能只沿用各自较低的分类门槛。
+    opposite_veto_thresholds_passed = (
+        opposite
+        and action_status == "accepted"
+        and action_margin >= veto_min_margin
+    )
+    wait_veto_thresholds_passed = (
+        explicit_wait
+        and confidence >= veto_wait_min_confidence
+        and action_margin >= veto_min_margin
+    )
+    veto_thresholds_passed = (
+        opposite_veto_thresholds_passed or wait_veto_thresholds_passed
+    )
+
+    def _result(decision: str, result_reasons: List[str], *,
+                veto_eligible: bool = False) -> Dict[str, Any]:
+        return {
+            "decision": decision,
+            "mode": normalized_mode,
+            "reasons": result_reasons,
+            "affects_execution": False,
+            "veto_eligible": veto_eligible,
+            "veto_thresholds_passed": veto_thresholds_passed,
+            "veto_wait_min_confidence": veto_wait_min_confidence,
+            "veto_min_action_margin": veto_min_margin,
+        }
+
+    if not hard_gates_passed:
+        return _result("HARD_VETO", ["code_hard_gate_failed"])
 
     eligible = True
     if main not in ENTRY_ACTIONS:
@@ -2338,7 +2367,7 @@ def _jev_enforcement_decision(*, mode: str, main_action: Any, independent: Mappi
     if data_status != "valid":
         eligible = False
         reasons.append("independent_data_status_not_valid")
-    if not passed_thresholds:
+    if not classification_thresholds_passed:
         eligible = False
         reasons.append("independent_thresholds_not_passed")
     if independent_action == "INSUFFICIENT_DATA":
@@ -2347,46 +2376,51 @@ def _jev_enforcement_decision(*, mode: str, main_action: Any, independent: Mappi
     if main in ENTRY_ACTIONS and independent_action == main:
         eligible = False
         reasons.append("independent_agrees")
-    if eligible and not (opposite or explicit_wait):
-        # 过门槛但不是反向、也不是明确 WAIT ⇒ 没有否决依据（§9 阶段 C）。
+
+    # no_edge 的 0.54 只负责把「市场平淡」与「模型拿不准」分开。真正把明确 WAIT
+    # 升格为否决依据时，必须重新通过独立的 veto 门槛。
+    if opposite and action_status == "accepted" and not opposite_veto_thresholds_passed:
+        eligible = False
+        if action_margin < veto_min_margin:
+            reasons.append("opposite_veto_margin_below_threshold")
+    if explicit_wait and not wait_veto_thresholds_passed:
+        eligible = False
+        if confidence < veto_wait_min_confidence:
+            reasons.append("wait_veto_confidence_below_threshold")
+        if action_margin < veto_min_margin:
+            reasons.append("wait_veto_margin_below_threshold")
+    if eligible and not (opposite_veto_thresholds_passed or wait_veto_thresholds_passed):
         eligible = False
         reasons.append("no_veto_grounds")
 
     if normalized_mode == "shadow":
-        return {"decision": "SHADOW", "mode": normalized_mode,
-                "reasons": reasons or ["shadow_mode_records_only"],
-                "affects_execution": False}
+        return _result("SHADOW", reasons or ["shadow_mode_records_only"],
+                       veto_eligible=eligible)
     if normalized_mode == "review":
-        return {"decision": "REVIEW", "mode": normalized_mode,
-                "reasons": reasons or ["review_mode_flags_for_human"],
-                "affects_execution": False}
+        return _result("REVIEW", reasons or ["review_mode_flags_for_human"],
+                       veto_eligible=eligible)
     if normalized_mode == "hard_veto":
-        # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES=1`：硬否决只允许来自代码门禁
-        # （在上面的分支已返回）。Jev 自身的判定最高只能到软否决，因此这里与
-        # soft_veto 档位同解 —— 不满足条件时必须是 NONE，而不是假装有个候选。
         if hard_veto_code_only:
-            return {"decision": "SOFT_VETO" if eligible else "NONE",
-                    "mode": normalized_mode,
-                    "reasons": (reasons + ["hard_veto_capped_to_soft_by_code_only_gate"]
-                                if eligible else
-                                reasons + ["hard_veto_capped_to_soft_by_code_only_gate",
-                                           "no_veto_grounds"]),
-                    "affects_execution": False}
-        return {"decision": "HARD_VETO" if eligible else "NONE",
-                "mode": normalized_mode, "reasons": reasons,
-                "affects_execution": False}
-    # soft_veto：标记待评估，不自行改变执行（§9 阶段 C）。
-    return {"decision": "SOFT_VETO_CANDIDATE" if eligible else "NONE",
-            "mode": normalized_mode,
-            "reasons": reasons or ["soft_veto_eligible"],
-            "affects_execution": False}
-
+            hard_reasons = (
+                reasons + ["hard_veto_capped_to_soft_by_code_only_gate"]
+                if eligible else
+                reasons + ["hard_veto_capped_to_soft_by_code_only_gate",
+                           "no_veto_grounds"]
+            )
+            return _result("SOFT_VETO" if eligible else "NONE", hard_reasons,
+                           veto_eligible=eligible)
+        return _result("HARD_VETO" if eligible else "NONE", reasons,
+                       veto_eligible=eligible)
+    return _result("SOFT_VETO_CANDIDATE" if eligible else "NONE",
+                   reasons or ["soft_veto_eligible"], veto_eligible=eligible)
 
 def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
                        audit: Mapping[str, Any], enforcement: str = "shadow",
                        hard_gates_passed: bool = True,
                        entry_mode: str = "initial",
-                       hard_veto_code_only: bool = True) -> Dict[str, Any]:
+                       hard_veto_code_only: bool = True,
+                       veto_wait_min_confidence: float = 0.70,
+                       veto_min_margin: float = 0.15) -> Dict[str, Any]:
     """Combine both Jev lanes without changing the executable main action."""
     independent_action = _jev_normalize_choice(independent.get("suggested_action"))
     audit_value = str(audit.get("verdict") or "REVIEW").upper()
@@ -2398,11 +2432,14 @@ def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
         independent_action,
         data_status=data_status,
         audit_verdict_value=audit_value,
+        action_status=str(independent.get("action_status") or ""),
     )
     enforcement_outcome = _jev_enforcement_decision(
         mode=enforcement, main_action=main_action, independent=independent,
         entry_mode=entry_mode, hard_gates_passed=hard_gates_passed,
         hard_veto_code_only=hard_veto_code_only,
+        veto_wait_min_confidence=veto_wait_min_confidence,
+        veto_min_margin=veto_min_margin,
     )
     return {
         "jev_independent_action": independent_action,
@@ -2415,6 +2452,10 @@ def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
         "jev_enforcement": str(enforcement or "shadow").upper(),
         "jev_enforcement_decision": enforcement_outcome["decision"],
         "jev_enforcement_reasons": enforcement_outcome["reasons"],
+        "jev_veto_eligible": enforcement_outcome["veto_eligible"],
+        "jev_veto_thresholds_passed": enforcement_outcome["veto_thresholds_passed"],
+        "jev_veto_wait_min_confidence": enforcement_outcome["veto_wait_min_confidence"],
+        "jev_veto_min_action_margin": enforcement_outcome["veto_min_action_margin"],
         # 本轮是否有任何档位**真的**改变了主脑执行。阶段 C/D 的执行门控需要样本外
         # 证据（§9 阶段 D），因此当前恒为 False；写出来是为了让台账能自证这一点，
         # 而不是让读者去猜。
@@ -3190,13 +3231,17 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         except (TypeError, ValueError):
             return fallback
 
-    # 门槛默认值按 2026-09-26 实测分布推导，推导规则见 docs/LOCAL_CHANGELOG.md。
-    # 规则：**有效性**门槛取该通道自身分布的中位数（只滤掉较弱的一半，而不是
-    # 拒掉 84%）；**接受**门槛取归一化 confidence 的 p75（接纳较强的四分位）。
-    # 全部可用环境变量覆盖；这里改默认值只是因为旧的 0.70/0.5 是按「有锚分布」
-    # 标定的，而独立通道在无锚后整条分布下移，旧门槛结构性不可达。
-    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.54)
+    # 方向动作与明确 WAIT 使用不同的绝对置信门槛。方向动作维持较保守的 0.70；
+    # WAIT/no_edge 只是在影子层声明「市场平淡」，不直接发单，因此保留 0.54 门槛，
+    # 避免所有中等强度 WAIT 都退化成 ABSTAIN、让 no_edge 标签失去可观测性。
+    # 两者都必须同时通过同一个 action margin 门槛。
+    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.70)
+    no_edge_min_confidence = _threshold("R20_JEV_NO_EDGE_MIN_CONFIDENCE", 0.54)
     min_margin = _threshold("R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
+    # no_edge 的分类门槛只服务观测；否决资格必须单独过更严格的 enforcement 门槛。
+    veto_wait_min_confidence = _threshold(
+        "R20_JEV_VETO_WAIT_MIN_CONFIDENCE", 0.70)
+    veto_min_margin = _threshold("R20_JEV_VETO_MIN_ACTION_MARGIN", 0.15)
     # `R20_JEV_DATA_VALID_MIN_PROBABILITY` 已随拆分移除：独立通道不再对模型的
     # 数据有效性自述设门禁（完整性/一致性改由代码判定），因此该配置项不再读取。
     # 留着一个读取了却不生效的环境变量比删掉它更危险 —— 它会让人以为改得动。
@@ -3227,7 +3272,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "WAIT": independent_answers.get(f"{prefix}_would_wait"),
         }, min_confidence=min_confidence, min_margin=min_margin,
             execution_ready=execution_ready,
-            execution_ready_min=execution_ready_min)
+            execution_ready_min=execution_ready_min,
+            wait_min_confidence=no_edge_min_confidence)
         choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
         if choice not in {"BUY_LONG", "SELL_SHORT", "WAIT", "INSUFFICIENT_DATA"}:
             choice = vote_result["suggested_action"]
@@ -3316,6 +3362,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             enforcement=review["enforcement_mode"],
             entry_mode=str(proposal.get("entry_mode") or "initial"),
             hard_veto_code_only=review.get("hard_veto_code_only", True),
+            veto_wait_min_confidence=veto_wait_min_confidence,
+            veto_min_margin=veto_min_margin,
         )
         return {
             "instId": proposal["instId"],
@@ -3346,6 +3394,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "jev_raw_max_vote": vote_result.get("raw_max_vote", -1.0),
             "jev_vote_sum": vote_result.get("vote_sum", 0.0),
             "jev_action_status": action_status,
+            "jev_confidence_threshold": vote_result.get("confidence_threshold", min_confidence),
             "quote_source": "okx",
             "audit_proposal_complete": audit_complete,
             "audit_proposal_consistent": audit_answers.get(f"{prefix}_thesis_supported"),
