@@ -1,6 +1,57 @@
 # R20 本地改动记录
 
-## 2026-09-26
+## 2026-09-26（下半场）
+
+### Jev 独立通道：拆分「完整性 / 一致性 / 方向性优势」
+
+问题：代码侧 `data_quality` 恒为 `valid`（210/210），而模型被问的那道
+`candidate_*_data_valid` 同时承担「数据够不够」与「有没有机会」两件事，于是它对
+**优势**的判断被记成 `invalid_data` —— 线上 65/80 个候选如此，标签与事实 100%
+矛盾。铁证：代码可测的数据属性**全部无方差**（`data_quality` 恒 valid、
+`direction_layers` 三层 quality 恒 0.9/1.0/1.0、null 数恒定），而该字段 sd=0.161，
+且与 `price_position_in_range` 的标的内中心化相关 r=−0.55 —— 数据没有方差，
+字段有方差，它测的不是数据。
+
+拆分后：
+
+- **代码拥有**完整性与一致性，且**独占** `INSUFFICIENT_DATA`。新增
+  `_jev_candidate_state_quality` / `_jev_position_state_quality`：必需字段缺失
+  → `code_state_incomplete`；价格非正、盘口交叉、价格偏离报价、4H K 线时间戳
+  错位、`position_in_range` 越界、方向层缺失 → `code_state_inconsistent`。
+  **`direction_observation.status == CONFLICT` 不算不一致** —— 多周期证据互相
+  矛盾是市场事实，不是载荷损坏；把它当数据问题会丢掉真实的分歧信息。
+- **模型只答判断**：`candidate_*_data_valid` → `candidate_*_edge_present`
+  （有没有方向性优势），`position_*_data_valid` → `position_*_management_warranted`
+  （有没有需要动作的理由）。题面明确告知完整性与一致性「不是你的事」。
+- **`edge_present` 只记录、不作否决门**。该题是全新的、无历史分布可标定；让未标定
+  的问题否决方向，正是此前「90 个候选 0 个方向输出」的成因。等它有样本、可按已
+  结算结果标定后，再考虑升级为门槛（方案 §5.1 本就把它定位为「解释维度和门槛」，
+  先做前者）。测试 `test_low_edge_alone_does_not_veto_a_confident_direction`
+  显式钉住这一点，防止有人无证据地把它改成门。
+- **`no_edge` 成为独立状态**：票决明确选 WAIT ⇒ `no_edge`（市场没给方向），与
+  `low_confidence`（拿不准）分开记录，不再冒充数据故障。
+- 移除 `cycle_data_valid`：实测该答案**从不参与任何判定**，只被记进
+  `aggregate_answers` —— 一道既名不副实又白付一次推理成本的问题。整轮质量改由
+  代码汇总记录在 `code_cycle_quality`。
+- 移除 `R20_JEV_DATA_VALID_MIN_PROBABILITY`：拆分后不再读取。留一个「读了却不
+  生效」的环境变量比删掉它更危险（它会让人以为改得动）。
+- 新增 `question_semantics_version=2` 标记语义版本：1 = 拆分前（模型答
+  `*_data_valid`，低分记 `invalid_data`），2 = 拆分后。**新旧样本不可混统计。**
+- 下游状态映射同步：`code_state_*` → `STATE_DEFECT`，`no_edge` → `NO_EDGE`；
+  旧的 `invalid_data`/`missing_data_valid` 保留仅为兼容历史记录。
+
+验证：
+
+- JEV 契约测试 27/27 通过（含新增 `CompletenessIsCodeOwnedTest` 五条边界）。
+- 全量 3235 个测试：失败集与拆分前**逐项相同**（各 34 个，均为既有失败），
+  零新增。
+- 线上实测（14:31、14:46 两轮，`question_semantics_version=2`）：
+  `code_cycle_quality` 全部 `ok`（0 不完整 / 0 不一致），**`invalid_data` 与
+  `INSUFFICIENT_DATA` 归零**（此前 65/80 被误标），产出方向信号
+  （UNI BUY_LONG ×2、BTC SELL_SHORT ×1）。`edge_present` 取值 0.20~0.68，
+  说明新题面在真实 state 上有判别力。
+
+## 2026-09-26（上半场）
 
 ### Jev 独立通道：测量有效性修复（Tier 1 + Tier 2）
 

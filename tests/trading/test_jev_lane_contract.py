@@ -39,9 +39,52 @@ _ENTRY_AUDIT_QUESTIONS = 7
 
 
 def _pkg(inst_id: str) -> Dict[str, Any]:
+    """一个**代码侧完整且自洽**的候选。
+
+    2026-09-26 拆分后，完整性/一致性由代码判定（`_jev_candidate_state_quality`）
+    并独占 `INSUFFICIENT_DATA`。因此夹具必须带上做方向判断所需的字段
+    （`direction_observation` / `direction_layers`），否则候选会被正确地判为
+    「state 不完整」——那会让票决测试测不到它本来想测的东西。
+    """
     return {"instId": inst_id, "name": inst_id.split("-")[0], "price": 100.0,
             "bidPx": 99.9, "askPx": 100.1, "ctVal": 1.0, "minSz": 1.0,
-            "base_sz": 1.0, "data_quality": "valid"}
+            "base_sz": 1.0, "data_quality": "valid",
+            "direction_observation": {
+                "status": "ALIGNED_BULL", "brain_candle_ts_4h": 1000,
+                "trader_candle_ts_4h": 1000, "price_position_in_range": 0.5,
+            },
+            "direction_layers": {
+                "direction_4h": {"direction": 1}, "strength_1h": {"direction": 1},
+                "entry_15m": {"direction": 1},
+            }}
+
+
+def _factor(inst_id: str) -> Dict[str, Any]:
+    """trader 因子快照：生产里由 `observe_cycle` 写入 `direction_observation`。
+
+    候选的 `direction_observation` / `direction_layers` 实际取自这里（而不是
+    brain package），因此夹具必须通过它注入，否则 `compare_directions` 会因
+    缺少 trader 侧数据而算出 `status=INSUFFICIENT_DATA` —— 那会让代码侧正确地
+    判定 state 不自洽，测试也就测不到票决逻辑了。
+    """
+    return {
+        "instId": inst_id,
+        "direction_observation": {
+            "schema_version": 1, "status": "ALIGNED_BULL",
+            "sources": {"macro_4h": "BULL", "market_regime": "BULL",
+                        "calculus_regime": "BULL"},
+            "macro_4h": "4H_MACRO_BULL", "market_regime": "BULL_TREND",
+            "calculus_regime": "BULL_ACCELERATING",
+            "brain_candle_ts_4h": 1000, "trader_candle_ts_4h": 1000,
+            "price_position_in_range": 0.5,
+            "range_4h_high": 110.0, "range_4h_low": 90.0,
+        },
+        "direction_layers": {
+            "direction_4h": {"direction": 1, "quality": 0.9},
+            "strength_1h": {"direction": 1, "quality": 1.0},
+            "entry_15m": {"direction": 1, "quality": 1.0},
+        },
+    }
 
 
 def _cache(inst_id: str, action: str) -> Dict[str, Any]:
@@ -118,6 +161,7 @@ class _Harness(unittest.TestCase):
             active_positions_detail=kwargs.pop("positions", []),
             position_management=kwargs.pop("management", []),
             usdt_available=44.0,
+            trader_factors=kwargs.pop("factors", [_factor(k) for k in mapping]),
         )
         path = os.path.join(self.tmp.name, "jev_shadow_reviews.jsonl")
         with open(path, "r", encoding="utf-8") as handle:
@@ -128,6 +172,135 @@ class _Harness(unittest.TestCase):
             if row["channel"] == channel:
                 return row["payload"].get("questions") or {}
         self.fail(f"未捕获到通道 {channel} 的 payload")
+
+
+class CompletenessIsCodeOwnedTest(_Harness):
+    """拆分契约：完整性/一致性归**代码**，且只有代码能触发 `INSUFFICIENT_DATA`。
+
+    2026-09-26 之前，模型的一道 `*_data_valid` 同时承担「数据够不够」与「有没
+    有机会」，低分被记成 `invalid_data` —— 线上 65/80 个候选如此，而它们的代码
+    `data_quality` 全是 `valid`，标签与事实 100% 矛盾。本类钉住拆分后的三条边界。
+    """
+
+    #: 高信心方向票：若模型侧仍在数据门槛上判门，低 edge 就会杀掉这个方向。
+    probabilities: Dict[str, float] = {
+        "edge_present": 0.95, "execution_ready": 0.95,
+        "would_buy_long": 0.9, "would_sell_short": 0.05, "would_wait": 0.1,
+    }
+
+    def test_low_edge_alone_does_not_veto_a_confident_direction(self):
+        """**有意为之**：`edge_present` 本轮只记录、不作否决门。
+
+        该题是全新的、没有任何历史分布可标定；让一个未标定的问题去否决方向，
+        正是此前「90 个候选 0 个方向输出」的成因。方向由三票票决决定，
+        edge 答案单独记录以便日后按已结算结果标定成门槛。若哪天有人把它改成
+        否决门，这条断言会失败，提醒他先拿出标定证据。
+        """
+        case = self._with_probabilities({"edge_present": 0.05})
+        row = case.run_review({"ETH-USDT-SWAP": "BUY_LONG"})["instrument_reviews"][0]
+        self.assertAlmostEqual(row["edge_probability"], 0.05, places=6,
+                               msg="低 edge 必须被如实记录")
+        self.assertEqual(row["suggested_action"], "BUY_LONG",
+                         "edge 低不得单独否决高信心方向票（无标定证据前）")
+
+    def test_confident_wait_is_labelled_no_edge(self):
+        """票决明确选 WAIT ⇒ 「无优势」，与「拿不准」分开记录。"""
+        case = self._with_probabilities({
+            "edge_present": 0.05, "execution_ready": 0.95,
+            "would_buy_long": 0.1, "would_sell_short": 0.05, "would_wait": 0.9,
+        })
+        row = case.run_review({"ETH-USDT-SWAP": "BUY_LONG"})["instrument_reviews"][0]
+        self.assertEqual(row["suggested_action"], "WAIT")
+        self.assertEqual(row["jev_action_status"], "no_edge")
+        self.assertEqual(row["code_state_status"], "ok",
+                         "夹具完整自洽，代码侧不该报缺陷")
+        self.assertNotIn(row["jev_action_status"],
+                         {"invalid_data", "missing_data_valid"},
+                         "「无优势」不得再冒充数据故障")
+
+    def _with_probabilities(self, overrides: Dict[str, float]):
+        """克隆本测试类并覆盖假答案表（夹具需要不同的答案分布）。"""
+        base = self
+
+        class Case(self.__class__):
+            probabilities = {**self.probabilities, **overrides}
+
+        case = Case(base._testMethodName)
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def test_inconsistent_state_is_insufficient_data(self):
+        """代码侧发现矛盾 ⇒ INSUFFICIENT_DATA，且理由是 `code_state_*`。"""
+        review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+        self.assertEqual(review["instrument_reviews"][0]["code_state_status"], "ok",
+                         "完整夹具的代码侧基线必须是 ok")
+        # 不给 trader 因子：代码无法构成方向观测，是**载荷**问题。
+        row = self.run_review_missing_direction(
+            {"ETH-USDT-SWAP": "BUY_LONG"})["instrument_reviews"][0]
+        self.assertEqual(row["code_state_status"], "inconsistent")
+        self.assertIn("direction_observation_insufficient",
+                      row["code_state_consistency_flags"])
+        self.assertEqual(row["suggested_action"], "INSUFFICIENT_DATA")
+        self.assertEqual(row["jev_action_status"], "code_state_inconsistent")
+
+    def test_quality_helper_classifies_the_three_cases(self):
+        """`_jev_candidate_state_quality` 的三种判定，直接单测（不经出网）。"""
+        ok = _factor("ETH-USDT-SWAP")
+        healthy = {"instId": "ETH-USDT-SWAP", "price": 100.0, "bidPx": 99.9,
+                   "askPx": 100.1, "direction_observation": ok["direction_observation"],
+                   "direction_layers": ok["direction_layers"]}
+        self.assertEqual(abt._jev_candidate_state_quality(healthy)["status"], "ok")
+
+        incomplete = dict(healthy)
+        incomplete.pop("direction_layers")
+        got = abt._jev_candidate_state_quality(incomplete)
+        self.assertEqual(got["status"], "insufficient_data")
+        self.assertEqual(got["missing_fields"], ["direction_layers"])
+
+        # CONFLICT 是**市场事实**（多周期证据互相矛盾），不是载荷损坏。
+        conflicted = dict(healthy)
+        conflicted["direction_observation"] = {
+            **ok["direction_observation"], "status": "CONFLICT"}
+        self.assertEqual(abt._jev_candidate_state_quality(conflicted)["status"], "ok",
+                         "多周期分歧不得被当成数据不一致")
+
+        crossed = dict(healthy, bidPx=100.2, askPx=99.9)
+        got = abt._jev_candidate_state_quality(crossed)
+        self.assertEqual(got["status"], "inconsistent")
+        self.assertIn("crossed_book", got["consistency_flags"])
+
+    def test_model_never_answers_a_data_question(self):
+        """独立通道不得再出现 `*_data_valid` —— 那是代码拥有的属性。"""
+        self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+        leaked = [k for k in self.questions("independent") if k.endswith("_data_valid")]
+        self.assertEqual(leaked, [],
+                         "模型侧又在答数据有效性了 —— 那会重新引入标签矛盾")
+        self.assertIn("candidate_0_edge_present", self.questions("independent"))
+
+    def test_edge_answer_is_recorded_but_does_not_veto_direction(self):
+        """`edge_present` 只记录、不作否决门 —— 未标定的门会重现「0 方向」。"""
+        row = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})["instrument_reviews"][0]
+        self.assertAlmostEqual(row["edge_probability"], 0.95, places=6)
+        self.assertEqual(row["suggested_action"], "BUY_LONG",
+                         "高 edge + 高方向票必须仍能产出方向")
+
+    def run_review_missing_direction(self, mapping: Dict[str, str]) -> Dict[str, Any]:
+        """跑一轮但把 `direction_observation`/`direction_layers` 从包里拿掉。"""
+        stripped = []
+        for key in mapping:
+            pkg = _pkg(key)
+            pkg.pop("direction_observation")
+            pkg.pop("direction_layers")
+            stripped.append(pkg)
+        abt._run_jev_shadow_review(
+            standard_cache={k: _cache(k, v) for k, v in mapping.items()},
+            packages=stripped,
+            time_str="2026-09-26 08:00:00",
+            active_positions_detail=[], position_management=[], usdt_available=44.0)
+        path = os.path.join(self.tmp.name, "jev_shadow_reviews.jsonl")
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.loads(handle.read().strip().splitlines()[-1])
 
 
 class PayloadTypeContractTest(_Harness):
@@ -215,7 +388,7 @@ class AuditDataIsSelfDescribingTest(_Harness):
     """
 
     probabilities = {
-        "data_valid": 0.9, "execution_ready": 0.9,
+        "edge_present": 0.9, "execution_ready": 0.9,
         "would_buy_long": 0.8, "would_sell_short": 0.05, "would_wait": 0.15,
         "thesis_supported": 0.8, "direction_conflict": 0.1, "entry_is_chasing": 0.2,
         "stop_structurally_valid": 0.85, "reward_after_cost_sufficient": 0.8,
@@ -255,12 +428,12 @@ class AuditDataIsSelfDescribingTest(_Harness):
         self.assertTrue(all(v >= -1.0 for v in probs.values()))
         self.assertTrue(all(isinstance(v, (int, float)) for v in probs.values()))
 
-    def test_data_valid_probability_keeps_the_missing_sentinel(self):
+    def test_model_side_answers_keep_the_missing_sentinel(self):
         """A：`max(0.0, x)` 会把「没问过」压成 0.0，与「模型答 0.0」无法区分。
 
         同一失效模式曾污染审计通道（98% 恒 REJECT）。`audit_probabilities` 一直
-        保留 -1.0 哨兵并有测试守护；这里把同源的 data_valid_probability /
-        execution_ready_probability 也钉住，避免它再次塌成 0。
+        保留 -1.0 哨兵并有测试守护；这里把模型侧的其他答案
+        （edge_probability / execution_ready_probability）也钉住。
         """
         # 测试装置总会回答所有问题，所以这里用局部 patch 造出「真的一个答案都没有」。
         empty = {"status": "ok",
@@ -270,7 +443,7 @@ class AuditDataIsSelfDescribingTest(_Harness):
         with patch.object(abt, "_jev_shadow_request", lambda *a, **k: dict(empty)):
             review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
         row = review["instrument_reviews"][0]
-        self.assertEqual(row["data_valid_probability"], -1.0,
+        self.assertEqual(row["edge_probability"], -1.0,
                          "缺答必须是 -1.0 哨兵，不得塌成 0.0")
         self.assertEqual(row["execution_ready_probability"], -1.0)
 
@@ -379,7 +552,7 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
     """去掉 choice 后，独立动作必须仍由票决（带 margin）推导。"""
 
     probabilities = {
-        "data_valid": 0.95,
+        "edge_present": 0.95,
         "execution_ready": 0.95,
         "would_buy_long": 0.90,
         "would_sell_short": 0.05,

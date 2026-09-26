@@ -1790,10 +1790,19 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                         # lane. Do not turn a directional answer on an already
                         # open position into a fictitious new entry sample.
                         jev_status_override = "NOT_ENTRY"
-                    elif shadow.get("jev_action_status") == "invalid_data":
+                    # 2026-09-26 拆分：数据类状态改由代码侧判定；`no_edge` 是**判断**
+                    # （市场没给方向），不是数据故障，因此单独归类，不再与
+                    # `INVALID_DATA` 混在一起 —— 旧口径把 65/80 个候选标成
+                    # `invalid_data`，而它们的代码 `data_quality` 全是 valid。
+                    elif shadow.get("jev_action_status") in {
+                            "code_state_incomplete", "code_state_inconsistent"}:
+                        jev_status_override = "STATE_DEFECT"
+                    elif shadow.get("jev_action_status") == "no_edge":
+                        jev_status_override = "NO_EDGE"
+                    elif shadow.get("jev_action_status") in {
+                            "invalid_data", "missing_data_valid"}:
+                        # 兼容拆分前的旧记录，新记录不再产生这两个状态。
                         jev_status_override = "INVALID_DATA"
-                    elif shadow.get("jev_action_status") == "missing_data_valid":
-                        jev_status_override = "MISSING_DATA"
                     elif shadow.get("jev_action_status") in {
                             "insufficient_data", "missing_action_votes"}:
                         jev_status_override = "MISSING_DATA"
@@ -1810,7 +1819,7 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                         base_sample_type = "not_entry_position_management"
                     elif jev_status_override in {"NOT_READY", "MISSING_DATA"}:
                         base_sample_type = "jev_not_ready"
-                    elif jev_status_override in {"INVALID_DATA", "AMBIGUOUS"}:
+                    elif jev_status_override in {"STATE_DEFECT", "INVALID_DATA", "AMBIGUOUS"}:
                         base_sample_type = "jev_invalid_or_ambiguous"
                     elif main_action == "WAIT" and jev_action == "WAIT":
                         base_sample_type = "both_wait"
@@ -2024,10 +2033,104 @@ def _jev_normalize_choice(value: Any) -> str:
     return aliases.get(text, text)
 
 
+#: 中性候选 state 中，做任何方向判断所必需的字段。缺失即「不完整」。
+_JEV_REQUIRED_CANDIDATE_FIELDS = (
+    "instId", "price", "bidPx", "askPx", "direction_observation", "direction_layers",
+)
+
+#: 中性持仓 state 中，做任何持仓管理判断所必需的字段。
+_JEV_REQUIRED_POSITION_FIELDS = ("instId", "side", "pos", "avgPx", "markPx")
+
+
+def _jev_blank(value: Any) -> bool:
+    """字段是否为空缺（None / 空串 / 空容器）。0 与 False 不算空缺。"""
+    if value is None or value == "":
+        return True
+    return isinstance(value, (list, dict, tuple, set)) and not value
+
+
+def _jev_candidate_state_quality(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """代码侧确定性判定候选 state 的「完整性」与「一致性」。
+
+    这两项都是**载荷的属性**，不涉及任何方向判断，因此必须由代码判定，且只能由
+    代码触发 `INSUFFICIENT_DATA`。模型答的是「有没有方向性优势」，那是市场判断
+    （见 CONTEXT.md「数据属性」一节）——此前两者被合并成同一个问题，导致代码
+    侧 `data_quality` 恒为 valid 而模型对优势的判断被记成「数据无效」。
+    """
+    missing = [key for key in _JEV_REQUIRED_CANDIDATE_FIELDS
+               if _jev_blank(candidate.get(key))]
+    flags: List[str] = []
+    price = _jev_shadow_float(candidate.get("price"), 0.0)
+    bid = _jev_shadow_float(candidate.get("bidPx"), 0.0)
+    ask = _jev_shadow_float(candidate.get("askPx"), 0.0)
+    if price <= 0:
+        flags.append("price_not_positive")
+    if bid > 0 and ask > 0:
+        if ask < bid:
+            flags.append("crossed_book")
+        else:
+            if not (bid * 0.5 <= price <= ask * 1.5):
+                flags.append("price_outside_quote")
+    observation = candidate.get("direction_observation")
+    if isinstance(observation, Mapping):
+        # 代码当时就没能构成观测（缺层/取数失败/时间戳错位），是数据问题。
+        if str(observation.get("status") or "") == "INSUFFICIENT_DATA":
+            flags.append("direction_observation_insufficient")
+        brain_ts = observation.get("brain_candle_ts_4h")
+        trader_ts = observation.get("trader_candle_ts_4h")
+        if isinstance(brain_ts, int) and isinstance(trader_ts, int):
+            # 与 compare_directions 的 data_ready 同一容差，避免比代码更严。
+            if abs(brain_ts - trader_ts) > 4 * 3600 * 1000:
+                flags.append("candle_timestamp_mismatch")
+        position = observation.get("price_position_in_range")
+        if isinstance(position, (int, float)) and not 0.0 <= position <= 1.0:
+            flags.append("position_in_range_out_of_bounds")
+    layers = candidate.get("direction_layers")
+    if isinstance(layers, Mapping):
+        absent = [name for name in ("direction_4h", "strength_1h", "entry_15m")
+                  if _jev_blank(layers.get(name))]
+        if absent:
+            flags.append("direction_layers_incomplete")
+    # 注意：`direction_observation.status == CONFLICT` **不算**不一致 ——
+    # 多周期证据互相矛盾是**市场事实**，不是载荷损坏。把它当数据问题会把
+    # 真实的分歧信息误判成数据故障。
+    return {
+        "complete": not missing,
+        "missing_fields": missing,
+        "consistent": not flags,
+        "consistency_flags": flags,
+        "status": ("insufficient_data" if missing else
+                   ("inconsistent" if flags else "ok")),
+    }
+
+
+def _jev_position_state_quality(position: Mapping[str, Any]) -> Dict[str, Any]:
+    """代码侧确定性判定持仓 state 的完整性与一致性（同候选侧口径）。"""
+    missing = [key for key in _JEV_REQUIRED_POSITION_FIELDS
+               if _jev_blank(position.get(key))]
+    flags: List[str] = []
+    side = _jev_shadow_side(position.get("side"))
+    if side not in {"long", "short"}:
+        flags.append("side_unrecognized")
+    if _jev_shadow_float(position.get("pos"), 0.0) <= 0:
+        flags.append("size_not_positive")
+    if _jev_shadow_float(position.get("avgPx"), 0.0) <= 0:
+        flags.append("entry_price_not_positive")
+    if _jev_shadow_float(position.get("markPx"), 0.0) <= 0:
+        flags.append("mark_price_not_positive")
+    return {
+        "complete": not missing,
+        "missing_fields": missing,
+        "consistent": not flags,
+        "consistency_flags": flags,
+        "status": ("insufficient_data" if missing else
+                   ("inconsistent" if flags else "ok")),
+    }
+
+
 def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
-               min_margin: float, data_valid: Any = None,
+               min_margin: float,
                execution_ready: Any = None,
-               data_valid_min: float = 0.5,
                execution_ready_min: float = 0.5) -> Dict[str, Any]:
     """把三个兼容票决归一化成一个动作分布，再判断是否接受。
 
@@ -2065,15 +2168,12 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
     second = ranked[1] if len(ranked) > 1 else -1.0
     margin = confidence - second if second >= 0 else -1.0
     raw_max_vote = max(usable.values())
-    data_probability = _jev_policy_probability(data_valid)
+    # 2026-09-26 拆分：这里**不再**看模型的 data_valid —— 载荷的完整性与一致性
+    # 由代码侧 `_jev_candidate_state_quality` 判定，且只有它能触发
+    # `INSUFFICIENT_DATA`。模型侧的答案改问「有没有方向性优势」，低分意味着
+    # 「无优势」（一个市场判断），由调用方映射成 WAIT，不再冒充数据错误。
     ready_probability = _jev_policy_probability(execution_ready)
-    if data_valid is not None and data_probability < 0:
-        status = "missing_data_valid"
-        suggested_action = "INSUFFICIENT_DATA"
-    elif data_valid is not None and data_probability < data_valid_min:
-        status = "invalid_data"
-        suggested_action = "INSUFFICIENT_DATA"
-    elif (suggested_action in ENTRY_ACTIONS and execution_ready is not None
+    if (suggested_action in ENTRY_ACTIONS and execution_ready is not None
           and ready_probability < 0):
         status = "missing_execution_ready"
         suggested_action = "INSUFFICIENT_DATA"
@@ -2099,7 +2199,6 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
         # 与「模型明确答 0.0」无法区分，下游任何求均值都会把未测量的行
         # 当成强烈否定（2026-09-26 的 98% 恒 REJECT 就是这个失效模式）。
         # `audit_probabilities` 一直保留哨兵，这里补齐同源字段。
-        "data_valid_probability": data_probability,
         "execution_ready_probability": ready_probability,
         # 归一化前的原始最大值与票和，便于事后核对归一化是否是合理的加工。
         "raw_max_vote": raw_max_vote,
@@ -2620,8 +2719,13 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "macro_4h", "calculus_regime",
             "direction_observation", "direction_layers", "price", "bidPx", "askPx",
             "price_position_in_range", "price_position_basis", "candle_ts_4h",
+            # 代码侧的完整性与一致性判定结论。模型被告知「这不是你的事」，
+            # 因此把结论一并给它，避免它替代码重做这件事。
+            "state_quality",
         )
     } for proposal in proposals]
+    for candidate, proposal in zip(neutral_candidates, proposals):
+        candidate["state_quality"] = _jev_candidate_state_quality(proposal)
     neutral_positions = []
     audit_positions = []
     for position in position_proposals:
@@ -2629,7 +2733,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         audit_positions.append(context)
         # 白名单裁剪，不是「减掉几个 main_*」。理由见
         # `_JEV_NEUTRAL_POSITION_KEYS` 上方的注释。
-        neutral_positions.append(_jev_neutral_position_state(context))
+        neutral_position = _jev_neutral_position_state(context)
+        neutral_position["state_quality"] = _jev_position_state_quality(context)
+        neutral_positions.append(neutral_position)
 
     # 两个通道都显式白名单组装：候选见 `neutral_candidates`，持仓见
     # `_JEV_NEUTRAL_POSITION_KEYS`。新增字段默认不会进入独立通道。
@@ -2681,15 +2787,11 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         "main_position_proposals": audit_positions,
     }
 
-    independent_questions: Dict[str, Any] = {
-        "cycle_data_valid": {
-            "type": "boolean",
-            "instructions": (
-                "Is the supplied point-in-time market and position data sufficiently "
-                "complete and internally consistent?"
-            ),
-        },
-    }
+    # 2026-09-26 拆分：原先这里有一道 `cycle_data_valid`，问「整轮数据是否完整且
+    # 内部一致」。它是**代码拥有的属性**（见 `_jev_candidate_state_quality`），
+    # 而且实测该答案从不参与任何判定，只被记进 `aggregate_answers` —— 一道既
+    # 名不副实、又白付一次推理成本的问题。已移除；整轮质量改由代码侧汇总记录。
+    independent_questions: Dict[str, Any] = {}
     audit_questions: Dict[str, Any] = {
         "audit_data_valid": {
             "type": "boolean",
@@ -2717,20 +2819,25 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             # single choice answer cannot express. Keeping the question set
             # boolean-only also makes both lanes structurally identical, so a payload
             # shape accepted by one is accepted by the other.
-            f"{prefix}_data_valid": {
+            # 2026-09-26 拆分：这道题此前叫 `*_data_valid`，问「数据是否足以做方向判断」，
+# 但代码侧已用确定性方式拥有「完整性」与「一致性」（见
+# `_jev_candidate_state_quality`），于是同一个词被用来问两件不同的事，模型的
+# 优势判断被记成了「数据无效」。现在只问**优势**：完整与一致由代码判定，
+# 缺失/矛盾由代码触发 INSUFFICIENT_DATA，模型这道题低分只表示「无优势」。
+            f"{prefix}_edge_present": {
                 "type": "boolean",
                 "instructions": (
-                    f"Is the neutral market data for {inst_id} sufficient for an "
-                    "independent direction judgment? This asks ONLY whether the "
-                    "supplied facts are complete and internally consistent — it is "
-                    "NOT a question about whether you see a tradable edge. Say no "
-                    "only if a required fact is actually missing or contradictory. "
-                    "If the state is complete but flat, that is still sufficient "
-                    "data: express the absence of an edge in the would_* votes below, "
-                    "not here. Calibration: >=0.9 only when every field you need is "
-                    "present and consistent; ~0.5 when some relevant facts are absent "
-                    "but a judgment is still possible; <=0.2 only when a field needed "
-                    "for any direction call is missing or self-contradictory."
+                    f"Using only the neutral state for {inst_id}, is there a "
+                    "directional edge worth acting on in the next observation "
+                    "window? Completeness and internal consistency of the supplied "
+                    "facts are NOT your concern here — the code already checks "
+                    "those, and state_quality in the payload tells you its verdict. "
+                    "This question is only about whether the market itself offers an "
+                    "edge. Calibration: >=0.8 when the evidence clearly points one "
+                    "way; ~0.5 when it is genuinely balanced; <=0.2 when the market "
+                    "is flat, mid-range, or gives no directional signal. A complete, "
+                    "consistent state with no edge is a LOW score here, not a data "
+                    "problem."
                 ),
             },
             f"{prefix}_execution_ready": {
@@ -2820,9 +2927,21 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             # Same as the candidate lane above: no `*_action` choice question.
             # The `*_would_hold/_would_close/_would_update_sl` votes drive
             # `suggested_action` through `_jev_rank_votes`.
-            f"{prefix}_data_valid": {
+            # 与候选侧同一拆分：完整性/一致性归代码（`_jev_position_state_quality`），
+            # 模型只回答判断。此题此前问「state 是否足够完整」，现改问「是否有
+            # 需要改变管理的理由」——低分表示「无需动作」，不是数据问题。
+            f"{prefix}_management_warranted": {
                 "type": "boolean",
-                "instructions": f"Is the neutral position and market state for {inst_id} sufficiently complete for independent management?",
+                "instructions": (
+                    f"Using only the neutral position state for {inst_id}, is there a "
+                    "specific reason to change this position's management right now "
+                    "(close it, or tighten/adjust its protection), rather than "
+                    "leaving it alone? State completeness and consistency are NOT "
+                    "your concern — the code checks those and reports its verdict in "
+                    "state_quality. Calibration: >=0.8 when a concrete reason exists; "
+                    "~0.5 when it is borderline; <=0.2 when the position needs no "
+                    "action."
+                ),
             },
             f"{prefix}_would_hold": {
                 "type": "boolean",
@@ -2864,6 +2983,11 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
 
     review: Dict[str, Any] = {
         "schema_version": 3,
+        # 2 = 拆分后语义：完整性/一致性归代码（`code_state_*`），模型只答
+        # 「有没有方向性优势」（`edge_present` / `management_warranted`）。
+        # 1 = 拆分前：模型答 `*_data_valid`，低分被记成 `invalid_data`。
+        # 新旧样本**不可混统计**，用这个字段区分。
+        "question_semantics_version": 2,
         "timestamp": int(review_started_timestamp),
         "review_started_timestamp": review_started_timestamp,
         "time_str": time_str,
@@ -2927,7 +3051,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
     # 标定的，而独立通道在无锚后整条分布下移，旧门槛结构性不可达。
     min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.54)
     min_margin = _threshold("R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
-    data_valid_min = _threshold("R20_JEV_DATA_VALID_MIN_PROBABILITY", 0.36)
+    # `R20_JEV_DATA_VALID_MIN_PROBABILITY` 已随拆分移除：独立通道不再对模型的
+    # 数据有效性自述设门禁（完整性/一致性改由代码判定），因此该配置项不再读取。
+    # 留着一个读取了却不生效的环境变量比删掉它更危险 —— 它会让人以为改得动。
     execution_ready_min = _threshold(
         "R20_JEV_EXECUTION_READY_MIN_PROBABILITY", 0.44)
     audit_data_valid_min = _threshold(
@@ -2944,28 +3070,41 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
 
     def _candidate_review(index: int, proposal: Dict[str, Any]) -> Dict[str, Any]:
         prefix = f"candidate_{index}"
-        data_valid = independent_answers.get(f"{prefix}_data_valid")
+        # 拆分后的判据链：代码判「载荷好不好」，模型判「市场有没有优势」。
+        # `INSUFFICIENT_DATA` 只允许由代码侧的完整性/一致性触发。
+        code_quality = _jev_candidate_state_quality(proposal)
+        edge_present = independent_answers.get(f"{prefix}_edge_present")
         execution_ready = independent_answers.get(f"{prefix}_execution_ready")
         vote_result = _jev_rank_votes({
             "BUY_LONG": independent_answers.get(f"{prefix}_would_buy_long"),
             "SELL_SHORT": independent_answers.get(f"{prefix}_would_sell_short"),
             "WAIT": independent_answers.get(f"{prefix}_would_wait"),
         }, min_confidence=min_confidence, min_margin=min_margin,
-            data_valid=data_valid, execution_ready=execution_ready,
-            data_valid_min=data_valid_min,
+            execution_ready=execution_ready,
             execution_ready_min=execution_ready_min)
         choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
         if choice not in {"BUY_LONG", "SELL_SHORT", "WAIT", "INSUFFICIENT_DATA"}:
             choice = vote_result["suggested_action"]
-        data_probability = _jev_policy_probability(data_valid)
-        if data_probability < 0:
-            action, action_status, data_status = "INSUFFICIENT_DATA", "missing_data_valid", "invalid"
-        elif data_probability < data_valid_min:
-            action, action_status, data_status = "INSUFFICIENT_DATA", "invalid_data", "invalid"
+        edge_probability = _jev_policy_probability(edge_present)
+        if code_quality["status"] == "insufficient_data":
+            action, action_status, data_status = (
+                "INSUFFICIENT_DATA", "code_state_incomplete", "invalid")
+        elif code_quality["status"] == "inconsistent":
+            action, action_status, data_status = (
+                "INSUFFICIENT_DATA", "code_state_inconsistent", "invalid")
         else:
             action, action_status, data_status = choice, vote_result["action_status"], "valid"
             if action_status in {"not_ready", "low_confidence", "ambiguous", "missing_action_votes"}:
                 action = "WAIT" if action_status != "missing_action_votes" else "INSUFFICIENT_DATA"
+            elif action == "WAIT" and action_status == "accepted":
+                # 票决**明确**选了 WAIT（而不是"方向弱"）⇒ 事实完整自洽但市场没给
+                # 方向，即「无优势」。这是重贴标签，不改变任何动作，只是把
+                # 「市场平淡」与「模型拿不准」分开记录。
+                action_status = "no_edge"
+        # NOTE: `edge_present` 本轮**只记录、不作否决门**。该题是全新的，没有任何
+        # 历史分布可标定；让一个未标定的问题去否决方向，正是此前「0 方向性输出」
+        # 的成因。等它有足够样本、能按已结算结果标定后，再考虑升级为门槛
+        # （方案 §5.1 本就把它定位为「解释维度和门槛」，先做前者）。
 
         # Mirror the question-side gate: a WAIT proposal has no audit answers, so
         # every flag would be "missing" and the verdict would be a meaningless
@@ -3035,10 +3174,17 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "cycle_id": proposal.get("cycle_id", ""),
             "decision_id": proposal.get("decision_id", ""),
             "main_action": proposal.get("action", "WAIT"),
-            "data_valid": data_valid,
             "direction_consistent": independent_answers.get(f"{prefix}_direction_consistent"),
             "execution_ready": execution_ready,
-            "data_valid_probability": data_probability,
+            # 代码侧的完整性与一致性判定（拆分后 INSUFFICIENT_DATA 的唯一来源）。
+            "code_state_complete": code_quality["complete"],
+            "code_state_missing_fields": code_quality["missing_fields"],
+            "code_state_consistent": code_quality["consistent"],
+            "code_state_consistency_flags": code_quality["consistency_flags"],
+            "code_state_status": code_quality["status"],
+            # 模型侧的优势判断。**只记录，不作否决门**（见上方 NOTE）。
+            "edge_present": edge_present,
+            "edge_probability": edge_probability,
             "execution_ready_probability": _jev_policy_probability(execution_ready),
             "suggested_action": action,
             "suggested_action_votes": {
@@ -3066,25 +3212,28 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
 
     def _position_review(index: int, proposal: Dict[str, Any]) -> Dict[str, Any]:
         prefix = f"position_{index}"
-        data_valid = independent_answers.get(f"{prefix}_data_valid")
+        # 与候选侧同一拆分：完整性/一致性归代码，只有它能触发 INSUFFICIENT_DATA。
+        code_quality = _jev_position_state_quality(proposal)
+        management_warranted = independent_answers.get(f"{prefix}_management_warranted")
         vote_result = _jev_rank_votes({
             "HOLD": independent_answers.get(f"{prefix}_would_hold"),
             "CLOSE_MARKET": independent_answers.get(f"{prefix}_would_close"),
             "UPDATE_SL": independent_answers.get(f"{prefix}_would_update_sl"),
-        }, min_confidence=position_min_confidence, min_margin=position_min_margin,
-            data_valid=data_valid)
+        }, min_confidence=position_min_confidence, min_margin=position_min_margin)
         choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
         if choice not in {"HOLD", "CLOSE_MARKET", "UPDATE_SL", "INSUFFICIENT_DATA"}:
             choice = vote_result["suggested_action"]
-        data_probability = _jev_policy_probability(data_valid)
-        if data_probability < 0:
-            action, status = "INSUFFICIENT_DATA", "missing_data_valid"
-        elif data_probability < data_valid_min:
-            action, status = "INSUFFICIENT_DATA", "invalid_data"
+        if code_quality["status"] == "insufficient_data":
+            action, status = "INSUFFICIENT_DATA", "code_state_incomplete"
+        elif code_quality["status"] == "inconsistent":
+            action, status = "INSUFFICIENT_DATA", "code_state_inconsistent"
         else:
             action, status = choice, vote_result["action_status"]
             if status in {"low_confidence", "ambiguous", "missing_action_votes"}:
                 action = "INSUFFICIENT_DATA" if status == "missing_action_votes" else "HOLD"
+            elif action == "HOLD" and status == "accepted":
+                # 同候选侧：票决明确选 HOLD ⇒ 无需动作，与「拿不准」分开记录。
+                status = "no_action_needed"
         flags = []
         protection = _jev_policy_probability(
             audit_answers.get(f"{prefix}_protection_ready"))
@@ -3114,8 +3263,15 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "main_action": main_action,
             "main_confidence": proposal.get("main_confidence", 0),
             "main_reason": proposal.get("main_reason", ""),
-            "data_valid": data_valid,
-            "data_valid_probability": data_probability,
+            "code_state_complete": code_quality["complete"],
+            "code_state_missing_fields": code_quality["missing_fields"],
+            "code_state_consistent": code_quality["consistent"],
+            "code_state_consistency_flags": code_quality["consistency_flags"],
+            "code_state_status": code_quality["status"],
+            # 模型侧的「是否需要动作」判断，只记录、不作否决门。
+            "management_warranted": management_warranted,
+            "management_warranted_probability": _jev_policy_probability(
+                management_warranted),
             "suggested_action": action,
             "suggested_action_votes": {
                 "HOLD": independent_answers.get(f"{prefix}_would_hold"),
@@ -3181,8 +3337,21 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         "attempts": (independent_result.get("attempts", []) +
                      audit_result.get("attempts", [])),
         "aggregate_answers": {
-            "independent_data_valid": independent_answers.get("cycle_data_valid"),
             "audit_data_valid": audit_answers.get("audit_data_valid"),
+        },
+        # 代码侧汇总：整轮有多少候选/持仓在完整性或一致性上不达标。
+        # 这是**代码的事实**，不再向模型重复提问。
+        "code_cycle_quality": {
+            "candidates_total": len(instrument_reviews),
+            "candidates_incomplete": sum(
+                1 for row in instrument_reviews if not row.get("code_state_complete")),
+            "candidates_inconsistent": sum(
+                1 for row in instrument_reviews if not row.get("code_state_consistent")),
+            "positions_total": len(position_reviews),
+            "positions_incomplete": sum(
+                1 for row in position_reviews if not row.get("code_state_complete")),
+            "positions_inconsistent": sum(
+                1 for row in position_reviews if not row.get("code_state_consistent")),
         },
         "instrument_reviews": instrument_reviews,
         "position_reviews": position_reviews,
