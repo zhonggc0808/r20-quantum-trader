@@ -35,7 +35,12 @@ class DirectionObservationTests(unittest.TestCase):
     def test_missing_4h_never_defaults_to_bullish(self):
         got = enrich_brain_package({"price": 100.0, "recent_4h": []})
         self.assertIsNone(got["range_4h_high"])
-        self.assertIsNone(got["price_position_in_range"])
+        # 2026-09-26：这个「最新 8 根」窗口改名为
+        # price_position_in_range_recent8，以免与权威的「已收盘 12 根」
+        # 口径（four_hour_range → direction_observation）同名混淆。
+        self.assertIsNone(got["price_position_in_range_recent8"])
+        self.assertNotIn("price_position_in_range", got,
+                         "两个窗口不得再共用同一个键名")
         self.assertIsNone(got["market_data_timestamps"]["4H"])
 
     def test_direction_layers_keep_legacy_aggregate_and_add_new_layers(self):

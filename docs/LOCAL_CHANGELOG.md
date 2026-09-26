@@ -1,5 +1,85 @@
 # R20 本地改动记录
 
+## 2026-09-26
+
+### Jev 独立通道：测量有效性修复（Tier 1 + Tier 2）
+
+背景：独立通道在无锚状态下整条答案分布被压缩到 [0.2, 0.68]，`data_valid`
+中位数 0.36，而门槛按「有主脑提案做锚」的旧分布标定（旧 `would_wait` 中位
+0.79），导致 90 个候选里 **0 个**达到 0.70 的 confidence 门槛、**0 个**方向性输出。
+下面的改动分两类：纯 bug 修复（零证据代价）与测量有效性修复（会重置样本）。
+
+**Tier 1 · 纯 bug 修复**
+
+- A `max(0.0, …)` 压掉 `-1.0`「未作答」哨兵（3 处写入点）：该写法把「没问过」
+  压成 0.0，与「模型明确答 0.0」无法区分，任何求均值都会把未测量的行当成强烈
+  否定。`audit_probabilities` 一直保留哨兵，本次补齐同源字段
+  `data_valid_probability` / `execution_ready_probability`，并加测试钉住。
+- A 台账迁移：64 条独立通道 422 失败记录的 793 行由 `0.0` 改写为 `-1.0`，
+  并置 `lane_unavailable` / `independent_lane_unavailable`，使其无法再被平均进
+  任何统计（旧口径全量中位 0.07 即由此污染；只取真正测量过的 90 行则中位 0.36）。
+- B 删死键：`trend_4h_bullish` / `trend_4h_bearish` 在 710/710 行恒为 null
+  （brain package 从不产生这两个键，白名单在宣称一个永远填不上的字段）；
+  硬编码的 `liquidity_state:"UNKNOWN"`（71/71 轮）删除，改为真实可算的
+  `spread_bps`（取自本轮已持有的盘口），深度显式记为
+  `depth_state:"unavailable"` 而不编造桶值。
+- C 收敛双重 `price_position_in_range`：`enrich_brain_package`（最新 8 根、含未
+  收盘）与 `four_hour_range`（已收盘 12 根）曾共用同名键，710 行中 707 行互相
+  矛盾，模型拿到两个互斥的箱体位置。前者改名
+  `price_position_in_range_recent8`，权威口径统一取已收盘 12 根，并新增
+  `price_position_basis` 记录实际沿用哪个窗口。2026-09-24 那次「统一
+  brain/trader 的 `range_4h_*` 口径」只统了 range 字段，漏掉了这个位置字段。
+- D 持仓路径改真白名单：原实现是「完整 62 键上下文减去 4 个具名 `main_*` 键」的
+  黑名单，而注释却宣称两条通道都走白名单 —— 将来任何换个名字编码主脑结论的新
+  字段都会自动泄漏。改为显式 `_JEV_NEUTRAL_POSITION_KEYS`（56 个事实键，
+  fail-closed），并补 `IndependentStateLeakGuardTest`（此前无任何测试断言
+  `independent_state` 不含主脑结论）。
+
+**Tier 2 · 测量有效性（作废此前样本）**
+
+- E 加校准指引：JEV 的 payload 是 `{model, state, questions}`，**没有 system
+  prompt**，校准只能进题面。为 `data_valid` / `execution_ready` / `would_*`
+  写明量表语义，并明确「数据完整但行情平淡」不等于数据不足 —— 后者应体现在
+  方向票里而不是数据题里。同真实 state 的 A/B：中位 0.52 → 0.65。
+- F confidence 改成真分布：原先拿三个**互相独立**的布尔问题（会不会做多/做空/
+  等待）的**最大值**当 confidence、差值当 margin，而方案 §5.1 明确禁止对 Noul
+  结果做概率加减。现先归一化成互斥分布再取最大分量与边际；原始票值与归一化前
+  最大值另存 `jev_raw_max_vote` / `jev_vote_sum`，信息不丢失。
+- G 门槛可配置并重标：此前 4 处 `0.5` 是硬编码（`data_valid`、
+  `execution_ready`、`audit_data_valid`、`protection`），是全项目唯一不可配置的
+  JEV 阈值。现全部走环境变量，默认值按实测分布推导 —— **规则：有效性门槛取该
+  通道分布中位数，接受门槛取归一化 confidence 的 p75**。取值：
+  `data_valid=0.36`、`execution_ready=0.44`、`min_confidence=0.54`；
+  `audit_data_valid` / `protection` / 审计旗标维持 0.50（审计分布未变）。
+
+**验证**
+
+- 全量测试 3235 个：失败集与改动前**逐项相同**（各 34 个，均为既有失败），
+  本次改动引入 0 个新失败；JEV 相关套件 26/26 通过。
+- 线上实测（调度器每轮新起进程，改动即时生效）：
+  10:31（旧）0 方向 → 11:01（+E）`data_valid` 0.16–0.82、**3 个 BUY_LONG accepted**
+  → 11:16 **1 个 BUY_LONG accepted**。
+- 台账迁移经两次线上写入后仍完整（793 行哨兵，0 行回退）。
+
+**仍未解决 / 已知局限**
+
+- 本次标定仅基于 9 轮 / 90 个候选，属**临时标定**，必须按已结算结果复标；
+  `R20_JEV_*` 环境变量可回滚，不得靠改代码切换。
+- 证据显示 `data_valid` 实际在测量**方向倾向**而非数据健康（与
+  `price_position_in_range` 的标的内中心化相关 r=−0.55，与 `entry_15m.direction`
+  r=−0.55），而代码侧 `data_quality` 恒为 `valid`。「数据是否有效」究竟归代码
+  还是归模型、该不该拆成 `data_complete` / `data_consistent` / `directional_edge`
+  三个概念，尚未决策。
+- 尚未验证：补足中性 state（方案 §4.1 规定的 `trend_4h`、`momentum_15m`、
+  `volatility`、`funding_state`、`bullish/bearish_evidence` 等均未实现）能否
+  进一步抬高答案。需要一次 A/B，不应默认「补数据=更准」。
+- `build_jev_independent_state` / `build_jev_audit_state` /
+  `run_jev_shadow_requests` / `scripts/trader/jev_policy.py` 四个方案点名的
+  模块仍不存在，state 依然内联在 `_run_jev_shadow_review` 中。
+- 2026-09-25 13:00 存在一次未解释的体制跃迁（中位数 0.17→0.67，同模型同路由同
+  题集）。重构前代码从未提交（父提交 `07a0c82` 中 JEV 引用为 0），该段历史不可
+  复原；应视为「该台账存在未解释的体制漂移」这一已知局限。
+
 ## 2026-09-25
 
 ### Jev 独立决策影子层

@@ -158,7 +158,11 @@ def assemble_decision_cache(
                 "market_data_timestamps": p.get("market_data_timestamps") or {},
                 "range_4h_high": p.get("range_4h_high"),
                 "range_4h_low": p.get("range_4h_low"),
-                "price_position_in_range": p.get("price_position_in_range"),
+                # 值来自 enrich_brain_package 的「最新 8 根（含未收盘）」窗口。
+                # 权威的「已收盘 12 根」口径在
+                # direction_observation.price_position_in_range；两个窗口不再同名。
+                "price_position_in_range": p.get("price_position_in_range_recent8"),
+                "price_position_in_range_recent8": p.get("price_position_in_range_recent8"),
                 "sample_ts": int(time.time() * 1000),
             },
             # 投委会溯源（2026-09-10 前台适配数据契约）：ran/reason + CIO 采纳席位

@@ -255,12 +255,124 @@ class AuditDataIsSelfDescribingTest(_Harness):
         self.assertTrue(all(v >= -1.0 for v in probs.values()))
         self.assertTrue(all(isinstance(v, (int, float)) for v in probs.values()))
 
+    def test_data_valid_probability_keeps_the_missing_sentinel(self):
+        """A：`max(0.0, x)` 会把「没问过」压成 0.0，与「模型答 0.0」无法区分。
+
+        同一失效模式曾污染审计通道（98% 恒 REJECT）。`audit_probabilities` 一直
+        保留 -1.0 哨兵并有测试守护；这里把同源的 data_valid_probability /
+        execution_ready_probability 也钉住，避免它再次塌成 0。
+        """
+        # 测试装置总会回答所有问题，所以这里用局部 patch 造出「真的一个答案都没有」。
+        empty = {"status": "ok",
+                 "response": {"model": "fake", "answers": {}, "usage": {}},
+                 "attempts": [{"attempt": 1, "status": "ok"}],
+                 "request_id": "", "latency_ms": 1}
+        with patch.object(abt, "_jev_shadow_request", lambda *a, **k: dict(empty)):
+            review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+        row = review["instrument_reviews"][0]
+        self.assertEqual(row["data_valid_probability"], -1.0,
+                         "缺答必须是 -1.0 哨兵，不得塌成 0.0")
+        self.assertEqual(row["execution_ready_probability"], -1.0)
+
     def test_wait_and_entry_are_separable_from_the_record_alone(self):
         """一条记录里就能看出谁被审计过 —— 不需要再去 join response.answers。"""
         audited = [inst for inst, r in self.by_inst.items()
                    if r["audit_probabilities"] is not None]
         self.assertEqual(audited, ["ETH-USDT-SWAP"],
                          "只有真入场候选应留下审计评分")
+
+
+class IndependentStateLeakGuardTest(_Harness):
+    """独立通道的 state 里绝不能出现主脑结论 —— 这是重构的立身之本。
+
+    2026-09-26 复盘时发现：候选侧是真白名单（16 键元组），但持仓侧是
+    「完整上下文减去 4 个具名 main_* 键」的黑名单，而注释却宣称两者都走白名单。
+    本类把两个通道都钉成「结构上不可能泄漏」。
+    """
+
+    probabilities: Dict[str, float] = {}
+
+    #: 任何通道的独立 state 里都不允许出现的叶子键名（主脑结论）。
+    #:
+    #: 注意 `margin_usdt` **不在**这个集合里：在持仓侧它是仓位事实（方案 §4.2
+    #: 明确允许），只有在候选侧它才是主脑的下单意图。同一个键名在两侧语义不同，
+    #: 所以候选侧另有专门断言，见 `test_candidates_carry_no_sizing_intent`。
+    _FORBIDDEN = {
+        "action", "confidence", "entry_price", "stop_loss_price",
+        "take_profit_price", "risk_reward_ratio", "leverage", "entry_mode",
+        "main_action", "main_confidence", "main_reason", "main_suggested_sl_price",
+        "shadow_margin_usdt", "shadow_leverage",
+        "shadow_margin_source", "shadow_leverage_source",
+    }
+
+    #: 候选侧专有的主脑意图键（在持仓侧是事实，故不能全 state 禁用）。
+    _CANDIDATE_FORBIDDEN = _FORBIDDEN | {"margin_usdt"}
+
+    @staticmethod
+    def _walk(node: Any) -> List[str]:
+        """收集所有字典键名（含嵌套），用于泄漏扫描。"""
+        found: List[str] = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                found.append(str(key))
+                found.extend(IndependentStateLeakGuardTest._walk(value))
+        elif isinstance(node, list):
+            for item in node:
+                found.extend(IndependentStateLeakGuardTest._walk(item))
+        return found
+
+    def _independent_state(self) -> Dict[str, Any]:
+        self.run_review(
+            {"BTC-USDT-SWAP": "WAIT", "ETH-USDT-SWAP": "BUY_LONG"},
+            positions=[{"instId": "BTC-USDT-SWAP", "side": "long", "pos": 1.0,
+                        "avgPx": 100.0, "markPx": 101.0, "venue": "okx",
+                        "main_action": "HOLD", "main_confidence": 91.0,
+                        "main_reason": "主脑理由绝不外泄",
+                        "main_suggested_sl_price": 97.5}],
+            management=[{"instId": "BTC-USDT-SWAP", "action": "HOLD"}])
+        path = os.path.join(self.tmp.name, "jev_shadow_reviews.jsonl")
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.loads(handle.read().strip().splitlines()[-1])["independent_state"]
+
+    def test_independent_state_carries_no_main_conclusion(self):
+        """持仓侧同样必须是白名单：主脑结论不得出现在独立 state 任何层级。"""
+        state = self._independent_state()
+        leaked = sorted(set(self._walk(state)) & self._FORBIDDEN)
+        self.assertEqual(leaked, [],
+                         f"独立 state 泄漏了主脑结论字段：{leaked}")
+
+    def test_candidates_carry_no_sizing_intent(self):
+        """候选侧不得带主脑的下单意图（margin/leverage/entry/stop/target 等）。"""
+        state = self._independent_state()
+        offenders = []
+        for candidate in (state.get("market") or {}).get("candidates") or []:
+            offenders.extend(sorted(set(candidate) & self._CANDIDATE_FORBIDDEN))
+        self.assertEqual(offenders, [],
+                         f"候选泄漏了主脑下单意图：{sorted(set(offenders))}")
+
+    def test_position_margin_is_still_visible_as_a_fact(self):
+        """守卫不得把持仓的保证金事实一起误删（方案 §4.2 允许 margin_usdt）。"""
+        state = self._independent_state()
+        positions = state.get("positions") or []
+        self.assertTrue(positions, "本用例应至少有一个持仓")
+        self.assertIn("margin_usdt", positions[0],
+                      "持仓侧 margin_usdt 是事实字段，必须保留")
+
+    def test_audit_state_still_carries_the_main_proposal(self):
+        """守卫不得把审计通道一起关掉 —— 审计本来就必须看到主脑提案。"""
+        self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+        path = os.path.join(self.tmp.name, "jev_shadow_reviews.jsonl")
+        with open(path, "r", encoding="utf-8") as handle:
+            record = json.loads(handle.read().strip().splitlines()[-1])
+        keys = set(self._walk(record["audit_state"]))
+        self.assertIn("main_proposals", keys,
+                      "审计 state 必须携带主脑提案")
+
+    def test_position_whitelist_excludes_every_main_key(self):
+        """白名单是显式常量：不得包含任何 main_* 键。"""
+        offenders = sorted(k for k in abt._JEV_NEUTRAL_POSITION_KEYS
+                           if k.startswith("main_"))
+        self.assertEqual(offenders, [])
 
 
 class IndependentActionStillDerivedFromVotesTest(_Harness):

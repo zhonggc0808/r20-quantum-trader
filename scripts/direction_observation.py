@@ -116,7 +116,12 @@ def enrich_brain_package(pkg: dict) -> dict:
         },
         "range_4h_high": high, "range_4h_low": low,
         "range_4h_width": (high - low) if high is not None and low is not None else None,
-        "price_position_in_range": position,
+        # NOTE(2026-09-26): 这个值来自 `recent_4h`（最新 8 根，含未收盘那根），
+        # 与 `four_hour_range()` 用的「12 根已收盘」是两个不同的箱体。两者曾共用
+        # `price_position_in_range` 这个名字，导致同一条记录里出现两个互斥值
+        # （710 行中 707 行不一致），模型看到的是自相矛盾的位置。权威口径是
+        # 已收盘 12 根的 `four_hour_range()`；这里改名，使两个窗口无法再被混淆。
+        "price_position_in_range_recent8": position,
         "range_4h_bars": len(recent) if high is not None else 0,
         "range_4h_candle_ts": latest_candle_timestamp(pkg.get("instId", ""), "4H"),
     })

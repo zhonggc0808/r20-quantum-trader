@@ -1071,6 +1071,37 @@ def _jev_shadow_position_audit_context(position: Dict[str, Any]) -> Dict[str, An
     }
 
 
+#: 独立通道允许看到的持仓事实字段（真白名单，fail-closed）。
+#:
+#: 2026-09-26 之前的实现是「完整 62 键上下文减去 4 个具名 main_* 键」，那是黑名单：
+#: 将来任何新增到 `_jev_shadow_position_audit_context` 的字段——只要它换个名字
+#: 编码主脑结论（例如 main_relation / proposal_status）——都会自动漏进独立通道，
+#: 而当时的注释却宣称两个通道都走白名单纪律。这里改成显式白名单：新增事实字段
+#: 只是不会进入独立通道（安全方向），而新增结论字段不可能自动泄漏。
+_JEV_NEUTRAL_POSITION_KEYS = (
+    "instId", "venue", "environment", "account_mode",
+    "side", "pos", "avgPx", "markPx", "upl", "uplRatio",
+    "lever", "notional_usdt", "margin_usdt", "imr", "mmr",
+    "liqPx", "liqPx_status", "liqPx_source", "liqPx_reason",
+    "bePx", "mgnMode", "ctVal", "ccy", "adl", "cTime", "uTime",
+    "opened_at", "entryTs", "entryTime",
+    "entry_order_id", "entry_intent_id", "entry_order_ts",
+    "entry_order_avg_px", "entry_order_fill_sz", "entry_order_source",
+    "entry_identity_status",
+    "funding_fee", "realized_pnl", "fee",
+    "trailingStopPx", "takeProfitPx", "exchangeSl", "exchangeTp",
+    "protectionStatus", "protectionAlgoId", "protectionCoveragePct",
+    "protection_orders", "protection_snapshot_source", "protection_snapshot_error",
+    "highWaterMark", "lowWaterMark", "stage_desc", "atr",
+    "bidPx", "askPx", "data_quality",
+)
+
+
+def _jev_neutral_position_state(context: Dict[str, Any]) -> Dict[str, Any]:
+    """按 `_JEV_NEUTRAL_POSITION_KEYS` 白名单裁剪持仓事实，剔除主脑结论。"""
+    return {key: context.get(key) for key in _JEV_NEUTRAL_POSITION_KEYS}
+
+
 def _jev_shadow_update_position_outcomes(position_proposals: List[Dict[str, Any]],
                                          position_reviews: List[Dict[str, Any]],
                                          review: Dict[str, Any]) -> None:
@@ -1995,28 +2026,51 @@ def _jev_normalize_choice(value: Any) -> str:
 
 def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
                min_margin: float, data_valid: Any = None,
-               execution_ready: Any = None) -> Dict[str, Any]:
-    """Choose the largest vote and expose why it was or was not accepted."""
-    probabilities = {str(key): _jev_policy_probability(value) for key, value in votes.items()}
-    ranked = sorted((value for value in probabilities.values() if value >= 0), reverse=True)
-    if not probabilities or not ranked:
+               execution_ready: Any = None,
+               data_valid_min: float = 0.5,
+               execution_ready_min: float = 0.5) -> Dict[str, Any]:
+    """把三个兼容票决归一化成一个动作分布，再判断是否接受。
+
+    2026-09-26 修正：这里原先拿「三个互相独立的布尔问题」的**最大值**当
+    confidence、拿它与次高者的差当 margin。那三个问题分别问「会不会做多 /
+    会不会做空 / 会不会等」，它们不是互斥选项，因此 max 不是概率、
+    差值也不是边际 —— 方案 §5.1 明确禁止对 Noul 结果做概率加减。
+
+    现在先把三票归一化成互斥分布（`probabilities`），confidence 取分布里的
+    最大分量，margin 取它与第二分量之差：两者都是真正定义良好的量。
+    原始票值仍然逐条记录在 `suggested_action_votes` 里，另外把归一化前的
+    最大值单独记为 `raw_max_vote`，所以没有任何信息丢失。
+    """
+    raw = {str(key): _jev_policy_probability(value) for key, value in votes.items()}
+    usable = {key: value for key, value in raw.items() if value >= 0}
+    if not usable:
         return {
             "suggested_action": "INSUFFICIENT_DATA",
-            "probabilities": probabilities,
+            "probabilities": raw,
             "confidence": 0.0,
             "action_margin": 0.0,
+            "raw_max_vote": -1.0,
+            "vote_sum": 0.0,
             "action_status": "missing_action_votes",
         }
+    total = sum(usable.values())
+    if total > 0:
+        probabilities = {key: value / total for key, value in usable.items()}
+    else:
+        # 三票全为 0：没有任何方向倾向，保持全 0 而不是伪造均匀分布。
+        probabilities = dict(usable)
+    ranked = sorted(probabilities.values(), reverse=True)
     suggested_action = max(probabilities, key=probabilities.get)
     confidence = probabilities[suggested_action]
     second = ranked[1] if len(ranked) > 1 else -1.0
     margin = confidence - second if second >= 0 else -1.0
+    raw_max_vote = max(usable.values())
     data_probability = _jev_policy_probability(data_valid)
     ready_probability = _jev_policy_probability(execution_ready)
     if data_valid is not None and data_probability < 0:
         status = "missing_data_valid"
         suggested_action = "INSUFFICIENT_DATA"
-    elif data_valid is not None and data_probability < 0.5:
+    elif data_valid is not None and data_probability < data_valid_min:
         status = "invalid_data"
         suggested_action = "INSUFFICIENT_DATA"
     elif (suggested_action in ENTRY_ACTIONS and execution_ready is not None
@@ -2024,7 +2078,7 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
         status = "missing_execution_ready"
         suggested_action = "INSUFFICIENT_DATA"
     elif (suggested_action in ENTRY_ACTIONS and execution_ready is not None
-          and ready_probability < 0.5):
+          and ready_probability < execution_ready_min):
         status = "not_ready"
         suggested_action = "WAIT"
     elif confidence < min_confidence:
@@ -2038,16 +2092,24 @@ def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
     return {
         "suggested_action": suggested_action,
         "probabilities": probabilities,
-        "confidence": max(0.0, confidence),
-        "action_margin": max(0.0, margin),
+        "confidence": confidence if confidence >= 0 else -1.0,
+        "action_margin": margin if margin >= 0 else -1.0,
         "action_status": status,
-        "data_valid_probability": max(0.0, data_probability),
-        "execution_ready_probability": max(0.0, ready_probability),
+        # 保留 -1.0「未作答」哨兵：max(0.0, x) 会把「没问过」压成 0.0，
+        # 与「模型明确答 0.0」无法区分，下游任何求均值都会把未测量的行
+        # 当成强烈否定（2026-09-26 的 98% 恒 REJECT 就是这个失效模式）。
+        # `audit_probabilities` 一直保留哨兵，这里补齐同源字段。
+        "data_valid_probability": data_probability,
+        "execution_ready_probability": ready_probability,
+        # 归一化前的原始最大值与票和，便于事后核对归一化是否是合理的加工。
+        "raw_max_vote": raw_max_vote,
+        "vote_sum": total,
     }
 
 
 def _jev_audit_verdict(flags: Iterable[str], *, data_complete: Any = None,
                   min_confidence: float = 0.70,
+                  data_complete_min: float = 0.5,
                   has_proposal: bool = True) -> Dict[str, Any]:
     """Turn atomic audit answers into a deterministic shadow verdict.
 
@@ -2061,7 +2123,7 @@ def _jev_audit_verdict(flags: Iterable[str], *, data_complete: Any = None,
                 "confidence_floor": min_confidence}
     normalized = [str(flag) for flag in flags if flag]
     complete_probability = _jev_policy_probability(data_complete)
-    if data_complete is not None and complete_probability >= 0 and complete_probability < 0.5:
+    if data_complete is not None and complete_probability >= 0 and complete_probability < data_complete_min:
         normalized.append("proposal_data_incomplete")
     hard_flags = {
         "proposal_data_incomplete",
@@ -2429,8 +2491,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "data_quality": row.get("data_quality"),
             "macro_4h": direction.get("macro_4h"),
             "calculus_regime": direction.get("calculus_regime"),
-            "trend_4h_bullish": p.get("trend_4h_bullish"),
-            "trend_4h_bearish": p.get("trend_4h_bearish"),
+            # `trend_4h_bullish` / `trend_4h_bearish` 已删除：这两个键只存在于
+            # trader 因子路径（scripts/trader/factors.py），brain package 从不产生，
+            # 因此 710/710 行恒为 null —— 白名单在宣称一个永远填不上的字段。
             "direction_observation": direction_observation,
             "direction_layers": direction_layer_snapshot,
             "price": p.get("price", 0),
@@ -2447,7 +2510,23 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "main_bidPx": p.get("bidPx", 0),
             "main_askPx": p.get("askPx", 0),
             "main_quote_timestamp": time.time(),
-            "price_position_in_range": direction.get("price_position_in_range"),
+            # 权威口径：已收盘 12 根 4H K 线（four_hour_range），由 direction_observation
+            # 携带。过去这里取的是 brain package 的「最新 8 根（含未收盘）」，
+            # 与 direction_observation 里的同名字段互相矛盾（710 行中 707 行不一致），
+            # 模型因此拿到两个互斥的箱体位置。现在统一取已收盘口径，并把
+            # 实际沿用哪个窗口记进 `price_position_basis`。
+            "price_position_in_range": (
+                direction_observation.get("price_position_in_range")
+                if isinstance(direction_observation, dict)
+                and direction_observation.get("price_position_in_range") is not None
+                else direction.get("price_position_in_range")
+            ),
+            "price_position_basis": (
+                "four_hour_closed_12"
+                if isinstance(direction_observation, dict)
+                and direction_observation.get("price_position_in_range") is not None
+                else "recent8_fallback"
+            ),
             "candle_ts_4h": direction.get("candle_ts_4h"),
         })
 
@@ -2538,9 +2617,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         key: proposal.get(key)
         for key in (
             "instId", "cycle_id", "decision_id", "decision_timestamp", "data_quality",
-            "macro_4h", "calculus_regime", "trend_4h_bullish", "trend_4h_bearish",
+            "macro_4h", "calculus_regime",
             "direction_observation", "direction_layers", "price", "bidPx", "askPx",
-            "price_position_in_range", "candle_ts_4h",
+            "price_position_in_range", "price_position_basis", "candle_ts_4h",
         )
     } for proposal in proposals]
     neutral_positions = []
@@ -2548,14 +2627,26 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
     for position in position_proposals:
         context = _jev_shadow_position_audit_context(position)
         audit_positions.append(context)
-        neutral_positions.append({key: value for key, value in context.items()
-                                  if key not in {
-                                      "main_action", "main_confidence",
-                                      "main_suggested_sl_price", "main_reason",
-                                  }})
+        # 白名单裁剪，不是「减掉几个 main_*」。理由见
+        # `_JEV_NEUTRAL_POSITION_KEYS` 上方的注释。
+        neutral_positions.append(_jev_neutral_position_state(context))
 
-    # The independent lane is deliberately assembled from a whitelist. A future
-    # field added to proposals cannot accidentally leak the main conclusion.
+    # 两个通道都显式白名单组装：候选见 `neutral_candidates`，持仓见
+    # `_JEV_NEUTRAL_POSITION_KEYS`。新增字段默认不会进入独立通道。
+    #
+    # `liquidity_state` 原先硬编码成字符串 "UNKNOWN"（71/71 轮），即 state 在
+    # 宣称一个它从来没填过的字段 —— 与 trend_4h_* 同类的死键。价差可以直接从
+    # 本轮已持有的 bid/ask 算出且零网络开销，因此改传真实 spread_bps；
+    # 盘口深度（orderbook depth）本周期并未取数，于是显式记为不可用，
+    # 而不是编一个桶值出来。
+    spread_samples = []
+    for _candidate in neutral_candidates:
+        _bid = _jev_shadow_float(_candidate.get("bidPx"), 0.0)
+        _ask = _jev_shadow_float(_candidate.get("askPx"), 0.0)
+        if _bid > 0 and _ask > 0 and _ask >= _bid:
+            spread_samples.append((_ask - _bid) / ((_ask + _bid) / 2.0) * 10000.0)
+    spread_bps = round(sorted(spread_samples)[len(spread_samples) // 2], 4) if spread_samples else None
+
     neutral_state = {
         "cycle_time": time_str,
         "market": {"candidates": neutral_candidates},
@@ -2565,7 +2656,11 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
                 os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005),
             "slippage_bps": _jev_shadow_float(
                 os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0),
-            "liquidity_state": "UNKNOWN",
+            # 本轮候选的中位价差，来自已持有的盘口快照。
+            "spread_bps": spread_bps,
+            # 深度需要额外 REST 取数（每轮 ×10 标的），本周期未取，故显式缺失。
+            "depth_state": "unavailable",
+            "depth_source": "not_fetched_in_cycle",
         },
         "risk_context": {
             "available_usdt": usdt_available,
@@ -2626,35 +2721,58 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
                 "type": "boolean",
                 "instructions": (
                     f"Is the neutral market data for {inst_id} sufficient for an "
-                    "independent direction judgment?"
+                    "independent direction judgment? This asks ONLY whether the "
+                    "supplied facts are complete and internally consistent — it is "
+                    "NOT a question about whether you see a tradable edge. Say no "
+                    "only if a required fact is actually missing or contradictory. "
+                    "If the state is complete but flat, that is still sufficient "
+                    "data: express the absence of an edge in the would_* votes below, "
+                    "not here. Calibration: >=0.9 only when every field you need is "
+                    "present and consistent; ~0.5 when some relevant facts are absent "
+                    "but a judgment is still possible; <=0.2 only when a field needed "
+                    "for any direction call is missing or self-contradictory."
                 ),
             },
             f"{prefix}_execution_ready": {
                 "type": "boolean",
                 "instructions": (
                     f"Based only on the neutral state for {inst_id}, is a directional "
-                    "action executable after normal cost and liquidity friction?"
+                    "action executable after normal cost and liquidity friction? "
+                    "Calibration: >=0.8 when spread and cost are clearly small "
+                    "relative to the expected move; ~0.5 when it is marginal; "
+                    "<=0.2 only when friction or thin depth would clearly consume "
+                    "the edge. If depth_state is unavailable, judge from spread_bps "
+                    "and say so rather than assuming the worst."
                 ),
             },
             f"{prefix}_would_buy_long": {
                 "type": "boolean",
                 "instructions": (
                     f"As a compatibility vote, would you choose BUY_LONG for {inst_id} "
-                    "using only the neutral state?"
+                    "using only the neutral state? Calibration: use the full range "
+                    "0-1. Answer <=0.2 when long is clearly not the best action, "
+                    "~0.5 when it is a genuine toss-up with WAIT, and >=0.8 when long "
+                    "is the action you would actually take. The three would_* votes are "
+                    "compared against each other, so a low absolute number is fine — "
+                    "but do not answer all three near 0.4, which carries no information."
                 ),
             },
             f"{prefix}_would_sell_short": {
                 "type": "boolean",
                 "instructions": (
                     f"As a compatibility vote, would you choose SELL_SHORT for {inst_id} "
-                    "using only the neutral state?"
+                    "using only the neutral state? Same calibration as would_buy_long: "
+                    "<=0.2 when short is clearly not best, ~0.5 for a genuine toss-up, "
+                    ">=0.8 when short is the action you would take."
                 ),
             },
             f"{prefix}_would_wait": {
                 "type": "boolean",
                 "instructions": (
                     f"As a compatibility vote, would you choose WAIT for {inst_id} "
-                    "using only the neutral state?"
+                    "using only the neutral state? Same calibration: <=0.2 when waiting "
+                    "is clearly not best, ~0.5 for a genuine toss-up, >=0.8 when waiting "
+                    "is the action you would take."
                 ),
             },
         })
@@ -2802,8 +2920,22 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         except (TypeError, ValueError):
             return fallback
 
-    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.70)
+    # 门槛默认值按 2026-09-26 实测分布推导，推导规则见 docs/LOCAL_CHANGELOG.md。
+    # 规则：**有效性**门槛取该通道自身分布的中位数（只滤掉较弱的一半，而不是
+    # 拒掉 84%）；**接受**门槛取归一化 confidence 的 p75（接纳较强的四分位）。
+    # 全部可用环境变量覆盖；这里改默认值只是因为旧的 0.70/0.5 是按「有锚分布」
+    # 标定的，而独立通道在无锚后整条分布下移，旧门槛结构性不可达。
+    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.54)
     min_margin = _threshold("R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
+    data_valid_min = _threshold("R20_JEV_DATA_VALID_MIN_PROBABILITY", 0.36)
+    execution_ready_min = _threshold(
+        "R20_JEV_EXECUTION_READY_MIN_PROBABILITY", 0.44)
+    audit_data_valid_min = _threshold(
+        "R20_JEV_AUDIT_DATA_VALID_MIN_PROBABILITY", 0.50)
+    protection_min = _threshold("R20_JEV_PROTECTION_MIN_PROBABILITY", 0.50)
+    # 审计旗标的判定分界（正向证据 >= 此值、风险项 < 此值即置旗）。默认 0.5
+    # 保持既有行为不变；审计通道的答案分布与独立通道不同，因此单独可调。
+    audit_flag_min = _threshold("R20_JEV_AUDIT_FLAG_MIN_PROBABILITY", 0.50)
     position_min_confidence = _threshold(
         "R20_JEV_POSITION_MIN_CONFIDENCE", min_confidence)
     position_min_margin = _threshold(
@@ -2819,14 +2951,16 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "SELL_SHORT": independent_answers.get(f"{prefix}_would_sell_short"),
             "WAIT": independent_answers.get(f"{prefix}_would_wait"),
         }, min_confidence=min_confidence, min_margin=min_margin,
-            data_valid=data_valid, execution_ready=execution_ready)
+            data_valid=data_valid, execution_ready=execution_ready,
+            data_valid_min=data_valid_min,
+            execution_ready_min=execution_ready_min)
         choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
         if choice not in {"BUY_LONG", "SELL_SHORT", "WAIT", "INSUFFICIENT_DATA"}:
             choice = vote_result["suggested_action"]
         data_probability = _jev_policy_probability(data_valid)
         if data_probability < 0:
             action, action_status, data_status = "INSUFFICIENT_DATA", "missing_data_valid", "invalid"
-        elif data_probability < 0.5:
+        elif data_probability < data_valid_min:
             action, action_status, data_status = "INSUFFICIENT_DATA", "invalid_data", "invalid"
         else:
             action, action_status, data_status = choice, vote_result["action_status"], "valid"
@@ -2875,12 +3009,12 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             for field, flag in flag_map:
                 value = audit_probabilities[field]
                 if field in {"stop_structurally_valid", "reward_after_cost_sufficient"}:
-                    if value >= 0 and value < 0.5:
+                    if value >= 0 and value < audit_flag_min:
                         flags.append(flag)
-                elif value >= 0.5:
+                elif value >= audit_flag_min:
                     flags.append(flag)
             if not audit_ok or _jev_policy_probability(
-                    audit_answers.get("audit_data_valid")) < 0.5:
+                    audit_answers.get("audit_data_valid")) < audit_data_valid_min:
                 flags.append("audit_unavailable")
             audit = _jev_audit_verdict(flags, data_complete=audit_complete,
                                        min_confidence=audit_min_confidence)
@@ -2904,9 +3038,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "data_valid": data_valid,
             "direction_consistent": independent_answers.get(f"{prefix}_direction_consistent"),
             "execution_ready": execution_ready,
-            "data_valid_probability": max(0.0, data_probability),
-            "execution_ready_probability": max(
-                0.0, _jev_policy_probability(execution_ready)),
+            "data_valid_probability": data_probability,
+            "execution_ready_probability": _jev_policy_probability(execution_ready),
             "suggested_action": action,
             "suggested_action_votes": {
                 "BUY_LONG": independent_answers.get(f"{prefix}_would_buy_long"),
@@ -2915,6 +3048,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             },
             "jev_confidence": vote_result.get("confidence", 0),
             "jev_action_margin": vote_result.get("action_margin", 0),
+            # 归一化前的口径，保留以便对照与回滚（confidence 现为分布分量）。
+            "jev_raw_max_vote": vote_result.get("raw_max_vote", -1.0),
+            "jev_vote_sum": vote_result.get("vote_sum", 0.0),
             "jev_action_status": action_status,
             "quote_source": "okx",
             "audit_proposal_complete": audit_complete,
@@ -2943,7 +3079,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         data_probability = _jev_policy_probability(data_valid)
         if data_probability < 0:
             action, status = "INSUFFICIENT_DATA", "missing_data_valid"
-        elif data_probability < 0.5:
+        elif data_probability < data_valid_min:
             action, status = "INSUFFICIENT_DATA", "invalid_data"
         else:
             action, status = choice, vote_result["action_status"]
@@ -2954,12 +3090,12 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             audit_answers.get(f"{prefix}_protection_ready"))
         close_needed = _jev_policy_probability(
             audit_answers.get(f"{prefix}_close_needed"))
-        if protection >= 0 and protection < 0.5:
+        if protection >= 0 and protection < protection_min:
             flags.append("protection_not_ready")
         if close_needed >= 0.5:
             flags.append("audit_close_needed")
         if not audit_ok or _jev_policy_probability(
-                audit_answers.get("audit_data_valid")) < 0.5:
+                audit_answers.get("audit_data_valid")) < audit_data_valid_min:
             flags.append("audit_unavailable")
         audit = _jev_audit_verdict(flags, min_confidence=audit_min_confidence)
         main_action = proposal.get("main_action", "HOLD")
@@ -2979,7 +3115,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "main_confidence": proposal.get("main_confidence", 0),
             "main_reason": proposal.get("main_reason", ""),
             "data_valid": data_valid,
-            "data_valid_probability": max(0.0, data_probability),
+            "data_valid_probability": data_probability,
             "suggested_action": action,
             "suggested_action_votes": {
                 "HOLD": independent_answers.get(f"{prefix}_would_hold"),
@@ -2988,6 +3124,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             },
             "jev_confidence": vote_result.get("confidence", 0),
             "jev_action_margin": vote_result.get("action_margin", 0),
+            "jev_raw_max_vote": vote_result.get("raw_max_vote", -1.0),
+            "jev_vote_sum": vote_result.get("vote_sum", 0.0),
             "jev_action_status": status,
             "audit_protection_ready": audit_answers.get(f"{prefix}_protection_ready"),
             "audit_close_needed": audit_answers.get(f"{prefix}_close_needed"),
