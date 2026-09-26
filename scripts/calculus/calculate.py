@@ -379,7 +379,7 @@ def calculate_multi_timeframe(candles_by_tf: Dict[str, Sequence[Sequence[float]]
     avg_dev_area = sum(i["deviation_area_integral"] for i in int_valid) / len(int_valid) if int_valid else 0.0
     avg_vol_action = sum(i["volume_action_integral"] for i in int_valid) / len(int_valid) if int_valid else 0.0
 
-    # Aggregate Probability Metrics across timeframes (15M and 1H prioritized)
+    # Legacy equal-weight probability aggregation across all valid timeframes.
     prob_valid = [f["probability_theory"] for f in valid if f.get("probability_theory", {}).get("valid")]
     avg_skewness = sum(p["skewness"] for p in prob_valid) / len(prob_valid) if prob_valid else 0.0
     avg_kurtosis = sum(p["kurtosis"] for p in prob_valid) / len(prob_valid) if prob_valid else 0.0

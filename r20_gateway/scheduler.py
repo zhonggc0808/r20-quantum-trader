@@ -117,7 +117,7 @@ class GatewayScheduler:
             if spec.name == "trader":
                 slot = int(now.timestamp()) // spec.interval_seconds
                 last_slot = int(last.timestamp()) // spec.interval_seconds if last else -1
-                return slot > last_slot and int(now.timestamp()) % spec.interval_seconds < 10
+                return slot > last_slot
             if spec.offset_seconds:
                 # Staggered execution aligned to clock with offset to prevent resource collisions
                 ts = int(now.timestamp())
@@ -144,7 +144,10 @@ class GatewayScheduler:
                 capture_output=True,
                 timeout=spec.timeout_seconds,
             )
-            detail = (result.stderr if result.returncode else result.stdout)[-2000:]
+            combined_output = "\n".join(
+                part for part in (result.stdout or "", result.stderr or "") if part
+            )
+            detail = combined_output[-2000:]
             self.store.finish_job(run_id, result.returncode, detail)
         except subprocess.TimeoutExpired as exc:
             self.store.finish_job(run_id, 124, f"timeout after {spec.timeout_seconds}s: {exc}")

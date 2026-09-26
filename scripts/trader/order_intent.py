@@ -91,5 +91,7 @@ def build_order_intent(*, is_long, inst_id, actual_sz, ct_val, limit_px, ai_leve
         "confidence": ai_conf,
         "intent_id": (f"{inst_id}:BUY_LONG" if is_long else f"{inst_id}:SELL_SHORT")
                      + f":{int(ai_info.get('timestamp') or time.time())}",
+        "decision_id": ai_info.get("decision_id", ""),
+        "cycle_id": ai_info.get("cycle_id", ""),
     }
     return side, pos_side, venue_ctx

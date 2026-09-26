@@ -53,6 +53,15 @@ def selected_environment(values: Mapping[str, str] | None = None) -> OKXEnvironm
     legacy_simulated = str(env.get("OKX_IS_SIMULATED", "1")).lower() in {"1", "true", "yes"}
     mode = str(env.get("R20_OKX_ENV") or ("demo" if legacy_simulated else "live")).lower()
     if mode not in ALLOWED_ENVIRONMENTS: mode = "demo"
+    # The account fence guards THIS instance's own on-disk configuration. An explicit
+    # `values` mapping is a programmatic call (test fixtures, replays, offline probes)
+    # that describes some hypothetical environment, not the one this checkout is
+    # scoped to — fencing it against the local scope file is exactly how ~70 unrelated
+    # cases ended up reading production data. The no-argument path is the one that
+    # actually decides what this process will trade with, and that one stays fenced.
+    if values is None:
+        from scripts.account_scope import assert_environment, runtime_data_dir
+        assert_environment(runtime_data_dir(ROOT / "data"), mode)
     prefix = "OKX_DEMO" if mode == "demo" else "OKX_LIVE"
     # A profile is an atomic credential group. A partially entered profile must
     # never borrow individual fields from a different (legacy) identity.

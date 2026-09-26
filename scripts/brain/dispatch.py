@@ -186,6 +186,15 @@ def dispatch_llm_and_persist_decisions(*,
             council_status=council_status,
         )
 
+        # 给每轮主脑决策分配稳定的审计标识。影子复核、开仓 tracker 和后续
+        # 平仓台账用同一标识关联，避免只能按时间和合约名做模糊匹配。
+        cycle_id = f"cycle-{int(time.time() * 1000)}"
+        for _inst_id, _decision_row in standard_cache.items():
+            if not isinstance(_decision_row, dict):
+                continue
+            _decision_row["cycle_id"] = cycle_id
+            _decision_row["decision_id"] = f"{cycle_id}:{_inst_id}"
+
         # 审计③(2026-09-13)：整档覆盖与 trader 的 venue-decision 读-改-写互斥
         # （r20_backend.file_locks，同锁文件路径即同临界区），防互相回退。
         from r20_backend.file_locks import file_lock
@@ -237,4 +246,3 @@ def dispatch_llm_and_persist_decisions(*,
         print(f"[AI Brain Batch] Error in batch inference: {e}")
         _record_cycle_health("failed", str(e))
         return None
-

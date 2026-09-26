@@ -8,6 +8,12 @@ set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "❌ Error: account-isolation .venv is missing; run deploy/install.sh first."
+    exit 1
+fi
+
 echo "🚀 [R20 Quantum Trader] Initializing system environment..."
 
 # 1. Check Python
@@ -32,8 +38,8 @@ mkdir -p data logs backups
 # 3.1 Initialize default instrument pool if not present (prevents untrusted pool blocking entry)
 if [ ! -f "data/instrument_pool.json" ]; then
     echo "📋 Initializing default instrument pool..."
-    if [ -x ".venv/bin/python" ]; then
-        .venv/bin/python -c "from scripts.instrument_pool import save_instruments, DEFAULT_INSTRUMENTS; save_instruments(DEFAULT_INSTRUMENTS)" 2>/dev/null || true
+    if [ -x "$PYTHON_BIN" ]; then
+        "$PYTHON_BIN" -c "from scripts.instrument_pool import save_instruments, DEFAULT_INSTRUMENTS; save_instruments(DEFAULT_INSTRUMENTS)" 2>/dev/null || true
     fi
 fi
 
@@ -52,4 +58,4 @@ fi
 
 # 5. Start Backend Engine
 echo "✨ Launching R20 Quantum Trader on http://0.0.0.0:8080 ..."
-exec python3 -m uvicorn r20_backend.app:app --host 0.0.0.0 --port 8080
+exec "$PYTHON_BIN" -m uvicorn r20_backend.app:app --host 0.0.0.0 --port 8080

@@ -30,6 +30,8 @@ import os
 import urllib
 import warnings
 
+from scripts.direction_observation import candle_timestamp, four_hour_range
+
 from r20_backend.execution import (
     calc_atr,
     calc_bollinger_squeeze,
@@ -97,7 +99,7 @@ def fetch_single_instrument_data(item, all_positions, usdt_available, *,
         "market_regime": "CHOP",
         "structure_1h": "CHOP",
         "trend_1h_bullish": True,
-        "trend_4h_bullish": True,
+        "trend_4h_bullish": False,
         "trend_1h_bearish": False,
         "trend_4h_bearish": False,
         "sentiment_score": 0.0,
@@ -120,7 +122,29 @@ def fetch_single_instrument_data(item, all_positions, usdt_available, *,
                     "markPx": float(p.get("markPx", p.get("last", 0)) or 0),
                     "upl": float(p.get("upl", 0)),
                     "uplRatio": float(p.get("uplRatio", 0) or 0),
-                    "lever": p.get("lever", "3")
+                    "lever": p.get("lever", "3"),
+                    # Preserve exchange risk/account fields for the Jev audit
+                    # layer. They are not used by the factor calculations.
+                    "leverage": p.get("lever", p.get("leverage", "3")),
+                    "notional_usdt": p.get("notionalUsd", p.get("notional_usdt")),
+                    "margin_usdt": p.get("imr", p.get("margin_usdt")),
+                    "imr": p.get("imr"),
+                    "mmr": p.get("mmr"),
+                    "liqPx": p.get("liqPx"),
+                    "bePx": p.get("bePx"),
+                    "mgnMode": p.get("mgnMode"),
+                    "ccy": p.get("ccy"),
+                    "adl": p.get("adl"),
+                    "cTime": p.get("cTime"),
+                    "uTime": p.get("uTime"),
+                    "funding_fee": p.get("fundingFee", p.get("funding_fee")),
+                    "realized_pnl": p.get("realizedPnl", p.get("realized_pnl")),
+                    "fee": p.get("fee"),
+                    "exchangeSl": p.get("exchangeSl"),
+                    "exchangeTp": p.get("exchangeTp"),
+                    "protectionStatus": p.get("protectionStatus"),
+                    "protectionAlgoId": p.get("protectionAlgoId"),
+                    "protectionCoveragePct": p.get("protectionCoveragePct"),
                 }
                 break
 
@@ -236,15 +260,20 @@ def fetch_single_instrument_data(item, all_positions, usdt_available, *,
             f["structure_1h"] = "CHOP"
     
     raw_4h = fetch_candles_direct(inst_id, "4H", 25)
+    f.update(four_hour_range(raw_4h, f["price"]))
+    f["market_data_timestamps"] = {"15M": candle_timestamp(raw_15m),
+                                   "1H": candle_timestamp(raw_1h),
+                                   "4H": candle_timestamp(raw_4h)}
     if raw_4h:
         c_4h = list(reversed(raw_4h))
         closes_4h = [float(c[4]) for c in c_4h]
         e9_4h = calc_ema(closes_4h, 9)
         e21_4h = calc_ema(closes_4h, 21)
-        f["trend_4h_bullish"] = (e9_4h >= e21_4h)
-        f["trend_4h_bearish"] = (e9_4h <= e21_4h)
+        if len(closes_4h) >= 21:
+            f["trend_4h_bullish"] = (e9_4h > e21_4h)
+            f["trend_4h_bearish"] = (e9_4h < e21_4h)
 
-    # 3. Dynamic Multi-Wave Regime Classification (Strict 15M + 1H + 4H Real-Time Alignment)
+    # 3. Market regime uses 1H + 15M only; 4H is observed separately and not a gate.
     # Anti-Inertia Fix: Never classify as BEAR_TREND if short-term 15M is actively reversing upwards (EMA9 > EMA21) or price > 15M EMA21/55
     is_15m_bullish = (f["ema9"] >= f["ema21"] and f["price"] >= f["ema21"] * 0.998)
     is_15m_bearish = (f["ema9"] <= f["ema21"] and f["price"] <= f["ema21"] * 1.002)

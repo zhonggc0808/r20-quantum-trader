@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -332,7 +333,14 @@ def scan_risk_gates_and_ai_brain(*,
             # 汇入多所（Binance / Gate）在管持仓，形成三所平权持仓全景。
             # 审计(2026-09-13)：必须复用 1a 已冻结的周期快照（零重复出网）。
             _merge_cross_venue_positions(active_pos_list, xv_positions_by_venue, all_factors)
-            brain_cache = execute_batch_ai_brain_cycle(pos_desc, active_pos_list, usdt_available=usdt_available) or {}
+            brain_kwargs = {"usdt_available": usdt_available}
+            try:
+                if "trader_factors" in inspect.signature(execute_batch_ai_brain_cycle).parameters:
+                    brain_kwargs["trader_factors"] = all_factors
+            except (TypeError, ValueError):
+                pass
+            brain_cache = execute_batch_ai_brain_cycle(
+                pos_desc, active_pos_list, **brain_kwargs) or {}
             if brain_cache:
                 refreshed_ok, refreshed_positions, refreshed_error = query_positions()
                 if not refreshed_ok:

@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/r20-quantum-trader
-EnvironmentFile=/opt/r20-quantum-trader/.env
-ExecStart=/usr/bin/env python3 -m r20_backend.scheduler
+WorkingDirectory=/root/development/r20-account-isolation
+EnvironmentFile=/root/development/r20-account-isolation/.env
+ExecStart=/root/development/r20-account-isolation/.venv/bin/python -m r20_backend.scheduler
 Restart=always
 RestartSec=15
 NoNewPrivileges=true

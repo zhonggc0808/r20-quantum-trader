@@ -1,0 +1,317 @@
+"""JEV 影子通道契约 —— 钉死 2026-09-26 修掉的两条回归。
+
+## 为什么有这条门
+
+**回归一（通道全灭）**：双通道重构给「独立决策」通道加了 `type: "choice"`
+选择题，而唯一在用的 provider（typesafe）只接受 `boolean`（发送时转成
+`noul`）—— 它对 choice 要求一套未公开的 `choice.criteria` 结构，服务端直接
+`422 Unprocessable Entity`。结果：独立通道连续 **62/62 轮失败**（16 小时），
+同期审计通道因为是纯 boolean 而 **100% 正常**。两通道唯一的结构差异就是这
+两道 choice 题。
+
+**回归二（无判别力的恒 REJECT）**：审计通道拿 `main=WAIT` 的「提议」去问
+`proposal_complete`。WAIT 提议按定义没有 entry/stop/target/size/leverage，
+于是该题中位数塌到 **0.07**、触发硬 flag `proposal_data_incomplete`，
+让 **604/620 = 98%** 的轮次恒定输出 `AUDIT_REJECT`。这不是「JEV 不认同」，
+是「没有提议可审」——一个恒为同一值的信号没有判别力，还会污染统计。
+
+本门钉住三件事：
+1. 任何通道的 payload 只允许出现 provider 能接受的类型；
+2. WAIT 提议不生成审计问题，也不被记成 REJECT，而是显式 `NOT_APPLICABLE`；
+3. 去掉 choice 之后，独立通道的动作仍由 `would_*` 票决**带 margin** 推导
+   （而不是退化成永远 WAIT）。
+"""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from typing import Any, Dict, List
+from unittest.mock import patch
+
+import scripts.ai_brain_trader as abt
+
+#: provider 唯一接受的类型（boolean 在发送前被就地转成 noul）。
+_ACCEPTED_TYPES = {"noul"}
+#: 入场提议应获得的审计问题数（7 道原子审计题）。
+_ENTRY_AUDIT_QUESTIONS = 7
+
+
+def _pkg(inst_id: str) -> Dict[str, Any]:
+    return {"instId": inst_id, "name": inst_id.split("-")[0], "price": 100.0,
+            "bidPx": 99.9, "askPx": 100.1, "ctVal": 1.0, "minSz": 1.0,
+            "base_sz": 1.0, "data_quality": "valid"}
+
+
+def _cache(inst_id: str, action: str) -> Dict[str, Any]:
+    return {"instId": inst_id, "cycle_id": "cyc-1", "decision_id": f"cyc-1:{inst_id}",
+            "timestamp": 1, "data_quality": "valid",
+            "decision": {"action": action, "confidence": 85.0, "leverage": 6,
+                         "margin_usdt": 5.0, "entry_price": 100.0,
+                         "take_profit_price": 105.0, "stop_loss_price": 98.0}}
+
+
+class _Harness(unittest.TestCase):
+    """把 `_run_jev_shadow_review` 跑起来但拦住一切出网与落盘。"""
+
+    #: 子类可覆盖：每个问题的假答案概率
+    probabilities: Dict[str, float] = {}
+
+    def setUp(self) -> None:
+        self.captured: List[Dict[str, Any]] = []
+        self.tmp = tempfile.TemporaryDirectory(prefix="r20-jev-")
+        self.addCleanup(self.tmp.cleanup)
+        env = {
+            "R20_JEV_SHADOW_ENABLED": "1",
+            "R20_JEV_INDEPENDENT_ENABLED": "1",
+            "R20_JEV_TYPESAFE_API_KEY": "fake-key-for-contract-test",
+            "R20_JEV_PROVIDER": "typesafe",
+            "R20_JEV_MODEL": "jev-latest",
+        }
+        patcher = patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._p_req = patch.object(abt, "_jev_shadow_request", self._fake_request)
+        self._p_dir = patch.object(abt, "DATA_DIR", self.tmp.name)
+        self._p_tick = patch.object(abt, "fetch_okx_ticker",
+                                    lambda *a, **k: {"last": 100.0, "bidPx": 99.9,
+                                                     "askPx": 100.1})
+        self._p_algo = patch.object(abt.okx_rest, "pending_algo_orders",
+                                    lambda *a, **k: [])
+        for p in (self._p_req, self._p_dir, self._p_tick, self._p_algo):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _probability(self, name: str) -> float:
+        """`candidate_3_would_buy_long` / `position_0_would_hold` 这类问题的概率查表。
+
+        必须先剥掉 `candidate_<i>_` / `position_<i>_` 前缀，否则查表恒 miss，假答案
+        会变成 None —— 那会让票决全灭并静默退化成 WAIT（本文件第一版就踩了这个坑，
+        被「方向应仍能产出」那条断言抓了出来）。
+        """
+        short = name
+        for prefix in ("candidate_", "position_"):
+            if name.startswith(prefix):
+                short = name[len(prefix):].split("_", 1)[1]
+                break
+        prob = self.probabilities.get(name)
+        return self.probabilities.get(short, 0.5) if prob is None else prob
+
+    def _fake_request(self, endpoint, api_key, payload, timeout, channel):
+        """拦住出网：记录 payload，按 boolean 问题回 noul 概率。"""
+        self.captured.append({"channel": channel, "payload": payload})
+        answers = {}
+        for name in (payload.get("questions") or {}):
+            prob = self._probability(name)
+            answers[name] = {"type": "noul", "noul": prob, "probability": prob}
+        return {"status": "ok", "response": {"model": "fake", "answers": answers,
+                                            "usage": {}},
+                "attempts": [{"attempt": 1, "status": "ok"}],
+                "request_id": "", "latency_ms": 1}
+
+    def run_review(self, mapping: Dict[str, str], **kwargs) -> Dict[str, Any]:
+        abt._run_jev_shadow_review(
+            standard_cache={k: _cache(k, v) for k, v in mapping.items()},
+            packages=[_pkg(k) for k in mapping],
+            time_str="2026-09-26 08:00:00",
+            active_positions_detail=kwargs.pop("positions", []),
+            position_management=kwargs.pop("management", []),
+            usdt_available=44.0,
+        )
+        path = os.path.join(self.tmp.name, "jev_shadow_reviews.jsonl")
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.loads(handle.read().strip().splitlines()[-1])
+
+    def questions(self, channel: str) -> Dict[str, Any]:
+        for row in self.captured:
+            if row["channel"] == channel:
+                return row["payload"].get("questions") or {}
+        self.fail(f"未捕获到通道 {channel} 的 payload")
+
+
+class PayloadTypeContractTest(_Harness):
+    probabilities: Dict[str, float] = {}
+
+    def test_no_choice_question_in_any_lane(self):
+        """回归一：choice 会让 typesafe 直接 422，任何通道都不得再出现。"""
+        self.run_review({"BTC-USDT-SWAP": "WAIT", "ETH-USDT-SWAP": "BUY_LONG"},
+                        positions=[{"instId": "BTC-USDT-SWAP", "side": "long",
+                                    "pos": 1.0, "avgPx": 100.0, "markPx": 101.0,
+                                    "venue": "okx"}],
+                        management=[{"instId": "BTC-USDT-SWAP", "action": "HOLD"}])
+        self.assertEqual([r["channel"] for r in self.captured],
+                         ["independent", "audit"], "两通道都应在同一轮发出")
+        offenders = []
+        for row in self.captured:
+            for name, question in (row["payload"].get("questions") or {}).items():
+                if question.get("type") not in _ACCEPTED_TYPES:
+                    offenders.append((row["channel"], name, question.get("type")))
+        self.assertEqual(offenders, [],
+                         "payload 里出现了 provider 不接受的类型（typesafe 会 422）")
+
+    def test_questions_are_declared_boolean_before_provider_conversion(self):
+        """门只钉「发出时」的类型；声明侧应全部是 boolean（转换前的合法源头）。"""
+        with open(abt.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertNotIn('"type": "choice"', source,
+                         "choice 声明又回来了 —— 它会让独立通道整体 422 全灭")
+
+
+class WaitProposalIsNotAuditedTest(_Harness):
+    probabilities: Dict[str, float] = {}
+
+    def setUp(self):
+        super().setUp()
+        self.review = self.run_review(
+            {"BTC-USDT-SWAP": "WAIT", "ETH-USDT-SWAP": "BUY_LONG"},
+            positions=[{"instId": "BTC-USDT-SWAP", "side": "long", "pos": 1.0,
+                        "avgPx": 100.0, "markPx": 101.0, "venue": "okx"}],
+            management=[{"instId": "BTC-USDT-SWAP", "action": "HOLD"}])
+        self.audit = self.questions("audit")
+        self.by_inst = {r["instId"]: r for r in self.review["instrument_reviews"]}
+
+    def test_wait_proposal_gets_no_audit_questions(self):
+        """回归二：没有提议可审 ⇒ 一道题都不该问。"""
+        leaked = [k for k in self.audit if k.startswith("candidate_0_")]
+        self.assertEqual(leaked, [],
+                         "WAIT 提议仍被送去审计 —— 这正是 98% 恒 REJECT 的成因")
+
+    def test_entry_proposal_keeps_full_audit_question_set(self):
+        """真入场提议必须照旧拿到完整审计题（修复不得把审计通道一起关掉）。"""
+        asked = [k for k in self.audit if k.startswith("candidate_1_")]
+        self.assertEqual(len(asked), _ENTRY_AUDIT_QUESTIONS,
+                         f"入场提议审计题数变了：{sorted(asked)}")
+
+    def test_wait_is_reported_not_applicable_not_reject(self):
+        """WAIT 必须是显式 NOT_APPLICABLE，不得再冒充 AUDIT_REJECT。"""
+        btc = self.by_inst["BTC-USDT-SWAP"]
+        self.assertEqual(btc["jev_audit_verdict"], "NOT_APPLICABLE")
+        self.assertEqual(btc["jev_relation_to_main"], "NOT_APPLICABLE")
+        self.assertIsNone(btc["audit_proposal_complete"],
+                          "未问过 proposal_complete 时不得编造一个值")
+        self.assertEqual(btc["audit_flags"], [])
+
+    def test_entry_still_gets_a_real_verdict(self):
+        """入场提议仍必须落到三态之一（不得被 NOT_APPLICABLE 吞掉）。"""
+        eth = self.by_inst["ETH-USDT-SWAP"]
+        self.assertIn(eth["jev_audit_verdict"], {"APPROVE", "REVIEW", "REJECT"})
+        self.assertIsInstance(eth["audit_flags"], list)
+
+
+class AuditDataIsSelfDescribingTest(_Harness):
+    """回归二的可观测性补丁：审计评分必须能自证"这一条到底有没有被审过"。
+
+    2026-09-26 复盘时踩到的坑：审计通道 98% 输出恒 REJECT，看起来像"JEV 一贯
+    否决主链"。真实原因是当时把 `main=WAIT`（entry/stop/target 全为 0）的提议也
+    送去审计 —— 问"这个止损结构是否有效"，模型只能答"无效"。
+    同轮对照（同一 state、同一次调用）：
+        candidate#0-#6 WAIT  entry=0/sl=0        stop_ok 0.21~0.40
+        candidate#7 BUY_LONG entry=13.68/sl=13.28 stop_ok 0.80
+    汇总 650 条：有 entry/sl 的 stop_ok 中位数 0.79，没有的 0.21；complete 0.70 vs 0.07。
+
+    根因已由「不再审计 WAIT」修掉。这里再钉住"数据自身能区分"，防止下一个人
+    重算一遍同样被污染的均值。
+    """
+
+    probabilities = {
+        "data_valid": 0.9, "execution_ready": 0.9,
+        "would_buy_long": 0.8, "would_sell_short": 0.05, "would_wait": 0.15,
+        "thesis_supported": 0.8, "direction_conflict": 0.1, "entry_is_chasing": 0.2,
+        "stop_structurally_valid": 0.85, "reward_after_cost_sufficient": 0.8,
+        "omits_counter_evidence": 0.2, "proposal_complete": 0.9,
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.review = self.run_review({"BTC-USDT-SWAP": "WAIT",
+                                       "ETH-USDT-SWAP": "BUY_LONG"})
+        self.by_inst = {r["instId"]: r for r in self.review["instrument_reviews"]}
+
+    def test_wait_candidate_carries_no_audit_probabilities(self):
+        """WAIT 候选必须是 None —— 不能是"全 0 的分数"，否则又会被均值污染。"""
+        btc = self.by_inst["BTC-USDT-SWAP"]
+        self.assertIsNone(
+            btc["audit_probabilities"],
+            "未审计的候选必须显式为 None：任何数字（含 0）都会被下游当成评分")
+
+    def test_entry_candidate_records_every_audit_probability(self):
+        """真候选必须留下完整 7 题原值，便于事后独立核对（无需按 index 反查）。"""
+        probs = self.by_inst["ETH-USDT-SWAP"]["audit_probabilities"]
+        self.assertIsInstance(probs, dict)
+        self.assertEqual(
+            set(probs),
+            {"thesis_supported", "direction_conflict", "entry_is_chasing",
+             "stop_structurally_valid", "reward_after_cost_sufficient",
+             "omits_counter_evidence", "proposal_complete"},
+            f"审计原值集合不完整：{sorted(probs)}")
+        self.assertAlmostEqual(probs["stop_structurally_valid"], 0.85, places=6)
+        self.assertAlmostEqual(probs["proposal_complete"], 0.9, places=6)
+
+    def test_missing_answer_uses_the_negative_sentinel_not_zero(self):
+        """缺答案要用 -1.0 哨兵，不能塌成 0 —— 否则"没答"会被读成"强烈否定"。"""
+        review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+        probs = review["instrument_reviews"][0]["audit_probabilities"]
+        self.assertTrue(all(v >= -1.0 for v in probs.values()))
+        self.assertTrue(all(isinstance(v, (int, float)) for v in probs.values()))
+
+    def test_wait_and_entry_are_separable_from_the_record_alone(self):
+        """一条记录里就能看出谁被审计过 —— 不需要再去 join response.answers。"""
+        audited = [inst for inst, r in self.by_inst.items()
+                   if r["audit_probabilities"] is not None]
+        self.assertEqual(audited, ["ETH-USDT-SWAP"],
+                         "只有真入场候选应留下审计评分")
+
+
+class IndependentActionStillDerivedFromVotesTest(_Harness):
+    """去掉 choice 后，独立动作必须仍由票决（带 margin）推导。"""
+
+    probabilities = {
+        "data_valid": 0.95,
+        "execution_ready": 0.95,
+        "would_buy_long": 0.90,
+        "would_sell_short": 0.05,
+        "would_wait": 0.20,
+    }
+
+    def test_directional_call_survives_without_choice_question(self):
+        review = self.run_review({"ETH-USDT-SWAP": "WAIT"})
+        row = review["instrument_reviews"][0]
+        self.assertNotIn("candidate_0_action", self.questions("independent"),
+                         "choice 问题已被移除")
+        self.assertEqual(row["suggested_action"], "BUY_LONG",
+                         "票决优势方向必须仍能产出独立动作（否则通道退化成永远 WAIT）")
+        self.assertGreaterEqual(row["jev_action_margin"], 0.15,
+                                "动作间距应达到 R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN")
+        self.assertEqual(row["jev_action_status"], "accepted")
+
+    def test_votes_are_still_present_and_recorded(self):
+        review = self.run_review({"ETH-USDT-SWAP": "WAIT"})
+        votes = review["instrument_reviews"][0]["suggested_action_votes"]
+        self.assertEqual(set(votes), {"BUY_LONG", "SELL_SHORT", "WAIT"},
+                         "三个兼容票决必须仍在记录里（choice 的信息并未丢失）")
+
+
+class JevVerdictHelperTest(unittest.TestCase):
+    def test_audit_verdict_not_applicable_short_circuits(self):
+        got = abt._jev_audit_verdict(["direction_conflict"], has_proposal=False)
+        self.assertEqual(got["verdict"], "NOT_APPLICABLE")
+        self.assertEqual(got["flags"], [],
+                         "没有提议时不得把传入的 flag 带出去")
+
+    def test_policy_relation_maps_not_applicable(self):
+        self.assertEqual(
+            abt._jev_policy_relation("WAIT", "BUY_LONG", data_status="valid",
+                                     audit_verdict_value="NOT_APPLICABLE"),
+            "NOT_APPLICABLE")
+
+    def test_not_applicable_is_not_a_reject(self):
+        for main in ("WAIT", "BUY_LONG"):
+            got = abt._jev_policy_relation(main, "WAIT", data_status="valid",
+                                           audit_verdict_value="NOT_APPLICABLE")
+            self.assertNotEqual(got, "AUDIT_REJECT",
+                                "NOT_APPLICABLE 绝不能被算成审计否决")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -51,18 +51,21 @@ def _routes_in(node_src: str) -> list:
 
 
 class StrategyRouterSplitTest(unittest.TestCase):
-    def test_static_route_table_is_identical_and_ordered(self):
+    def test_static_route_table_keeps_baseline_order(self):
         r = subprocess.run(["git", "show", f"{PRE}:{BASELINE}"],
                            capture_output=True, text=True, cwd=str(ROOT))
         self.assertEqual(r.returncode, 0, f"基线取不到：{r.stderr[:200]}")
         want = _routes_in(r.stdout)
-        self.assertEqual(len(want), 35, f"基线应有 35 条路由，实际 {len(want)}")
+        self.assertEqual(len(want), 35, f"拆包基线应有 35 条路由，实际 {len(want)}")
 
         got = []
         for name in INCLUDE_ORDER:
             got.extend(_routes_in((PKG / f"{name}.py").read_text(encoding="utf-8")))
-        self.assertEqual(got, want,
-                         "路由表（路径/方法/处理器名/顺序）与拆分前不一致")
+        # 拆包后必须保留基线接口及其相对顺序，但后续版本允许追加新接口。
+        want_set = set(want)
+        got_baseline = [route for route in got if route in want_set]
+        self.assertEqual(got_baseline, want,
+                         "路由表丢失或重排了拆包基线接口")
 
     def test_live_openapi_route_surface_unchanged(self):
         from r20_backend.app import app
@@ -80,9 +83,10 @@ class StrategyRouterSplitTest(unittest.TestCase):
         r = subprocess.run(["git", "show", f"{PRE}:{BASELINE}"],
                            capture_output=True, text=True, cwd=str(ROOT))
         want = {(p, m) for p, m, _ in _routes_in(r.stdout)}
-        self.assertEqual(live, want, "线上接口面（路径×方法）与拆分前不一致")
-        self.assertEqual(len(live), 35)
-        self.assertEqual(tags, {("strategy",): 35},
+        self.assertTrue(want <= live,
+                        f"线上接口面丢失拆包基线接口: {sorted(want - live)}")
+        self.assertGreaterEqual(len(live), len(want))
+        self.assertEqual(tags, {("strategy",): len(live)},
                          "tags 必须恰好一处 ['strategy']（两处都加会重复）")
 
     def test_aggregator_include_order_is_documented_order(self):

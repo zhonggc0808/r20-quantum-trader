@@ -59,6 +59,12 @@ from scripts.trader.cycle_stages import (
     persist_state_and_sync_ledger,
     preflight_reconcile_and_housekeeping,
 )
+from scripts.direction_observation import (
+    LEGACY_CALCULUS_VERSION,
+    SCHEMA_VERSION,
+    direction_layers,
+    observe_cycle,
+)
 from scripts.trader.entry_execution import (
     execute_entry_scan,
 )
@@ -352,6 +358,136 @@ def save_trackers(trackers):
             f"（下轮将按旧状态继续）: {_save_err!r}",
             RuntimeWarning)
 
+
+def _entry_identity_timestamp_ms(value: Any) -> int:
+    """Normalize OKX millisecond strings, epoch seconds, and local ISO text."""
+    if value in (None, "", "--"):
+        return 0
+    try:
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric > 0:
+            return int(numeric if numeric >= 10_000_000_000 else numeric * 1000)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+        return int(parsed.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def backfill_tracker_entry_identities(all_positions: List[Dict[str, Any]],
+                                      trackers: Dict[str, Any]) -> Dict[str, int]:
+    """Best-effort join old live trackers to their exact OKX opening order.
+
+    Matching is bounded by instrument, side, non-reduce-only semantics, and a
+    bounded time window around the exchange position creation time.  A miss is
+    recorded explicitly and retried only after six hours; it is never replaced
+    with a same-symbol guess.
+    """
+    now_ms = int(time.time() * 1000)
+    result = {"matched": 0, "not_found": 0, "errors": 0, "skipped": 0}
+    changed = False
+    for position in all_positions or []:
+        if not isinstance(position, dict) or float(position.get("pos", 0) or 0) <= 0:
+            continue
+        inst_id = str(position.get("instId") or "")
+        side = str(position.get("side") or position.get("posSide") or "").lower()
+        if not inst_id or side not in {"long", "short"}:
+            result["skipped"] += 1
+            continue
+        tracker = trackers.get(f"{inst_id}_{side}")
+        if not isinstance(tracker, dict):
+            result["skipped"] += 1
+            continue
+        if tracker.get("entry_order_id"):
+            tracker.setdefault("entry_identity_status", "matched")
+            result["skipped"] += 1
+            continue
+        checked_at = _entry_identity_timestamp_ms(tracker.get("entry_identity_checked_at"))
+        if checked_at and now_ms - checked_at < 6 * 3600 * 1000:
+            result["skipped"] += 1
+            continue
+
+        target_ms = 0
+        for value in (
+            position.get("cTime"), tracker.get("entry_order_ts"),
+            tracker.get("entryTs"), tracker.get("entryTime"),
+        ):
+            target_ms = _entry_identity_timestamp_ms(value)
+            if target_ms:
+                break
+        tracker["entry_identity_checked_at"] = now_ms
+        changed = True
+        if not target_ms:
+            tracker["entry_identity_status"] = "missing_open_timestamp"
+            result["not_found"] += 1
+            continue
+
+        expected_order_side = "buy" if side == "long" else "sell"
+        try:
+            rows = okx_rest.orders_history(
+                inst_id=inst_id,
+                state="filled",
+                # OKX filters orders-history by order creation time, while a
+                # resting limit order may fill much later (DOGE did exactly
+                # this). Keep the window bounded but wide enough to cover a
+                # normal pending-order lifetime; rank candidates by fill time.
+                begin=max(0, target_ms - 6 * 60 * 60 * 1000),
+                end=target_ms + 6 * 60 * 60 * 1000,
+                limit=100,
+            ) or []
+            candidates = []
+            entry_size = abs(float(tracker.get("initialSz") or position.get("pos") or 0))
+            entry_px = float(tracker.get("entryPx") or position.get("avgPx") or 0)
+            for order in rows:
+                if not isinstance(order, dict) or str(order.get("instId") or inst_id) != inst_id:
+                    continue
+                if str(order.get("state") or "filled").lower() != "filled":
+                    continue
+                if str(order.get("side") or "").lower() != expected_order_side:
+                    continue
+                if str(order.get("reduceOnly") or "false").lower() in {"true", "1", "yes"}:
+                    continue
+                order_pos_side = str(order.get("posSide") or "net").lower()
+                if order_pos_side not in {side, "net", ""}:
+                    continue
+                order_ms = _entry_identity_timestamp_ms(
+                    order.get("fillTime") or order.get("uTime") or order.get("cTime"))
+                if not order_ms or abs(order_ms - target_ms) > 6 * 60 * 60 * 1000:
+                    continue
+                fill_size = abs(float(order.get("accFillSz") or order.get("fillSz") or order.get("sz") or 0))
+                fill_px = float(order.get("avgPx") or order.get("fillPx") or order.get("px") or 0)
+                size_gap = abs(fill_size - entry_size) / max(entry_size, 1e-12) if fill_size > 0 else 99.0
+                price_gap = abs(fill_px - entry_px) / max(entry_px, 1e-12) if fill_px > 0 else 99.0
+                candidates.append((abs(order_ms - target_ms), size_gap, price_gap, order_ms, order))
+
+            if not candidates:
+                tracker["entry_identity_status"] = "not_found"
+                tracker["entry_order_source"] = "okx_orders_history"
+                result["not_found"] += 1
+                continue
+            _, _, _, order_ms, match = min(candidates, key=lambda item: item[:3])
+            tracker.update({
+                "entry_order_id": match.get("ordId"),
+                "entry_order_ts": order_ms,
+                "entry_order_avg_px": match.get("avgPx") or match.get("fillPx") or match.get("px"),
+                "entry_order_fill_sz": match.get("accFillSz") or match.get("fillSz") or match.get("sz"),
+                "entry_order_source": "okx_orders_history",
+                "entry_identity_status": "matched",
+            })
+            result["matched"] += 1
+        except Exception as exc:
+            tracker["entry_identity_status"] = "lookup_error"
+            tracker["entry_identity_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            result["errors"] += 1
+
+    if changed:
+        save_trackers(trackers)
+    return result
+
 def _atomic_write_json(path, payload):
     """审计③(2026-09-13)：常驻写者统一原子路数（mkstemp+fsync+os.replace，对齐
     sync_full_ledger / r20_gateway.secrets）。此前台账/状态/冷却直 open("w") 覆写，
@@ -471,7 +607,8 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None) -> Tuple[bool, s
         current_environment=current_environment,
         load_instruments=load_instruments,
         okx_rest=okx_rest,
-        venue_registry=venue_registry)
+        venue_registry=venue_registry,
+        data_dir=DATA_DIR)
 
 # =============================================================================
 # US-006 重启接管存量挂单——周期级挂单对账
@@ -484,9 +621,9 @@ RECONCILE_REASON_SIDE_MISMATCH = "方向不一致"
 RECONCILE_REASON_INTENT_STALE = "周期意图已失效"
 
 
-def record_open_intent(inst_id: str, side: str, ts_ms: int = None) -> None:
+def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None) -> None:
     """壳（第八十三刀搬至 `scripts/trader/ledger_writer.py`，调用期同名注入）。"""
-    return _ledger_writer_intent(inst_id, side, ts_ms,
+    return _ledger_writer_intent(inst_id, side, ts_ms, metadata,
                                  OPEN_INTENT_FILE=OPEN_INTENT_FILE,
                                  OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS)
 
@@ -812,7 +949,49 @@ def build_signal_snapshot(f: dict) -> dict:
     调用期解析 `DATA_DIR` 注入 —— `patch.object(aft, "DATA_DIR", tmp)`
     的既有专测面保真。
     """
-    return _signal_snapshot_build(f, data_dir=DATA_DIR)
+    snap = _signal_snapshot_build(f, data_dir=DATA_DIR)
+    snap["direction_schema_version"] = SCHEMA_VERSION
+    snap["calculus_schema_version"] = LEGACY_CALCULUS_VERSION
+    snap["strategy_version"] = f.get("policy_version") or __version__
+    snap["direction_layers"] = f.get("direction_layers") or direction_layers(f.get("calculus"))
+    snap["direction_observation"] = f.get("direction_observation")
+    return snap
+
+def finalize_pending_tracker_signal_snapshots(all_factors, trackers):
+    """在本轮方向观测完成后，补齐新 tracker 的入场快照并写入 journal。"""
+    for f in all_factors:
+        position = f.get("position")
+        if not position:
+            continue
+        pos_key = f"{f['instId']}_{position.get('side', '')}"
+        tracker = trackers.get(pos_key)
+        if not tracker or not tracker.get("signal_snapshot_pending"):
+            continue
+
+        snapshot = build_signal_snapshot(f)
+        if f.get("cycle_id") and not tracker.get("cycle_id"):
+            tracker["cycle_id"] = f.get("cycle_id", "")
+        if f.get("decision_id") and not tracker.get("decision_id"):
+            tracker["decision_id"] = f.get("decision_id", "")
+        tracker["signal_snapshot"] = snapshot
+        tracker.pop("signal_snapshot_pending", None)
+        record_signal_snapshot({
+            "instId": f["instId"],
+            "name": f.get("name"),
+            "side": position.get("side"),
+            "entryTs": tracker.get("entryTs"),
+            "entryTime": tracker.get("entryTime"),
+            "entryPx": tracker.get("entryPx"),
+            "sz": tracker.get("initialSz"),
+            "cycle_id": tracker.get("cycle_id", ""),
+            "decision_id": tracker.get("decision_id", ""),
+            "entry_order_id": tracker.get("entry_order_id"),
+            "entry_intent_id": tracker.get("entry_intent_id"),
+            "entry_order_ts": tracker.get("entry_order_ts"),
+            "entry_venue": tracker.get("entry_venue", "okx"),
+            "policy_version": tracker.get("policy_version", ""),
+            "snapshot": snapshot,
+        })
 
 def _signal_journal_file() -> str:
     """**调用期**解析信号日记路径（与 `build_signal_snapshot(data_dir=DATA_DIR)` 同款）。
@@ -848,6 +1027,38 @@ def record_signal_snapshot(snap: dict) -> None:
 
 def record_trade(trade_data):
     """壳（第八十三刀搬至 `scripts/trader/ledger_writer.py`，调用期同名注入）。"""
+    # 平仓台账没有强制要求调用方重复传递影子复核标识；从当前 tracker
+    # 补齐后，入场信号、影子评估和最终盈亏可以按 decision_id 直接关联。
+    if isinstance(trade_data, dict):
+        try:
+            _inst = str(trade_data.get("inst") or trade_data.get("name") or "")
+            _direction = str(trade_data.get("direction") or trade_data.get("side") or "")
+            _want_side = "long" if "多" in _direction else ("short" if "空" in _direction else "")
+            for _key, _tracker in (load_trackers() or {}).items():
+                if not isinstance(_tracker, dict):
+                    continue
+                _tracker_inst = str(_tracker.get("instId") or _tracker.get("name") or "")
+                _tracker_side = str(_tracker.get("side") or "").lower()
+                _same_inst = _inst in {_tracker_inst, str(_tracker.get("name") or "")} or (
+                    _inst and _tracker_inst.startswith(f"{_inst}-"))
+                if _same_inst and (not _want_side or _want_side in _tracker_side):
+                    if _tracker.get("decision_id"):
+                        trade_data.setdefault("decision_id", _tracker["decision_id"])
+                    if _tracker.get("cycle_id"):
+                        trade_data.setdefault("cycle_id", _tracker["cycle_id"])
+                    for _field in ("entry_order_id", "entry_intent_id", "entry_order_ts",
+                                   "entry_venue", "entryPx", "entryTs", "entryTime"):
+                        if _tracker.get(_field) is not None:
+                            trade_data.setdefault(_field, _tracker[_field])
+                    break
+        except Exception as _shadow_link_exc:
+            print(f"[Jev Shadow] warn 平仓台账关联 decision_id 失败: {_shadow_link_exc}")
+    if isinstance(trade_data, dict) and not trade_data.get("id"):
+        _identity = (trade_data.get("entry_order_id") or
+                     trade_data.get("decision_id") or
+                     f"{trade_data.get('inst', trade_data.get('name', 'unknown'))}")
+        _id_seed = f"{_identity}:{trade_data.get('time', '')}"
+        trade_data["id"] = "local_close_" + str(_id_seed).replace("/", "_").replace(" ", "_")
     return _ledger_writer_trade(
         trade_data,
         LEDGER_JSON_FILE=LEDGER_JSON_FILE,
@@ -1059,6 +1270,14 @@ def execute_portfolio():
         prune_trackers=prune_trackers,
         save_trackers=save_trackers    )
 
+    _entry_identity_result = backfill_tracker_entry_identities(all_positions, trackers)
+    if _entry_identity_result["matched"]:
+        executed_actions.append(
+            f"补齐 {_entry_identity_result['matched']} 条持仓入场订单身份")
+    if _entry_identity_result["errors"]:
+        executed_actions.append(
+            f"{_entry_identity_result['errors']} 条持仓入场订单身份回查失败，保留待重试状态")
+
     # 4. Check Circuit Breaker & Batch AI Brain Scan (Including Active Positions Detail)
     ASSET_MARGIN_CAP, brain_cache, cb_active, cb_reason = scan_risk_gates_and_ai_brain(
         _xv_total=_xv_total,
@@ -1083,6 +1302,10 @@ def execute_portfolio():
         query_positions=query_positions,
         read_cycle_health=read_cycle_health,
         save_trackers=save_trackers    )
+
+    observe_cycle(all_factors, brain_cache)
+    finalize_pending_tracker_signal_snapshots(all_factors, trackers)
+    save_trackers(trackers)
 
     if not cb_active and pool_is_trustworthy():
         execute_entry_scan(

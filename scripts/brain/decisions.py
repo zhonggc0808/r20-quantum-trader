@@ -149,6 +149,18 @@ def assemble_decision_cache(
                 "summary": p_summary,
             },
             "macro_assessment": macro_summary,
+            "direction_input": {
+                "schema_version": 1,
+                "macro_4h": p.get("macro_4h"),
+                "calculus_regime": (p.get("calculus") or {}).get("regime"),
+                "data_quality": p.get("data_quality"),
+                "candle_ts_4h": (p.get("market_data_timestamps") or {}).get("4H"),
+                "market_data_timestamps": p.get("market_data_timestamps") or {},
+                "range_4h_high": p.get("range_4h_high"),
+                "range_4h_low": p.get("range_4h_low"),
+                "price_position_in_range": p.get("price_position_in_range"),
+                "sample_ts": int(time.time() * 1000),
+            },
             # 投委会溯源（2026-09-10 前台适配数据契约）：ran/reason + CIO 采纳席位
             "council": {
                 **(council_status or {"ran": False}),

@@ -192,7 +192,17 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
                 return False, f"{target_venue.upper()} 下单失败: {detail}"
 
             order_id = str(res.get("order_id") or res.get("tp_id") or f"{target_venue}-ok")
-            record_open_intent(inst_id, side)
+            record_open_intent(
+                inst_id, side, metadata={
+                    "order_id": order_id,
+                    "decision_id": (venue_ctx or {}).get("decision_id"),
+                    "cycle_id": (venue_ctx or {}).get("cycle_id"),
+                    "pos_side": pos_side,
+                    "venue": target_venue,
+                    "requested_price": effective_px,
+                    "size": size,
+                    "intent_id": (venue_ctx or {}).get("intent_id"),
+                })
             confirm_signal_reservation(_reservation)
             return True, order_id
         except Exception as exc:
@@ -235,7 +245,17 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
     if not order_id:
         release_signal_reservation(_reservation, "交易所未返回可核验订单号")
         return False, "exchange accepted response without a verifiable order id"
-    record_open_intent(inst_id, side)
+    record_open_intent(
+        inst_id, side, metadata={
+                    "order_id": order_id,
+                    "decision_id": (venue_ctx or {}).get("decision_id"),
+                    "cycle_id": (venue_ctx or {}).get("cycle_id"),
+                    "pos_side": pos_side,
+                    "venue": target_venue,
+                    "requested_price": effective_px,
+                    "size": size,
+                    "intent_id": (venue_ctx or {}).get("intent_id"),
+                })
     confirm_signal_reservation(_reservation)
     return True, str(order_id)
 

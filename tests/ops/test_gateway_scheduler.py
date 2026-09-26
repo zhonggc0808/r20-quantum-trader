@@ -33,7 +33,7 @@ class GatewaySchedulerTests(unittest.TestCase):
         boundary = self.now.replace(minute=15, second=0)
         self.store.set_state("job.last.trader", boundary.replace(minute=0).isoformat())
         self.assertTrue(self.scheduler.due(trader, boundary, {}))
-        self.assertFalse(self.scheduler.due(trader, boundary.replace(second=11), {}))
+        self.assertTrue(self.scheduler.due(trader, boundary.replace(second=11), {}))
 
     def test_daily_job_runs_once_per_time_slot(self):
         briefing = next(spec for spec in JOBS if spec.name == "daily_briefing")

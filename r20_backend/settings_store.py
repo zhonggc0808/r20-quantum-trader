@@ -121,6 +121,9 @@ def sanitize_env_value(key: str, value: Any) -> str:
 
 
 def remove_env(keys: set[str] | list[str] | tuple[str, ...]) -> None:
+    from scripts.account_scope import runtime_data_dir, validate_environment_update
+    validate_environment_update(runtime_data_dir(ENV_FILE.parent / "data"),
+                                dict.fromkeys(keys), removing=True)
     targets = {str(k) for k in keys}
     invalid = sorted(k for k in targets if not _ENV_KEY_RE.match(k))
     if invalid:
@@ -150,6 +153,8 @@ def remove_env(keys: set[str] | list[str] | tuple[str, ...]) -> None:
 
 
 def update_env(values: Mapping[str, str | bool | None]) -> None:
+    from scripts.account_scope import runtime_data_dir, validate_environment_update
+    validate_environment_update(runtime_data_dir(ENV_FILE.parent / "data"), values)
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     # 审计 P0-2(2026-09-13)：同上，整个 RMW 持 file_lock；丢更新与「UI 显示已生效、
     # 磁盘未生效」的谎报都源于此处无锁。绝不能只锁写那一半（会退化成另一种丢更新）。

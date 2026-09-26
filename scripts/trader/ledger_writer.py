@@ -25,7 +25,7 @@ import os
 import time
 
 
-def record_open_intent(inst_id: str, side: str, ts_ms: int = None, *,
+def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None, *,
                        OPEN_INTENT_FILE: str, OPEN_INTENT_TTL_MS: int) -> None:
     """下单成功后记录本地开仓意图，供重启后挂单对账归属（US-006）。
 
@@ -48,7 +48,14 @@ def record_open_intent(inst_id: str, side: str, ts_ms: int = None, *,
         _side_l = str(side).lower()
         intents = [i for i in intents
                    if not (str(i.get("instId")) == inst_id and str(i.get("side", "")).lower() == _side_l)]
-        intents.append({"instId": inst_id, "side": side, "ts": int(ts_ms or _now_ms)})
+        entry = {"instId": inst_id, "side": side, "ts": int(ts_ms or _now_ms)}
+        if isinstance(metadata, dict):
+            for key in ("order_id", "decision_id", "cycle_id", "pos_side", "venue",
+                        "requested_price", "size", "intent_id"):
+                value = metadata.get(key)
+                if value not in (None, ""):
+                    entry[key] = value
+        intents.append(entry)
         with open(OPEN_INTENT_FILE, "w", encoding="utf-8") as f:
             json.dump(intents[-200:], f, ensure_ascii=False, indent=2)
     except Exception as e:

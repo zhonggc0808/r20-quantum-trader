@@ -291,6 +291,20 @@ def fetch_ticker(inst_id: str, timeout: float = 3.5) -> Optional[Dict[str, Any]]
     return _alt_venue_ticker(inst_id)
 
 
+def fetch_okx_ticker(inst_id: str, timeout: float = 3.5) -> Optional[Dict[str, Any]]:
+    """Fetch an OKX-only ticker without falling back to another venue.
+
+    Shadow PnL is compared with OKX execution, so using a Binance/Gate quote
+    after an OKX outage would create a false fill and contaminate evaluation.
+    """
+    data = _public_get("/api/v5/market/ticker", params={"instId": inst_id}, timeout=timeout)
+    if data and data.get("data"):
+        ticker = dict(data["data"][0])
+        ticker.setdefault("venue", "okx")
+        return ticker
+    return None
+
+
 def fetch_tickers_bulk(inst_type: str = "SWAP", timeout: float = 4.0) -> Dict[str, Dict[str, Any]]:
     """Fetch all instrument tickers in ONE single network request."""
     data = _public_get("/api/v5/market/tickers", params={"instType": inst_type}, timeout=timeout)
@@ -498,8 +512,15 @@ def fetch_candles(
         timeout=timeout,
     )
     if data and data.get("data"):
-        return data["data"]
-    return _alt_venue_candles(inst_id, bar, limit)
+        rows = data["data"]
+    else:
+        rows = _alt_venue_candles(inst_id, bar, limit)
+    try:
+        from scripts.direction_observation import remember_candle_timestamp
+        remember_candle_timestamp(inst_id, bar, rows)
+    except Exception:
+        pass
+    return rows
 
 
 # ---------------------------------------------------------------------------

@@ -7,10 +7,10 @@ Type=simple
 User=r20
 Group=r20
 Environment=HOME=/home/r20
-Environment=PATH=/opt/r20-quantum-trader/.venv/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=/opt/r20-quantum-trader
-EnvironmentFile=/opt/r20-quantum-trader/.env
-ExecStart=/usr/bin/python3 -m r20_gateway.worker
+Environment=PATH=/root/development/r20-account-isolation/.venv/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/root/development/r20-account-isolation
+EnvironmentFile=/root/development/r20-account-isolation/.env
+ExecStart=/root/development/r20-account-isolation/.venv/bin/python -m r20_gateway.worker
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -43,13 +43,18 @@ from risk_constants import (
     effective_single_asset_margin,    MAX_TOTAL_EXPOSURE_USDT,
 )
 import json
+import hashlib
 import time
 import datetime
 import urllib.request
 import subprocess
 import tempfile
 import fcntl
-from typing import Dict, Any, List, Optional, Tuple
+import urllib.error
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+ENTRY_ACTIONS = {"BUY_LONG", "SELL_SHORT"}
+POSITION_ACTIONS = {"HOLD", "CLOSE_MARKET", "UPDATE_SL"}
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -68,9 +73,15 @@ def _get_system_version_tag() -> str:
 
 WORKSPACE_DIR = PROJECT_ROOT
 DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
-from market_data_service import fetch_single_indicator, fetch_ticker, fetch_candles
+from market_data_service import fetch_single_indicator, fetch_ticker, fetch_okx_ticker, fetch_candles
 # 结构优化阶段4·B3：单标的数据包装配已搬入 scripts/brain/packages.py（门面保留薄壳）
 from scripts.brain.packages import fetch_single_instrument_package as _fetch_single_instrument_package
+from scripts.direction_observation import (
+    compare_directions,
+    direction_layers,
+    enrich_brain_package,
+)
+from scripts.trader.order_lease import record_keep, remove_lease
 # 结构优化阶段4·B3 第二块：跨所采集/健康度/提示词组装已搬入 scripts/brain/xvenue.py。
 # 依赖面较宽（适配器缝、safe_float、VENUE_HEALTH_FILE、atomic_write_json、_XV_HEALTH），
 # 全部走**调用期注入**，理由见该模块 docstring 与 r20_backend/README.md §5。
@@ -349,11 +360,12 @@ def fetch_single_instrument_package(item: Dict[str, Any]) -> Dict[str, Any]:
     `pin_baseline_risk_env()` 的重载名单不含子模块，import 期绑定会让
     `patch.object(门面, "fetch_candles")` 失效。详见该模块 docstring。
     """
-    return _fetch_single_instrument_package(
+    pkg = _fetch_single_instrument_package(
         item,
         fetch_candles=fetch_candles,
         fetch_single_indicator=fetch_single_indicator,
     )
+    return enrich_brain_package(pkg)
 
 # ── SYSTEM_PROMPT · v7.6 优质预设基线 ──────────────────────────────────────
 # 设计契约：
@@ -782,10 +794,10 @@ def fetch_pending_orders_list() -> Optional[List[Dict[str, Any]]]:
 
 
 def execute_brain_pending_cancels(pending_mgmt_list: List[Any]) -> List[Dict[str, Any]]:
-    """执行 AI 决策的 CANCEL 清单（V5 直签 REST，US-003）。
+    """执行逐笔 KEEP/CANCEL，并维护 20 分钟 AI 挂单租约。
 
-    仅当撤单真实成功才打印 🛑（旧 CLI 版失败也无条件打印成功，属假告警，已修正）；
-    单笔失败打印 ⚠️ 并继续处理其余项，返回执行日志供测试与审计。
+    KEEP 只刷新有限租约，不是永久豁免；CANCEL 仅在交易所确认成功后清理租约。
+    单笔失败不影响其余订单，且失败的 KEEP 不会获得隐式保留权。
     """
     log: List[Dict[str, Any]] = []
     for p_order in pending_mgmt_list or []:
@@ -795,15 +807,2375 @@ def execute_brain_pending_cancels(pending_mgmt_list: List[Any]) -> List[Dict[str
         p_ord_id = str(p_order.get("ordId", ""))
         p_inst_id = str(p_order.get("instId", ""))
         p_reason = str(p_order.get("reason", "模型指示撤销该挂单"))
+        if p_act == "KEEP" and p_ord_id and p_inst_id:
+            try:
+                lease = record_keep(p_ord_id, p_inst_id, data_dir=DATA_DIR)
+                print(f"[AI Brain Batch] AI确认维持挂单20分钟: {p_inst_id} "
+                      f"(ordId={p_ord_id}, lease_until={lease['lease_until']}, 原因={p_reason})")
+                log.append({"ok": True, "action": "KEEP", "instId": p_inst_id,
+                            "ordId": p_ord_id, "reason": p_reason,
+                            "lease_until": lease["lease_until"]})
+            except Exception as exc:
+                print(f"[AI Brain Batch] KEEP租约写入失败（按无租约处理）: "
+                      f"{p_inst_id} ordId={p_ord_id}: {exc}")
+                log.append({"ok": False, "action": "KEEP", "instId": p_inst_id,
+                            "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
+            continue
         if p_act == "CANCEL" and p_ord_id and p_inst_id:
             try:
                 okx_rest.cancel_order(p_inst_id, p_ord_id)
+                try:
+                    remove_lease(p_ord_id, data_dir=DATA_DIR)
+                except Exception as lease_exc:
+                    print(f"[AI Brain Batch] warn 撤单成功但租约清理失败: "
+                          f"{p_inst_id} ordId={p_ord_id}: {lease_exc}")
                 print(f"[AI Brain Batch] 🛑 AI自主撤回失效/过时限价单: {p_inst_id} (ordId={p_ord_id}, 原因={p_reason})")
-                log.append({"ok": True, "instId": p_inst_id, "ordId": p_ord_id, "reason": p_reason})
+                log.append({"ok": True, "action": "CANCEL", "instId": p_inst_id,
+                            "ordId": p_ord_id, "reason": p_reason})
             except Exception as exc:
                 print(f"[AI Brain Batch] ⚠️ 撤单失败（直签 REST fail-closed，不做假成功，待下一周期重试）: {p_inst_id} ordId={p_ord_id}: {exc}")
-                log.append({"ok": False, "instId": p_inst_id, "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
+                log.append({"ok": False, "action": "CANCEL", "instId": p_inst_id,
+                            "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
     return log
+
+
+def _jev_shadow_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if result == result else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _jev_shadow_base(inst_id: Any) -> str:
+    value = str(inst_id or "").upper().split(":")[-1]
+    return value.split("-")[0].replace("_USDT", "").replace("USDT", "")
+
+
+def _jev_shadow_side(value: Any) -> str:
+    text = str(value or "").lower()
+    if "long" in text or "多" in text:
+        return "long"
+    if "short" in text or "空" in text:
+        return "short"
+    return text
+
+
+def _jev_shadow_timestamp(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) < 10_000_000_000 else float(value) / 1000.0
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    # OKX emits cTime/uTime as digit strings in milliseconds. Parse those
+    # before ISO-8601 so a valid position age is not silently reduced to zero.
+    try:
+        numeric = float(text)
+        if numeric == numeric and abs(numeric) != float("inf"):
+            return numeric if numeric < 10_000_000_000 else numeric / 1000.0
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _jev_shadow_position_snapshot(position: Dict[str, Any], *, fee_rate: float,
+                                  slippage_bps: float) -> Dict[str, Any]:
+    size = abs(_jev_shadow_float(position.get("pos"), 0.0))
+    entry = _jev_shadow_float(position.get("avgPx"), 0.0)
+    mark = _jev_shadow_float(position.get("markPx", position.get("last")), 0.0)
+    ct_val = max(0.0, _jev_shadow_float(position.get("ctVal"), 1.0))
+    side = _jev_shadow_side(position.get("side", position.get("posSide")))
+    bid = _jev_shadow_float(position.get("bidPx"), 0.0)
+    ask = _jev_shadow_float(position.get("askPx"), 0.0)
+    slip_ratio = max(0.0, slippage_bps) / 10000.0
+    if side == "long":
+        executable = bid if bid > 0 else mark * (1.0 - slip_ratio)
+    else:
+        executable = ask if ask > 0 else mark * (1.0 + slip_ratio)
+    executable = max(0.0, executable)
+    raw_upl = position.get("upl", position.get("unrealized_pnl"))
+    if raw_upl is None and entry > 0 and mark > 0:
+        raw_upl = size * ct_val * ((mark - entry) if side == "long" else (entry - mark))
+    raw_upl = _jev_shadow_float(raw_upl, 0.0)
+    fee = size * ct_val * executable * max(0.0, fee_rate)
+    slippage_cost = size * ct_val * abs(executable - mark)
+    return {
+        "size": size,
+        "entry_price": entry,
+        "mark_price": mark,
+        "executable_exit_price": executable,
+        "ct_val": ct_val,
+        "unrealized_pnl_gross": raw_upl,
+        "estimated_exit_fee": fee,
+        "estimated_slippage_cost": slippage_cost,
+        "shadow_exit_net_pnl": raw_upl - fee - slippage_cost,
+    }
+
+
+def _jev_shadow_position_audit_context(position: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a complete, provenance-aware position view for Jev's full audit.
+
+    The independent review intentionally receives a blind view. This second
+    view is allowed to contain execution/account facts and the main proposal,
+    but missing fields remain explicit instead of being replaced with guesses.
+    """
+    def _first(*keys: str, default: Any = None) -> Any:
+        for key in keys:
+            value = position.get(key)
+            if value not in (None, "", "--"):
+                return value
+        return default
+
+    opened_at_ms = _first(
+        "cTime", "open_time_ms", "opened_at_ms", "entryTs", "entryTs_ms",
+        "entry_time_ms", "entryTimeMs", "entry_order_ts", default=None,
+    )
+    opened_at = _first("opened_at", "open_time", "entry_time", "entryTime", default=None)
+    if opened_at is None and opened_at_ms not in (None, "", "--"):
+        opened_ts = _jev_shadow_timestamp(opened_at_ms)
+        if opened_ts > 0:
+            opened_at = datetime.datetime.fromtimestamp(
+                opened_ts, tz=datetime.timezone(datetime.timedelta(hours=8))
+            ).isoformat()
+
+    side = _jev_shadow_side(_first("side", "posSide", default=""))
+    size = _jev_shadow_float(_first("pos", "pos_sz", default=0), 0.0)
+    avg_px = _jev_shadow_float(_first("avgPx", "entry_price", default=0), 0.0)
+    mark_px = _jev_shadow_float(_first("markPx", "mark_price", "last", default=0), 0.0)
+    stop_px = _jev_shadow_float(_first("trailingStopPx", "trailingSl", "exchangeSl", default=0), 0.0)
+    take_px = _jev_shadow_float(_first("takeProfitPx", "exchangeTp", default=0), 0.0)
+    exchange_sl = _first("exchangeSl", default=None)
+    exchange_tp = _first("exchangeTp", default=None)
+    protection_status = _first("protectionStatus", default=None)
+    liq_px = _first("liqPx", "liq_price")
+    liq_px_available = _jev_shadow_float(liq_px, 0.0) > 0
+    margin_mode = str(_first("mgnMode", "margin_mode", default="") or "").lower()
+    if liq_px_available:
+        liq_px_status = "available"
+        liq_px_reason = ""
+    elif margin_mode == "cross":
+        liq_px_status = "exchange_unavailable"
+        liq_px_reason = "cross_margin_account_level_liquidation_price_unavailable"
+    else:
+        liq_px_status = "missing"
+        liq_px_reason = "exchange_position_snapshot_missing_liquidation_price"
+    entry_order_id = _first("entry_order_id", "entryOrderId", default=None)
+    entry_identity_status = _first("entry_identity_status", default=None)
+    if not entry_identity_status:
+        entry_identity_status = "matched" if entry_order_id else "unavailable"
+
+    required = {
+        "side": side,
+        "pos": size,
+        "avgPx": avg_px,
+        "markPx": mark_px,
+        "lever": _first("lever", "leverage"),
+        "margin_usdt": _first("margin_usdt", "margin", "imr"),
+        "opened_at": opened_at,
+        "protection_status": protection_status,
+    }
+    missing_fields = [key for key, value in required.items()
+                      if value in (None, "", "--") or (key in {"pos", "avgPx", "markPx"} and value <= 0)]
+    consistency_flags = []
+    if side in {"long", "short"} and avg_px > 0:
+        if side == "long" and stop_px > 0 and stop_px >= avg_px:
+            consistency_flags.append("long_stop_not_below_entry")
+        if side == "short" and stop_px > 0 and stop_px <= avg_px:
+            consistency_flags.append("short_stop_not_above_entry")
+        if side == "long" and take_px > 0 and take_px <= avg_px:
+            consistency_flags.append("long_take_profit_not_above_entry")
+        if side == "short" and take_px > 0 and take_px >= avg_px:
+            consistency_flags.append("short_take_profit_not_below_entry")
+    if protection_status in {None, "", "unknown", "unknown_stale", "unknown_unavailable"}:
+        consistency_flags.append("protection_status_unconfirmed")
+    if protection_status == "fully_protected" and not (exchange_sl or exchange_tp):
+        consistency_flags.append("protection_status_without_exchange_orders")
+
+    return {
+        "instId": position.get("instId"),
+        "venue": position.get("venue", "okx"),
+        "environment": position.get("environment"),
+        "account_mode": position.get("account_mode"),
+        "side": side,
+        "pos": position.get("pos", position.get("pos_sz")),
+        "avgPx": position.get("avgPx"),
+        "markPx": position.get("markPx", position.get("last")),
+        "upl": position.get("upl", position.get("unrealized_pnl")),
+        "uplRatio": position.get("uplRatio"),
+        "lever": _first("lever", "leverage"),
+        "notional_usdt": _first("notional_usdt", "notionalUsd"),
+        "margin_usdt": _first("margin_usdt", "margin", "imr"),
+        "imr": position.get("imr"),
+        "mmr": position.get("mmr"),
+        "liqPx": liq_px,
+        "liqPx_status": liq_px_status,
+        "liqPx_source": "okx_position_snapshot",
+        "liqPx_reason": liq_px_reason,
+        "bePx": position.get("bePx"),
+        "mgnMode": position.get("mgnMode"),
+        "ctVal": position.get("ctVal"),
+        "ccy": position.get("ccy"),
+        "adl": position.get("adl"),
+        "cTime": position.get("cTime"),
+        "uTime": position.get("uTime"),
+        "opened_at": opened_at,
+        "entryTs": position.get("entryTs"),
+        "entryTime": position.get("entryTime"),
+        "entry_order_id": entry_order_id,
+        "entry_intent_id": position.get("entry_intent_id"),
+        "entry_order_ts": position.get("entry_order_ts"),
+        "entry_order_avg_px": position.get("entry_order_avg_px"),
+        "entry_order_fill_sz": position.get("entry_order_fill_sz"),
+        "entry_order_source": position.get("entry_order_source"),
+        "entry_identity_status": entry_identity_status,
+        "funding_fee": _first("funding_fee", "fundingFee"),
+        "realized_pnl": _first("realized_pnl", "realizedPnl"),
+        "fee": position.get("fee"),
+        "trailingStopPx": position.get("trailingStopPx", position.get("trailingSl")),
+        "takeProfitPx": position.get("takeProfitPx"),
+        "exchangeSl": exchange_sl,
+        "exchangeTp": exchange_tp,
+        "protectionStatus": protection_status,
+        "protectionAlgoId": position.get("protectionAlgoId"),
+        "protectionCoveragePct": position.get("protectionCoveragePct"),
+        "protection_orders": position.get("protection_orders", []),
+        "protection_snapshot_source": position.get("protection_snapshot_source"),
+        "protection_snapshot_error": position.get("protection_snapshot_error"),
+        "highWaterMark": position.get("highWaterMark"),
+        "lowWaterMark": position.get("lowWaterMark"),
+        "stage_desc": position.get("stage_desc", position.get("stageDesc", "")),
+        "atr": position.get("atr"),
+        "bidPx": position.get("bidPx"),
+        "askPx": position.get("askPx"),
+        "main_action": position.get("main_action", "HOLD"),
+        "main_confidence": position.get("main_confidence", 0),
+        "main_suggested_sl_price": position.get("main_suggested_sl_price", 0),
+        "main_reason": position.get("main_reason", ""),
+        "data_quality": {
+            "missing_fields": missing_fields,
+            "optional_missing_fields": (["liqPx"] if not liq_px_available else []),
+            "consistency_flags": consistency_flags,
+            "complete": not missing_fields and not consistency_flags,
+            "source": "okx_position_snapshot_plus_local_tracker",
+            "liqPx_status": liq_px_status,
+            "liqPx_source": "okx_position_snapshot",
+            "liqPx_reason": liq_px_reason,
+            "entry_identity_status": entry_identity_status,
+        },
+    }
+
+
+def _jev_shadow_update_position_outcomes(position_proposals: List[Dict[str, Any]],
+                                         position_reviews: List[Dict[str, Any]],
+                                         review: Dict[str, Any]) -> None:
+    """Persist counterfactual exit snapshots and update fixed post-review horizons."""
+    path = os.path.join(DATA_DIR, "jev_shadow_position_outcomes.jsonl")
+    now_ts = float(review.get("timestamp") or time.time())
+    fee_rate = max(0.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
+    slippage_bps = max(0.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
+    cycle_seconds = max(60.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
+    horizon_seconds = max(3600.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
+    review_by_inst = {str(item.get("instId")): item for item in position_reviews if isinstance(item, dict)}
+
+    ledger = []
+    ledger_path = os.path.join(DATA_DIR, "trading_ledger.json")
+    try:
+        if os.path.exists(ledger_path):
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            ledger = loaded if isinstance(loaded, list) else []
+    except Exception:
+        ledger = []
+
+    def close_for(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        review_ts = _jev_shadow_timestamp(record.get("review_timestamp"))
+        base = _jev_shadow_base(record.get("instId"))
+        side = _jev_shadow_side(record.get("side"))
+        venue = str(record.get("venue") or "").lower()
+        candidates = []
+        for item in ledger:
+            if not isinstance(item, dict) or str(item.get("status", "closed")) != "closed":
+                continue
+            close_ts = _jev_shadow_timestamp(item.get("close_time") or item.get("time"))
+            if close_ts <= review_ts or _jev_shadow_base(item.get("inst") or item.get("name")) != base:
+                continue
+            item_side = _jev_shadow_side(item.get("side") or item.get("direction"))
+            if item_side and side and item_side != side:
+                continue
+            item_venue = str(item.get("venue") or "").lower()
+            if venue and item_venue and venue != item_venue:
+                continue
+            candidates.append((close_ts, item))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[0])
+        exact = [item for _, item in candidates
+                 if _jev_shadow_identity_match(record, item)]
+        if exact:
+            return exact[0]
+        # An identity-bearing sample must never fall back to same-symbol
+        # matching; that would attribute a different completed trade.
+        return None if _jev_shadow_has_identity(record) else candidates[0][1]
+
+    def current_for(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        base = _jev_shadow_base(record.get("instId"))
+        side = _jev_shadow_side(record.get("side"))
+        venue = str(record.get("venue") or "").lower()
+        explicit = [proposal for proposal in position_proposals
+                    if _jev_shadow_identity_match(record, proposal)]
+        if explicit:
+            return explicit[0]
+        if _jev_shadow_has_identity(record):
+            return None
+        for proposal in position_proposals:
+            if (_jev_shadow_base(proposal.get("instId")) == base and
+                    _jev_shadow_side(proposal.get("side")) == side and
+                    (not venue or str(proposal.get("venue") or "").lower() == venue)):
+                return proposal
+        return None
+
+    try:
+        from r20_backend.file_locks import file_lock
+        retention_days = max(14, min(int(os.environ.get("R20_JEV_POSITION_RETENTION_DAYS", "60")), 180))
+        max_records = max(500, min(int(os.environ.get("R20_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
+        cutoff = int(time.time()) - retention_days * 24 * 60 * 60
+        with file_lock(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            records = []
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            item = json.loads(line)
+                            # Older shadow ledgers called the paper-fill state
+                            # FILLED_AT_REVIEW. Keep those samples alive under
+                            # the current lifecycle so their fixed horizons
+                            # continue to advance instead of becoming orphaned.
+                            if item.get("jev_delayed_entry_status") == "FILLED_AT_REVIEW":
+                                item["jev_delayed_entry_status"] = "PAPER_ESTIMATED_FILL"
+                                item["jev_status_migrated_from"] = "FILLED_AT_REVIEW"
+                            item.setdefault("schema_version", 2)
+                            if int(item.get("review_timestamp", 0) or 0) >= cutoff:
+                                records.append(item)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+
+            for item in records:
+                if item.get("status") == "closed":
+                    continue
+                close = close_for(item)
+                current = current_for(item)
+                item_ts = _jev_shadow_timestamp(item.get("review_timestamp"))
+                if close:
+                    close_ts = _jev_shadow_timestamp(close.get("close_time") or close.get("time"))
+                    close_pnl = _jev_shadow_float(close.get("net_pnl", close.get("pnl")), 0.0)
+                    item["actual_close_time"] = close.get("close_time") or close.get("time")
+                    item["actual_close_pnl"] = close_pnl
+                    item["actual_close_id"] = (close.get("trade_id") or
+                                               close.get("order_id") or
+                                               close.get("id", ""))
+                    item["max_adverse_excursion"] = min(_jev_shadow_float(item.get("max_adverse_excursion"), 0.0), close_pnl)
+                    item["max_favorable_excursion"] = max(_jev_shadow_float(item.get("max_favorable_excursion"), 0.0), close_pnl)
+                    if item.get("pnl_after_1_cycle") is None:
+                        item["pnl_after_1_cycle"] = close_pnl
+                        item["pnl_after_1_cycle_source"] = "actual_close"
+                    if close_ts - item_ts >= horizon_seconds and item.get("pnl_after_4h") is None:
+                        item["pnl_after_4h"] = close_pnl
+                        item["pnl_after_4h_source"] = "actual_close"
+                    item["status"] = "closed"
+                    continue
+                if current:
+                    current_snapshot = _jev_shadow_position_snapshot(
+                        current, fee_rate=fee_rate, slippage_bps=slippage_bps)
+                    item["observation_count"] = int(item.get("observation_count", 0) or 0) + 1
+                    item["last_observed_at"] = now_ts
+                    current_net = current_snapshot["shadow_exit_net_pnl"]
+                    item["max_adverse_excursion"] = min(_jev_shadow_float(item.get("max_adverse_excursion"), 0.0), current_net)
+                    item["max_favorable_excursion"] = max(_jev_shadow_float(item.get("max_favorable_excursion"), 0.0), current_net)
+                    if item.get("pnl_after_1_cycle") is None and (item["observation_count"] >= 1 or now_ts - item_ts >= cycle_seconds):
+                        item["pnl_after_1_cycle"] = current_net
+                        item["pnl_after_1_cycle_source"] = "mark_to_market"
+                    if item.get("pnl_after_4h") is None and now_ts - item_ts >= horizon_seconds:
+                        item["pnl_after_4h"] = current_net
+                        item["pnl_after_4h_source"] = "mark_to_market"
+                    item["last_mark_price"] = current_snapshot["mark_price"]
+                    item["last_mark_net_pnl"] = current_net
+
+            for proposal in position_proposals:
+                snapshot = _jev_shadow_position_snapshot(
+                    proposal, fee_rate=fee_rate, slippage_bps=slippage_bps)
+                position_review = review_by_inst.get(str(proposal.get("instId")), {})
+                record_ts = int(now_ts)
+                record_id = (f"{review.get('cycle_id', 'cycle-unknown')}:{proposal.get('instId')}"
+                             f":{proposal.get('venue', 'okx')}:{proposal.get('side')}")
+                records.append({
+                    "record_id": record_id,
+                    "status": "pending",
+                    "review_timestamp": record_ts,
+                    "review_time": review.get("time_str", ""),
+                    "cycle_id": proposal.get("cycle_id", review.get("cycle_id", "")),
+                    "decision_id": proposal.get("decision_id", ""),
+                    "entry_order_id": proposal.get("entry_order_id"),
+                    "entry_intent_id": proposal.get("entry_intent_id"),
+                    "entry_order_ts": proposal.get("entry_order_ts"),
+                    "entry_time": proposal.get("entry_time"),
+                    "instId": proposal.get("instId", ""),
+                    "venue": proposal.get("venue", "okx"),
+                    "side": _jev_shadow_side(proposal.get("side")),
+                    "size": snapshot["size"],
+                    "entry_price": snapshot["entry_price"],
+                    "mark_price": snapshot["mark_price"],
+                    "executable_exit_price": snapshot["executable_exit_price"],
+                    "ct_val": snapshot["ct_val"],
+                    "unrealized_pnl_gross": snapshot["unrealized_pnl_gross"],
+                    "estimated_exit_fee": snapshot["estimated_exit_fee"],
+                    "estimated_slippage_cost": snapshot["estimated_slippage_cost"],
+                    "shadow_exit_net_pnl": snapshot["shadow_exit_net_pnl"],
+                    "jev_action": position_review.get("suggested_action", "UNKNOWN"),
+                    "jev_action_votes": position_review.get("suggested_action_votes", {}),
+                    "jev_confidence": position_review.get("jev_confidence", 0),
+                    "jev_action_margin": position_review.get("jev_action_margin", 0),
+                    "jev_action_status": position_review.get("jev_action_status", "unknown"),
+                    "jev_review_status": review.get("status", "unknown"),
+                    "main_action": proposal.get("main_action", "HOLD"),
+                    "main_confidence": proposal.get("main_confidence", 0),
+                    "main_reason": proposal.get("main_reason", ""),
+                    "pnl_after_1_cycle": None,
+                    "pnl_after_4h": None,
+                    "actual_close_pnl": None,
+                    "actual_close_time": None,
+                    "max_adverse_excursion": min(0.0, snapshot["unrealized_pnl_gross"]),
+                    "max_favorable_excursion": max(0.0, snapshot["unrealized_pnl_gross"]),
+                    "observation_count": 0,
+                    "cost_assumptions": {
+                        "fee_rate": fee_rate,
+                        "slippage_bps": slippage_bps,
+                        "cycle_seconds": cycle_seconds,
+                        "horizon_4h_seconds": horizon_seconds,
+                    },
+                })
+            records = records[-max_records:]
+            fd, tmp_path = tempfile.mkstemp(prefix=".jev-position-", suffix=".tmp", dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for item in records:
+                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+    except Exception as exc:
+        print(f"[AI Brain Jev Shadow] warn 平仓反事实台账落盘失败: {exc}")
+
+
+def _jev_shadow_entry_quote(proposal: Dict[str, Any], action: str,
+                            slippage_bps: float, quote_prefix: str = "") -> float:
+    """Return an executable quote from the requested decision/response snapshot."""
+    action = str(action or "").upper()
+    prefix = str(quote_prefix or "")
+    mark = _jev_shadow_float(proposal.get(f"{prefix}price", proposal.get("price")), 0.0)
+    bid = _jev_shadow_float(proposal.get(f"{prefix}bidPx", proposal.get("bidPx")), 0.0)
+    ask = _jev_shadow_float(proposal.get(f"{prefix}askPx", proposal.get("askPx")), 0.0)
+    if action == "BUY_LONG":
+        quote = ask
+        fallback_factor = 1.0 + max(0.0, slippage_bps) / 10000.0
+    elif action == "SELL_SHORT":
+        quote = bid
+        fallback_factor = 1.0 - max(0.0, slippage_bps) / 10000.0
+    else:
+        return 0.0
+    return quote if quote > 0 else (mark * fallback_factor if mark > 0 else 0.0)
+
+
+def _jev_shadow_entry_size(proposal: Dict[str, Any], entry_price: float,
+                           ct_val: float) -> float:
+    """Mirror execution sizing constraints for a comparable Jev paper fill."""
+    explicit_size = _jev_shadow_float(
+        proposal.get("shadow_size", proposal.get("size", 0.0)), 0.0)
+    if explicit_size > 0:
+        return explicit_size
+    # The shadow budget is authoritative once present. This matters when the
+    # main decision is WAIT: the normalized cache still carries a default
+    # leverage, but it must not silently size an independent Jev trade.
+    margin = _jev_shadow_float(proposal.get("shadow_margin_usdt"), 0.0)
+    if margin <= 0:
+        margin = _jev_shadow_float(proposal.get("margin_usdt"), 0.0)
+    leverage = _jev_shadow_float(proposal.get("shadow_leverage"), 0.0)
+    if leverage <= 0:
+        leverage = _jev_shadow_float(proposal.get("leverage"), 0.0)
+    if margin <= 0 or leverage <= 0 or entry_price <= 0 or ct_val <= 0:
+        return 0.0
+    raw_size = (margin * leverage) / (entry_price * ct_val)
+    step = max(0.0000001, _jev_shadow_float(proposal.get("minSz"), 1.0))
+    size = int(raw_size / step) * step
+    if size <= 0:
+        return 0.0
+    base_size = _jev_shadow_float(proposal.get("base_sz"), 0.0)
+    # Only a real main-decision budget mirrors the execution layer's adaptive
+    # base-size clamp. Independent Jev trades use their fixed shadow budget;
+    # clamping those to half of base_sz can inflate a small paper trade by
+    # orders of magnitude (notably BTC contracts).
+    if base_size > 0 and proposal.get("shadow_margin_source") == "main_decision":
+        min_allowed = max(step, int((base_size * 0.5) / step) * step)
+        max_allowed = int((base_size * 2.0) / step) * step
+        size = max(min_allowed, min(max_allowed, size))
+    return round(size, 12)
+
+
+def _jev_shadow_entry_mark_pnl(entry_price: float, mark_price: float, side: str,
+                               size: float, ct_val: float, bid_px: float,
+                               ask_px: float, fee_rate: float,
+                               slippage_bps: float) -> Dict[str, float]:
+    """Calculate a round-trip paper PnL using executable entry and exit quotes.
+
+    The quote already contains the spread/impact paid by the hypothetical
+    order. Do not subtract the distance from ``mark_price`` a second time.
+    """
+    if entry_price <= 0 or mark_price <= 0 or size <= 0 or ct_val <= 0:
+        return {"gross": 0.0, "net": 0.0, "entry_fee": 0.0,
+                "exit_fee": 0.0, "slippage_cost": 0.0}
+    slip_ratio = max(0.0, slippage_bps) / 10000.0
+    if side == "long":
+        exit_price = bid_px if bid_px > 0 else mark_price * (1.0 - slip_ratio)
+        gross = size * ct_val * (exit_price - entry_price)
+    else:
+        exit_price = ask_px if ask_px > 0 else mark_price * (1.0 + slip_ratio)
+        gross = size * ct_val * (entry_price - exit_price)
+    entry_fee = size * ct_val * entry_price * max(0.0, fee_rate)
+    exit_fee = size * ct_val * exit_price * max(0.0, fee_rate)
+    # Entry/exit quote selection already realizes spread and fallback slippage.
+    slippage_cost = 0.0
+    return {
+        "gross": gross,
+        "net": gross - entry_fee - exit_fee - slippage_cost,
+        "entry_fee": entry_fee,
+        "exit_fee": exit_fee,
+        "slippage_cost": slippage_cost,
+    }
+
+
+def _jev_shadow_probability(value: Any) -> float:
+    if not isinstance(value, dict):
+        return -1.0
+    try:
+        parsed = float(value.get("probability"))
+    except (TypeError, ValueError):
+        return -1.0
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else -1.0
+
+
+def _jev_shadow_identity_match(record: Dict[str, Any], ledger_item: Dict[str, Any]) -> bool:
+    """Match a live outcome to a ledger row only through explicit identity."""
+    pairs = (("decision_id", "decision_id"),
+             ("entry_order_id", "entry_order_id"),
+             ("entry_order_id", "order_id"),
+             ("entry_trade_id", "entry_trade_id"),
+             ("entry_trade_id", "trade_id"))
+    for record_key, ledger_key in pairs:
+        left = str(record.get(record_key) or "").strip()
+        right = str(ledger_item.get(ledger_key) or "").strip()
+        if left and right and left == right:
+            return True
+    return False
+
+
+def _jev_shadow_has_identity(record: Dict[str, Any]) -> bool:
+    return any(str(record.get(key) or "").strip()
+               for key in ("decision_id", "entry_order_id", "entry_trade_id"))
+
+
+def _jev_shadow_entry_order_chain(record: Dict[str, Any], ledger_item: Dict[str, Any]) -> bool:
+    """Match a legacy fill to a review through a bounded local order intent."""
+    try:
+        entry_association_window = max(600.0, min(float(os.environ.get(
+            "R20_JEV_ENTRY_ASSOCIATION_WINDOW_S", "3600")), 7200.0))
+    except (TypeError, ValueError):
+        entry_association_window = 3600.0
+    review_ts = _jev_shadow_timestamp(record.get("review_timestamp"))
+    entry_ts = _jev_shadow_timestamp(
+        ledger_item.get("open_time") or ledger_item.get("open_ts") or
+        ledger_item.get("entry_time"))
+    if review_ts <= 0 or entry_ts <= review_ts:
+        return False
+    if entry_ts - review_ts > entry_association_window:
+        return False
+    base = _jev_shadow_base(record.get("instId"))
+    side = _jev_shadow_side(record.get("main_action"))
+    if (_jev_shadow_base(ledger_item.get("inst") or ledger_item.get("name")) != base or
+            _jev_shadow_side(ledger_item.get("side") or ledger_item.get("direction")) != side):
+        return False
+
+    intent_path = os.path.join(DATA_DIR, "open_order_intents.json")
+    try:
+        with open(intent_path, "r", encoding="utf-8") as handle:
+            order_intents = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        order_intents = []
+    if not isinstance(order_intents, list):
+        return False
+    for intent in order_intents:
+        if not isinstance(intent, dict):
+            continue
+        intent_ts = _jev_shadow_timestamp(intent.get("ts"))
+        if not (review_ts < intent_ts <= entry_ts):
+            continue
+        if intent_ts - review_ts > entry_association_window:
+            continue
+        if _jev_shadow_base(intent.get("instId")) != base:
+            continue
+        intent_side = _jev_shadow_side(intent.get("side"))
+        if intent_side == "buy":
+            intent_side = "long"
+        elif intent_side == "sell":
+            intent_side = "short"
+        if intent_side == side:
+            return True
+    return False
+
+
+def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
+                                      instrument_reviews: List[Dict[str, Any]],
+                                      active_positions_detail: List[Dict[str, Any]],
+                                      review: Dict[str, Any]) -> None:
+    """Persist and advance counterfactual entry outcomes.
+
+    The file intentionally stays separate from both the real ledger and the
+    Jev exit file. A Jev WAIT is a zero-PnL no-entry baseline; a directional Jev
+    answer is marked at the first executable quote available in that review.
+    Real main-trade PnL is populated only from a matched live position or a
+    closed ledger row, never from the paper calculation.
+    """
+    path = os.path.join(DATA_DIR, "jev_shadow_entry_outcomes.jsonl")
+    now_ts = float(review.get("timestamp") or time.time())
+    fee_rate = max(0.0, _jev_shadow_float(
+        os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
+    slippage_bps = max(0.0, _jev_shadow_float(
+        os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
+    cycle_seconds = max(60.0, _jev_shadow_float(
+        os.environ.get("R20_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
+    horizon_seconds = max(3600.0, _jev_shadow_float(
+        os.environ.get("R20_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
+    package_by_inst = {str(p.get("instId")): p for p in proposals if isinstance(p, dict)}
+    review_by_inst = {
+        str(item.get("instId")): item for item in instrument_reviews
+        if isinstance(item, dict)
+    }
+    active_positions = [p for p in (active_positions_detail or []) if isinstance(p, dict)]
+
+    ledger = []
+    ledger_path = os.path.join(DATA_DIR, "trading_ledger.json")
+    try:
+        if os.path.exists(ledger_path):
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            ledger = loaded if isinstance(loaded, list) else []
+    except Exception:
+        ledger = []
+
+    def matching_active(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        decision_id = str(record.get("decision_id") or "")
+        base = _jev_shadow_base(record.get("instId"))
+        side = _jev_shadow_side(record.get("main_action"))
+        exact = [p for p in active_positions
+                 if _jev_shadow_identity_match(record, p)]
+        if exact:
+            return exact[0]
+        if _jev_shadow_has_identity(record):
+            return None
+        for position in active_positions:
+            if (_jev_shadow_base(position.get("instId")) == base and
+                    _jev_shadow_side(position.get("side") or position.get("posSide")) == side):
+                return position
+        return None
+
+    def matching_close(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        review_ts = _jev_shadow_timestamp(record.get("review_timestamp"))
+        decision_id = str(record.get("decision_id") or "")
+        base = _jev_shadow_base(record.get("instId"))
+        side = _jev_shadow_side(record.get("main_action"))
+        candidates = []
+        for item in ledger:
+            if not isinstance(item, dict) or str(item.get("status", "closed")) != "closed":
+                continue
+            close_ts = _jev_shadow_timestamp(item.get("close_time") or item.get("time"))
+            if close_ts <= review_ts:
+                continue
+            if _jev_shadow_identity_match(record, item):
+                candidates.append((close_ts, item, True))
+                continue
+            if not _jev_shadow_has_identity(record) and (_jev_shadow_base(item.get("inst") or item.get("name")) == base and
+                                    _jev_shadow_side(item.get("side") or item.get("direction")) == side):
+                candidates.append((close_ts, item, False))
+                continue
+            if not _jev_shadow_has_identity(record) and _jev_shadow_entry_order_chain(record, item):
+                candidates.append((close_ts, item, False))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda row: (not row[2], row[0]))
+        return candidates[0][1]
+
+    def current_market(record: Dict[str, Any]) -> Dict[str, Any]:
+        package = package_by_inst.get(str(record.get("instId")), {})
+        active = matching_active(record) or {}
+        return {
+            "price": _jev_shadow_float(active.get("markPx"), 0.0) or
+                     _jev_shadow_float(package.get("price"), 0.0),
+            "bidPx": _jev_shadow_float(active.get("bidPx"), 0.0) or
+                     _jev_shadow_float(package.get("bidPx"), 0.0),
+            "askPx": _jev_shadow_float(active.get("askPx"), 0.0) or
+                     _jev_shadow_float(package.get("askPx"), 0.0),
+        }
+
+    try:
+        from r20_backend.file_locks import file_lock
+        retention_days = max(14, min(int(os.environ.get(
+            "R20_JEV_POSITION_RETENTION_DAYS", "60")), 180))
+        max_records = max(500, min(int(os.environ.get(
+            "R20_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
+        cutoff = int(time.time()) - retention_days * 24 * 60 * 60
+        with file_lock(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            records = []
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            item = json.loads(line)
+                            # Migrate the pre-lifecycle paper-fill label in
+                            # memory; the atomic rewrite below makes the
+                            # compatibility change durable.
+                            if item.get("jev_delayed_entry_status") == "FILLED_AT_REVIEW":
+                                item["jev_delayed_entry_status"] = "PAPER_ESTIMATED_FILL"
+                                item["jev_status_migrated_from"] = "FILLED_AT_REVIEW"
+                            item.setdefault("schema_version", 2)
+                            if int(item.get("review_timestamp", 0) or 0) >= cutoff:
+                                records.append(item)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+
+            by_id = {str(item.get("record_id")): item for item in records
+                     if item.get("record_id")}
+            for item in records:
+                # A real main trade may close before the four-hour horizon. Keep
+                # the row alive so the Jev paper trade can still reach the same
+                # fixed horizon instead of ending at the main exit time.
+                if item.get("status") == "resolved_4h":
+                    continue
+                active = matching_active(item)
+                close = matching_close(item)
+                market = current_market(item)
+                item_ts = _jev_shadow_timestamp(item.get("review_timestamp"))
+                elapsed = max(0.0, now_ts - item_ts)
+
+                if close:
+                    close_pnl = _jev_shadow_float(
+                        close.get("net_pnl", close.get("pnl")), 0.0)
+                    item["actual_close_pnl"] = close_pnl
+                    item["actual_close_time"] = close.get("close_time") or close.get("time")
+                    item["actual_close_id"] = close.get("id", "")
+                    item["main_trade_pnl"] = close_pnl
+                    item["main_trade_pnl_source"] = "trading_ledger"
+                    item["main_trade_status"] = "closed"
+                    item["actual_entry_price"] = _jev_shadow_float(
+                        close.get("open_px") or close.get("entry_px"), 0.0) or None
+                    item["actual_size"] = abs(_jev_shadow_float(
+                        close.get("sz") or close.get("size"), 0.0)) or None
+                    if _jev_shadow_identity_match(item, close):
+                        if (item.get("entry_order_id") and
+                                item.get("entry_order_id") in {
+                                    close.get("entry_order_id"), close.get("order_id")
+                                }):
+                            item["main_match_method"] = "entry_order_id"
+                        else:
+                            item["main_match_method"] = "decision_id"
+                    elif _jev_shadow_entry_order_chain(item, close):
+                        item["main_match_method"] = "bounded_order_intent_chain"
+                        item["main_match_reason"] = (
+                            "无 decision_id，按同标的同方向、复核后提交且在挂单生命周期内成交的订单意图关联")
+                    close_mark = _jev_shadow_float(close.get("close_px"), 0.0)
+                    if (close_mark > 0 and item.get("jev_delayed_entry_status") in {
+                            "PAPER_ESTIMATED_FILL", "PAPER_ESTIMATED_STALE"}):
+                        close_pnl_snapshot = _jev_shadow_entry_mark_pnl(
+                            _jev_shadow_float(item.get("jev_delayed_entry_price"), 0.0),
+                            close_mark,
+                            _jev_shadow_side(item.get("jev_action")),
+                            _jev_shadow_float(item.get("jev_delayed_size"), 0.0),
+                            _jev_shadow_float(item.get("ct_val"), 1.0),
+                            close_mark,
+                            close_mark,
+                            fee_rate,
+                            slippage_bps,
+                        )
+                        item["jev_pnl_at_main_close"] = close_pnl_snapshot["net"]
+                elif active:
+                    actual_upl = _jev_shadow_float(
+                        active.get("upl", active.get("unrealized_pnl")), 0.0)
+                    actual_entry = _jev_shadow_float(active.get("avgPx"), 0.0)
+                    actual_size = abs(_jev_shadow_float(active.get("pos"), 0.0))
+                    actual_ct_val = max(0.0000001, _jev_shadow_float(
+                        active.get("ctVal"), _jev_shadow_float(item.get("ct_val"), 1.0)))
+                    actual_side = _jev_shadow_side(
+                        active.get("side") or active.get("posSide") or item.get("main_action"))
+                    actual_snapshot = _jev_shadow_entry_mark_pnl(
+                        actual_entry, market["price"], actual_side, actual_size,
+                        actual_ct_val, market["bidPx"], market["askPx"],
+                        fee_rate, slippage_bps)
+                    item["main_trade_pnl"] = actual_snapshot["net"]
+                    item["main_trade_pnl_gross"] = actual_snapshot["gross"]
+                    item["main_trade_upl"] = actual_upl
+                    item["main_trade_pnl_source"] = "live_position_mark_net"
+                    item["main_trade_status"] = "open"
+                    item["actual_entry_price"] = actual_entry
+                    item["actual_size"] = actual_size
+                elif item.get("main_action") != "WAIT":
+                    legacy_position = next(
+                        (candidate for candidate in active_positions
+                         if _jev_shadow_base(candidate.get("instId")) ==
+                         _jev_shadow_base(item.get("instId")) and
+                         _jev_shadow_side(candidate.get("side") or candidate.get("posSide")) ==
+                         _jev_shadow_side(item.get("main_action"))),
+                        None,
+                    )
+                    if legacy_position and item.get("decision_id"):
+                        item["main_trade_status"] = "unmatched_legacy_position"
+                        item["main_match_reason"] = "同标的同方向持仓缺少 decision_id，未强行关联"
+                    else:
+                        item.setdefault("main_trade_status", "not_observed")
+
+                jev_status = item.get("jev_delayed_entry_status")
+                if jev_status in {"PAPER_ESTIMATED_FILL", "PAPER_ESTIMATED_STALE"}:
+                    side = _jev_shadow_side(item.get("jev_action"))
+                    pnl = _jev_shadow_entry_mark_pnl(
+                        _jev_shadow_float(item.get("jev_delayed_entry_price"), 0.0),
+                        market["price"], side,
+                        _jev_shadow_float(item.get("jev_delayed_size"), 0.0),
+                        _jev_shadow_float(item.get("ct_val"), 1.0),
+                        market["bidPx"], market["askPx"], fee_rate, slippage_bps)
+                    item["jev_delayed_entry_pnl"] = pnl["net"]
+                    item["jev_delayed_entry_pnl_gross"] = pnl["gross"]
+                    item["jev_no_entry_pnl"] = 0.0
+                    item["max_adverse_excursion"] = min(
+                        _jev_shadow_float(item.get("max_adverse_excursion"), 0.0), pnl["net"])
+                    item["max_favorable_excursion"] = max(
+                        _jev_shadow_float(item.get("max_favorable_excursion"), 0.0), pnl["net"])
+                    if elapsed >= cycle_seconds and item.get("pnl_after_1_cycle") is None:
+                        item["pnl_after_1_cycle"] = pnl["net"]
+                        item["pnl_after_1_cycle_source"] = "mark_to_market"
+                        item["pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
+                        item["pnl_after_1_cycle_observed_at"] = now_ts
+                        item["pnl_after_1_cycle_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + cycle_seconds))
+                    if elapsed >= horizon_seconds and item.get("pnl_after_4h") is None:
+                        item["pnl_after_4h"] = pnl["net"]
+                        item["pnl_after_4h_source"] = "mark_to_market"
+                        item["pnl_after_4h_target_at"] = item_ts + horizon_seconds
+                        item["pnl_after_4h_observed_at"] = now_ts
+                        item["pnl_after_4h_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + horizon_seconds))
+                elif jev_status == "WAIT_BASELINE":
+                    item["jev_delayed_entry_pnl"] = None
+                    item["jev_no_entry_pnl"] = 0.0
+                    if elapsed >= cycle_seconds and item.get("pnl_after_1_cycle") is None:
+                        item["pnl_after_1_cycle"] = 0.0
+                        item["pnl_after_1_cycle_source"] = "no_entry_baseline"
+                        item["pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
+                        item["pnl_after_1_cycle_observed_at"] = now_ts
+                        item["pnl_after_1_cycle_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + cycle_seconds))
+                    if elapsed >= horizon_seconds and item.get("pnl_after_4h") is None:
+                        item["pnl_after_4h"] = 0.0
+                        item["pnl_after_4h_source"] = "no_entry_baseline"
+                        item["pnl_after_4h_target_at"] = item_ts + horizon_seconds
+                        item["pnl_after_4h_observed_at"] = now_ts
+                        item["pnl_after_4h_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + horizon_seconds))
+
+                if elapsed >= cycle_seconds and item.get("main_pnl_after_1_cycle") is None:
+                    if item.get("main_trade_pnl") is not None:
+                        item["main_pnl_after_1_cycle"] = item["main_trade_pnl"]
+                        item["main_pnl_after_1_cycle_source"] = item.get(
+                            "main_trade_pnl_source", "mark_to_market")
+                        item["main_pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
+                        item["main_pnl_after_1_cycle_observed_at"] = now_ts
+                        item["main_pnl_after_1_cycle_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + cycle_seconds))
+                if elapsed >= horizon_seconds and item.get("main_pnl_after_4h") is None:
+                    if item.get("main_trade_pnl") is not None:
+                        item["main_pnl_after_4h"] = item["main_trade_pnl"]
+                        item["main_pnl_after_4h_source"] = item.get(
+                            "main_trade_pnl_source", "mark_to_market")
+                        item["main_pnl_after_4h_target_at"] = item_ts + horizon_seconds
+                        item["main_pnl_after_4h_observed_at"] = now_ts
+                        item["main_pnl_after_4h_lag_seconds"] = max(
+                            0.0, now_ts - (item_ts + horizon_seconds))
+
+                if item.get("main_trade_pnl") is not None and item.get("jev_delayed_entry_pnl") is not None:
+                    item["jev_minus_main_pnl"] = (
+                        item["jev_delayed_entry_pnl"] - item["main_trade_pnl"])
+                    item["jev_better_than_main"] = item["jev_minus_main_pnl"] > 0
+                if elapsed >= horizon_seconds:
+                    if item.get("jev_delayed_entry_status") in {
+                            "JEV_UNAVAILABLE", "AMBIGUOUS", "INVALID_DATA",
+                            "MISSING_DATA", "NOT_READY", "NO_PRICE", "NO_SIZE",
+                            "NOT_ENTRY"}:
+                        item["status"] = "unresolved_4h"
+                    else:
+                        item["status"] = "resolved_actual_close" if close else "resolved_4h"
+                    if (item.get("main_action") != "WAIT" and
+                            item.get("main_trade_pnl") is None and
+                            item.get("main_trade_status") not in {"unmatched_legacy_position"}):
+                        item["main_trade_status"] = "unmatched_after_horizon"
+                        item["main_match_reason"] = "复核后窗口内未观察到带 decision_id 的真实成交或平仓"
+                elif close:
+                    item["status"] = "main_closed_pending_4h"
+                else:
+                    item["status"] = "pending"
+
+            for proposal in proposals:
+                    inst_id = str(proposal.get("instId") or "")
+                    shadow = review_by_inst.get(inst_id) or {
+                        "suggested_action": "UNKNOWN",
+                        "suggested_action_votes": {},
+                        "jev_confidence": 0,
+                        "jev_action_margin": 0,
+                        "jev_action_status": "unavailable",
+                    }
+                    main_action = str(proposal.get("action") or "WAIT").upper()
+                    jev_action = str(shadow.get("suggested_action") or "UNKNOWN").upper()
+                    entry_mode = str(proposal.get("entry_mode") or "initial")
+                    if review.get("status") != "ok":
+                        jev_status_override = "JEV_UNAVAILABLE"
+                    elif entry_mode == "position_management":
+                        # Active positions are evaluated by the position review
+                        # lane. Do not turn a directional answer on an already
+                        # open position into a fictitious new entry sample.
+                        jev_status_override = "NOT_ENTRY"
+                    elif shadow.get("jev_action_status") == "invalid_data":
+                        jev_status_override = "INVALID_DATA"
+                    elif shadow.get("jev_action_status") == "missing_data_valid":
+                        jev_status_override = "MISSING_DATA"
+                    elif shadow.get("jev_action_status") in {
+                            "insufficient_data", "missing_action_votes"}:
+                        jev_status_override = "MISSING_DATA"
+                    elif shadow.get("jev_action_status") in {
+                            "not_ready", "missing_execution_ready"}:
+                        jev_status_override = "NOT_READY"
+                    elif jev_action == "UNKNOWN":
+                        jev_status_override = "AMBIGUOUS"
+                    else:
+                        jev_status_override = ""
+                    if review.get("status") != "ok":
+                        base_sample_type = "jev_api_error"
+                    elif jev_status_override == "NOT_ENTRY":
+                        base_sample_type = "not_entry_position_management"
+                    elif jev_status_override in {"NOT_READY", "MISSING_DATA"}:
+                        base_sample_type = "jev_not_ready"
+                    elif jev_status_override in {"INVALID_DATA", "AMBIGUOUS"}:
+                        base_sample_type = "jev_invalid_or_ambiguous"
+                    elif main_action == "WAIT" and jev_action == "WAIT":
+                        base_sample_type = "both_wait"
+                    elif main_action != "WAIT" and jev_action == "WAIT":
+                        base_sample_type = "main_trade_jev_wait"
+                    elif main_action == "WAIT" and jev_action != "WAIT":
+                        base_sample_type = "main_wait_jev_trade"
+                    elif main_action == jev_action:
+                        base_sample_type = "aligned_trade"
+                    elif {main_action, jev_action} == {"BUY_LONG", "SELL_SHORT"}:
+                        base_sample_type = "opposite_trade"
+                    else:
+                        base_sample_type = "direction_disagreement"
+                    sample_type = (f"{entry_mode}_{base_sample_type}"
+                                   if entry_mode != "initial" else base_sample_type)
+                    record_id = f"{proposal.get('decision_id') or review.get('cycle_id')}:{inst_id}"
+                    if record_id in by_id:
+                        continue
+                    ct_val = max(0.0000001, _jev_shadow_float(proposal.get("ctVal"), 1.0))
+                    main_requested = _jev_shadow_float(proposal.get("entry_price"), 0.0)
+                    main_quote = _jev_shadow_entry_quote(
+                        proposal, main_action, slippage_bps, quote_prefix="main_")
+                    jev_quote = _jev_shadow_entry_quote(
+                        proposal, jev_action, slippage_bps, quote_prefix="jev_")
+                    jev_side = _jev_shadow_side(jev_action)
+                    jev_size = _jev_shadow_entry_size(proposal, jev_quote, ct_val)
+                    if jev_status_override:
+                        jev_status = jev_status_override
+                    elif jev_action == "WAIT":
+                        jev_status = "WAIT_BASELINE"
+                    elif jev_quote <= 0:
+                        jev_status = "NO_PRICE"
+                    elif jev_size <= 0:
+                        jev_status = "NO_SIZE"
+                    elif proposal.get("jev_quote_error"):
+                        jev_status = "PAPER_ESTIMATED_STALE"
+                    else:
+                        jev_status = "PAPER_ESTIMATED_FILL"
+                    if jev_status == "NOT_ENTRY":
+                        jev_quote = 0.0
+                        jev_size = 0.0
+                    initial_jev_pnl = None
+                    if jev_status in {"PAPER_ESTIMATED_FILL", "PAPER_ESTIMATED_STALE"}:
+                        initial_jev_pnl = _jev_shadow_entry_mark_pnl(
+                            jev_quote,
+                            _jev_shadow_float(proposal.get("jev_price", proposal.get("price")), 0.0),
+                            jev_side,
+                            jev_size,
+                            ct_val,
+                            _jev_shadow_float(proposal.get("jev_bidPx", proposal.get("bidPx")), 0.0),
+                            _jev_shadow_float(proposal.get("jev_askPx", proposal.get("askPx")), 0.0),
+                            fee_rate,
+                            slippage_bps,
+                        )
+                    active = matching_active({
+                        "decision_id": proposal.get("decision_id", ""),
+                        "instId": inst_id,
+                        "main_action": main_action,
+                    })
+                    record = {
+                        "record_id": record_id,
+                        "schema_version": 2,
+                        "status": "pending",
+                        "review_timestamp": int(now_ts),
+                        "review_time": review.get("time_str", ""),
+                        "cycle_id": proposal.get("cycle_id", review.get("cycle_id", "")),
+                        "decision_id": proposal.get("decision_id", ""),
+                        "instId": inst_id,
+                        "sample_type": sample_type,
+                        "entry_mode": entry_mode,
+                        "entry_eligible": entry_mode in {"initial", "scale_in"},
+                        "evaluation_scope": (
+                            "directional_entry_fixed_horizon"
+                            if entry_mode in {"initial", "scale_in"}
+                            else "not_entry_position_management"),
+                        "full_strategy_pnl": False,
+                        "funding_fee_modeled": False,
+                        "review_status": review.get("status", "unknown"),
+                        "review_error": review.get("error", ""),
+                        "main_action": main_action,
+                        "main_confidence": proposal.get("confidence", 0),
+                        "main_entry_price": main_requested,
+                        "main_executable_entry_price": main_quote,
+                        "jev_action": jev_action,
+                        "jev_action_votes": shadow.get("suggested_action_votes", {}),
+                        "jev_confidence": shadow.get("jev_confidence", 0),
+                        "jev_delayed_entry_price": jev_quote,
+                        "jev_delayed_entry_status": jev_status,
+                        "shadow_size_source": proposal.get("shadow_margin_source", "unknown"),
+                        "shadow_leverage_source": proposal.get("shadow_leverage_source", "unknown"),
+                        "jev_delayed_size": jev_size,
+                        "jev_quote_timestamp": proposal.get("jev_quote_timestamp"),
+                        "jev_quote_source": proposal.get("jev_quote_source", "okx"),
+                        "jev_quote_error": proposal.get("jev_quote_error", ""),
+                        "jev_entry_latency_seconds": max(
+                            0.0,
+                            _jev_shadow_float(proposal.get("jev_quote_timestamp"), now_ts)
+                            - _jev_shadow_float(proposal.get("main_quote_timestamp"), now_ts),
+                        ),
+                        "jev_action_margin": shadow.get("jev_action_margin", 0),
+                        "jev_action_status": shadow.get("jev_action_status", "unknown"),
+                        "jev_no_entry_pnl": 0.0,
+                        "main_trade_pnl": None,
+                        "jev_delayed_entry_pnl": (
+                            initial_jev_pnl["net"] if initial_jev_pnl else None),
+                        "jev_delayed_entry_pnl_gross": (
+                            initial_jev_pnl["gross"] if initial_jev_pnl else None),
+                        "pnl_after_1_cycle": None,
+                        "pnl_after_4h": None,
+                        "main_pnl_after_1_cycle": None,
+                        "main_pnl_after_4h": None,
+                        "actual_close_pnl": None,
+                        "actual_close_time": None,
+                        "max_adverse_excursion": min(
+                            0.0, initial_jev_pnl["net"] if initial_jev_pnl else 0.0),
+                        "max_favorable_excursion": max(
+                            0.0, initial_jev_pnl["net"] if initial_jev_pnl else 0.0),
+                        "ct_val": ct_val,
+                        "actual_entry_price": _jev_shadow_float(active.get("avgPx"), 0.0) if active else None,
+                        "actual_size": abs(_jev_shadow_float(active.get("pos"), 0.0)) if active else None,
+                        "main_trade_status": "open" if active else (
+                            "expected_entry" if main_action != "WAIT" else "no_main_entry"),
+                        "cost_assumptions": {
+                            "fee_rate": fee_rate,
+                            "slippage_bps": slippage_bps,
+                            "cycle_seconds": cycle_seconds,
+                            "horizon_4h_seconds": horizon_seconds,
+                            "jev_entry_policy": "post_response_quote_paper_estimate",
+                        },
+                    }
+                    if active:
+                        actual_entry = _jev_shadow_float(active.get("avgPx"), 0.0)
+                        actual_size = abs(_jev_shadow_float(active.get("pos"), 0.0))
+                        actual_ct_val = max(0.0000001, _jev_shadow_float(
+                            active.get("ctVal"), ct_val))
+                        actual_side = _jev_shadow_side(
+                            active.get("side") or active.get("posSide") or main_action)
+                        actual_mark = _jev_shadow_float(
+                            active.get("markPx", active.get("last")), 0.0)
+                        actual_bid = _jev_shadow_float(active.get("bidPx"), 0.0)
+                        actual_ask = _jev_shadow_float(active.get("askPx"), 0.0)
+                        actual_snapshot = _jev_shadow_entry_mark_pnl(
+                            actual_entry, actual_mark, actual_side, actual_size,
+                            actual_ct_val, actual_bid, actual_ask,
+                            fee_rate, slippage_bps)
+                        record["main_trade_pnl"] = actual_snapshot["net"]
+                        record["main_trade_pnl_gross"] = actual_snapshot["gross"]
+                        record["main_trade_upl"] = _jev_shadow_float(
+                            active.get("upl", active.get("unrealized_pnl")), 0.0)
+                        record["main_trade_pnl_source"] = "live_position_mark_net"
+                    records.append(record)
+                    by_id[record_id] = record
+
+            records = records[-max_records:]
+            fd, tmp_path = tempfile.mkstemp(prefix=".jev-entry-", suffix=".tmp",
+                                             dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for item in records:
+                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+    except Exception as exc:
+        print(f"[AI Brain Jev Shadow] warn 开仓反事实台账落盘失败: {exc}")
+
+
+def _jev_policy_probability(value: Any, default: float = -1.0) -> float:
+    """Read a provider probability without treating missing data as zero."""
+    raw = value
+    if isinstance(value, Mapping):
+        for key in ("probability", "prob", "confidence", "value", "noul"):
+            if key in value:
+                raw = value[key]
+                break
+    try:
+        result = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result < 0:
+        return default
+    if result > 1 and result <= 100:
+        result /= 100.0
+    return min(1.0, result)
+
+
+def _jev_normalize_choice(value: Any) -> str:
+    """Normalize a choice answer from native or text-based providers."""
+    if isinstance(value, Mapping):
+        for key in ("choice", "answer", "value", "label", "text"):
+            if key in value:
+                value = value[key]
+                break
+    text = str(value or "").strip().upper().replace(" ", "_")
+    aliases = {
+        "BUY": "BUY_LONG",
+        "LONG": "BUY_LONG",
+        "SELL": "SELL_SHORT",
+        "SHORT": "SELL_SHORT",
+        "WAIT_OR_KEEP": "WAIT",
+        "KEEP": "WAIT",
+        "INSUFFICIENT": "INSUFFICIENT_DATA",
+        "NOT_ENOUGH_DATA": "INSUFFICIENT_DATA",
+        "CLOSE": "CLOSE_MARKET",
+        "UPDATE_STOP": "UPDATE_SL",
+    }
+    return aliases.get(text, text)
+
+
+def _jev_rank_votes(votes: Mapping[str, Any], *, min_confidence: float,
+               min_margin: float, data_valid: Any = None,
+               execution_ready: Any = None) -> Dict[str, Any]:
+    """Choose the largest vote and expose why it was or was not accepted."""
+    probabilities = {str(key): _jev_policy_probability(value) for key, value in votes.items()}
+    ranked = sorted((value for value in probabilities.values() if value >= 0), reverse=True)
+    if not probabilities or not ranked:
+        return {
+            "suggested_action": "INSUFFICIENT_DATA",
+            "probabilities": probabilities,
+            "confidence": 0.0,
+            "action_margin": 0.0,
+            "action_status": "missing_action_votes",
+        }
+    suggested_action = max(probabilities, key=probabilities.get)
+    confidence = probabilities[suggested_action]
+    second = ranked[1] if len(ranked) > 1 else -1.0
+    margin = confidence - second if second >= 0 else -1.0
+    data_probability = _jev_policy_probability(data_valid)
+    ready_probability = _jev_policy_probability(execution_ready)
+    if data_valid is not None and data_probability < 0:
+        status = "missing_data_valid"
+        suggested_action = "INSUFFICIENT_DATA"
+    elif data_valid is not None and data_probability < 0.5:
+        status = "invalid_data"
+        suggested_action = "INSUFFICIENT_DATA"
+    elif (suggested_action in ENTRY_ACTIONS and execution_ready is not None
+          and ready_probability < 0):
+        status = "missing_execution_ready"
+        suggested_action = "INSUFFICIENT_DATA"
+    elif (suggested_action in ENTRY_ACTIONS and execution_ready is not None
+          and ready_probability < 0.5):
+        status = "not_ready"
+        suggested_action = "WAIT"
+    elif confidence < min_confidence:
+        status = "low_confidence"
+        suggested_action = "WAIT"
+    elif margin >= 0 and margin < min_margin:
+        status = "ambiguous"
+        suggested_action = "WAIT"
+    else:
+        status = "accepted"
+    return {
+        "suggested_action": suggested_action,
+        "probabilities": probabilities,
+        "confidence": max(0.0, confidence),
+        "action_margin": max(0.0, margin),
+        "action_status": status,
+        "data_valid_probability": max(0.0, data_probability),
+        "execution_ready_probability": max(0.0, ready_probability),
+    }
+
+
+def _jev_audit_verdict(flags: Iterable[str], *, data_complete: Any = None,
+                  min_confidence: float = 0.70,
+                  has_proposal: bool = True) -> Dict[str, Any]:
+    """Turn atomic audit answers into a deterministic shadow verdict.
+
+    ``has_proposal=False`` means the main action is WAIT: there is no entry, stop,
+    target, size or leverage to verify, so a REJECT would be an artifact of asking
+    about something that does not exist. Report NOT_APPLICABLE instead and keep it
+    out of the rejection statistics.
+    """
+    if not has_proposal:
+        return {"verdict": "NOT_APPLICABLE", "flags": [],
+                "confidence_floor": min_confidence}
+    normalized = [str(flag) for flag in flags if flag]
+    complete_probability = _jev_policy_probability(data_complete)
+    if data_complete is not None and complete_probability >= 0 and complete_probability < 0.5:
+        normalized.append("proposal_data_incomplete")
+    hard_flags = {
+        "proposal_data_incomplete",
+        "stop_structure_invalid",
+        "reward_after_cost_insufficient",
+        "direction_conflict",
+    }
+    if any(flag in hard_flags for flag in normalized):
+        verdict = "REJECT"
+    elif normalized:
+        verdict = "REVIEW"
+    else:
+        verdict = "APPROVE"
+    return {
+        "verdict": verdict,
+        "flags": list(dict.fromkeys(normalized)),
+        "confidence_floor": min_confidence,
+    }
+
+
+def _jev_policy_relation(main_action: Any, independent_action: Any, *, data_status: str,
+             audit_verdict_value: str = "APPROVE") -> str:
+    """Classify the independent Jev result relative to the main action."""
+    main = _jev_normalize_choice(main_action)
+    independent = _jev_normalize_choice(independent_action)
+    if audit_verdict_value == "NOT_APPLICABLE":
+        return "NOT_APPLICABLE"
+    if audit_verdict_value == "REJECT":
+        return "AUDIT_REJECT"
+    if data_status not in {"valid", "accepted"} or independent in {"", "INSUFFICIENT_DATA"}:
+        return "ABSTAIN"
+    if main in ENTRY_ACTIONS and independent == "WAIT":
+        return "WAIT_VS_ENTRY"
+    if main == "WAIT" and independent in ENTRY_ACTIONS:
+        return "MAIN_WAIT_JEV_ENTRY"
+    if main in ENTRY_ACTIONS and independent in ENTRY_ACTIONS and main != independent:
+        return "OPPOSITE_DIRECTION"
+    if main == independent:
+        return "AGREE"
+    return "ABSTAIN"
+
+
+def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
+                       audit: Mapping[str, Any], enforcement: str = "shadow",
+                       hard_gates_passed: bool = True) -> Dict[str, Any]:
+    """Combine both Jev lanes without changing the executable main action."""
+    independent_action = _jev_normalize_choice(independent.get("suggested_action"))
+    audit_value = str(audit.get("verdict") or "REVIEW").upper()
+    if not hard_gates_passed:
+        audit_value = "REJECT"
+    data_status = str(independent.get("data_status") or independent.get("action_status") or "invalid")
+    decision_relation = _jev_policy_relation(
+        main_action,
+        independent_action,
+        data_status=data_status,
+        audit_verdict_value=audit_value,
+    )
+    return {
+        "jev_independent_action": independent_action,
+        "jev_independent_confidence": independent.get("confidence", 0.0),
+        "jev_independent_action_margin": independent.get("action_margin", 0.0),
+        "jev_independent_data_status": data_status,
+        "jev_audit_verdict": audit_value,
+        "jev_audit_flags": list(audit.get("flags") or []),
+        "jev_relation_to_main": decision_relation,
+        "jev_enforcement": str(enforcement or "shadow").upper(),
+        "main_action": _jev_normalize_choice(main_action),
+        "execution_action": _jev_normalize_choice(main_action),
+    }
+
+
+
+def _jev_shadow_provider_payload(model: str, state: Dict[str, Any],
+                                 questions: Dict[str, Any], provider: str) -> Dict[str, Any]:
+    """Build one isolated provider request; no state is shared between lanes."""
+    payload = {"model": model, "state": state, "questions": questions}
+    if provider == "vercel_gateway":
+        configured_order = os.environ.get("R20_JEV_GATEWAY_PROVIDER_ORDER", "typesafe-ai")
+        provider_order = [item.strip() for item in configured_order.split(",") if item.strip()]
+        if provider_order:
+            payload["providerOptions"] = {"gateway": {"order": provider_order}}
+    if provider == "typesafe":
+        for question in questions.values():
+            if isinstance(question, dict) and question.get("type") == "boolean":
+                question["type"] = "noul"
+    return payload
+
+
+def _jev_shadow_request(endpoint: str, api_key: str, payload: Dict[str, Any],
+                        timeout: float, channel: str) -> Dict[str, Any]:
+    """Call one Jev lane with bounded retries and provider metadata."""
+    started = time.perf_counter()
+    attempts = []
+    retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+    response = None
+    request_id = ""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": f"R20-Quantum-Trader/Jev-Shadow/{channel}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                response = json.loads(resp.read().decode("utf-8", errors="replace"))
+                request_id = str(
+                    resp.headers.get("x-request-id") or resp.headers.get("request-id") or ""
+                )
+            attempts.append({"attempt": attempt, "status": "ok"})
+            break
+        except urllib.error.HTTPError as exc:
+            status = int(getattr(exc, "code", 0) or 0)
+            attempts.append({"attempt": attempt, "status": status})
+            if status not in retryable_statuses or attempt >= max_attempts:
+                raise
+            retry_after = 0.0
+            try:
+                retry_after = float(exc.headers.get("Retry-After", 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            delay = min(2.0, max(0.25, retry_after or (0.5 * (2 ** (attempt - 1)))))
+            print(f"[AI Brain Jev Shadow] {channel} transient HTTP {status}，"
+                  f"{delay:g}s 后重试 ({attempt}/{max_attempts})")
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            attempts.append({"attempt": attempt, "status": type(exc).__name__})
+            if attempt >= max_attempts:
+                raise
+            delay = min(2.0, 0.5 * (2 ** (attempt - 1)))
+            print(f"[AI Brain Jev Shadow] {channel} transient {type(exc).__name__}，"
+                  f"{delay:g}s 后重试 ({attempt}/{max_attempts})")
+            time.sleep(delay)
+    if response is None:
+        raise RuntimeError(f"Jev {channel} request returned no response")
+    return {
+        "status": "ok",
+        "response": response,
+        "attempts": attempts,
+        "request_id": str(
+            (response.get("request_id") if isinstance(response, dict) else "")
+            or request_id
+        ),
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+    }
+
+
+def _jev_shadow_normalize_answers(response: Any, provider: str) -> Dict[str, Any]:
+    answers = response.get("answers") if isinstance(response, dict) else {}
+    if not isinstance(answers, dict):
+        return {}
+    if provider != "typesafe":
+        return answers
+    normalized = {}
+    for name, answer in answers.items():
+        if isinstance(answer, dict) and answer.get("type") == "noul":
+            item = dict(answer)
+            item["probability"] = answer.get("noul")
+            normalized[name] = item
+        else:
+            normalized[name] = answer
+    return normalized
+
+
+def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[str, Any]],
+                           time_str: str, active_positions_detail: Optional[List[Dict[str, Any]]] = None,
+                           position_management: Optional[List[Dict[str, Any]]] = None,
+                           usdt_available: Optional[float] = None,
+                           pending_orders_detail: Optional[List[Dict[str, Any]]] = None,
+                           trader_factors: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Run Jev as an observe-only review; never alter the trading decision."""
+    enabled = str(os.environ.get("R20_JEV_SHADOW_ENABLED", "1")).strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return
+    independent_enabled = str(os.environ.get("R20_JEV_INDEPENDENT_ENABLED", "1")).strip().lower()
+    if independent_enabled in {"0", "false", "no", "off"}:
+        print("[AI Brain Jev Shadow] 独立双通道已关闭，跳过本轮影子复核")
+        return
+    configured_provider = str(os.environ.get("R20_JEV_PROVIDER", "")).strip().lower()
+    configured_endpoint = str(os.environ.get("R20_JEV_SHADOW_URL", "")).strip()
+    direct_typesafe = configured_provider in {"typesafe", "typesafe-ai", "direct"}
+    direct_typesafe = direct_typesafe or bool(
+        os.environ.get("R20_JEV_TYPESAFE_API_KEY") or os.environ.get("TYPESAFE_API_KEY"))
+    if configured_endpoint:
+        direct_typesafe = direct_typesafe or "api.typesafe.ai" in configured_endpoint.lower()
+    if direct_typesafe:
+        provider = "typesafe"
+        api_key = (os.environ.get("R20_JEV_TYPESAFE_API_KEY") or
+                   os.environ.get("TYPESAFE_API_KEY") or
+                   os.environ.get("R20_JEV_API_KEY") or "").strip()
+        endpoint = configured_endpoint or "https://api.typesafe.ai/v1/systemone"
+        model = (os.environ.get("R20_JEV_MODEL") or "jev-latest").strip()
+    else:
+        provider = "vercel_gateway"
+        api_key = (os.environ.get("R20_JEV_API_KEY") or
+                   os.environ.get("AI_GATEWAY_API_KEY") or "").strip()
+        endpoint = configured_endpoint or "https://ai-gateway.vercel.sh/v1/evaluate"
+        model = (os.environ.get("R20_JEV_MODEL") or "typesafe-ai/jev").strip()
+    if not api_key:
+        return
+    try:
+        timeout = max(1.0, min(float(os.environ.get("R20_JEV_SHADOW_TIMEOUT", "6")), 15.0))
+    except (TypeError, ValueError):
+        timeout = 6.0
+
+    proposals = []
+    active_positions = [dict(item) for item in (active_positions_detail or [])
+                        if isinstance(item, dict)]
+    active_by_inst: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _enrich_exchange_protection(position: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach a best-effort live OKX algo-order snapshot for Jev only."""
+        if str(position.get("venue", "okx")).lower() != "okx":
+            return position
+        inst_id = str(position.get("instId") or "")
+        if not inst_id:
+            return position
+        enriched = dict(position)
+        try:
+            algo_rows = okx_rest.pending_algo_orders(inst_id=inst_id, timeout=2.5) or []
+            side = _jev_shadow_side(position.get("side") or position.get("posSide"))
+            live_rows = [row for row in algo_rows
+                         if str(row.get("state", "live")).lower() in {"live", "effective"}
+                         and str(row.get("posSide", "net")).lower() in {side, "net"}
+                         and str(row.get("reduceOnly", "true")).lower() in {"true", "1", "yes"}]
+            pos_size = abs(_jev_shadow_float(position.get("pos"), 0.0))
+            sl_rows = [row for row in live_rows if _jev_shadow_float(row.get("slTriggerPx"), 0.0) > 0]
+            protected_size = sum(abs(_jev_shadow_float(row.get("sz"), 0.0)) for row in sl_rows)
+            full_row = next((row for row in live_rows
+                             if _jev_shadow_float(row.get("slTriggerPx"), 0.0) > 0
+                             and _jev_shadow_float(row.get("tpTriggerPx"), 0.0) > 0), None)
+            sl_row = next(iter(sl_rows), None)
+            if full_row and protected_size >= pos_size * 0.999:
+                enriched.update({
+                    "exchangeSl": _jev_shadow_float(full_row.get("slTriggerPx"), 0.0),
+                    "exchangeTp": _jev_shadow_float(full_row.get("tpTriggerPx"), 0.0),
+                    "protectionStatus": "fully_protected",
+                    "protectionCoveragePct": 100.0,
+                    "protectionAlgoId": full_row.get("algoId", ""),
+                })
+            elif live_rows:
+                enriched.update({
+                    "exchangeSl": (_jev_shadow_float(sl_row.get("slTriggerPx"), 0.0)
+                                   if sl_row else None),
+                    "exchangeTp": (_jev_shadow_float(sl_row.get("tpTriggerPx"), 0.0)
+                                   if sl_row and _jev_shadow_float(sl_row.get("tpTriggerPx"), 0.0) > 0 else None),
+                    "protectionStatus": "partially_protected",
+                    "protectionCoveragePct": round(min(100.0, protected_size / max(pos_size, 1e-12) * 100), 1),
+                    "protectionAlgoId": (sl_row or {}).get("algoId", ""),
+                })
+            else:
+                enriched.update({
+                    "exchangeSl": None,
+                    "exchangeTp": None,
+                    "protectionStatus": "unprotected",
+                    "protectionCoveragePct": 0.0,
+                    "protectionAlgoId": "",
+                })
+            enriched["protection_orders"] = [
+                {key: row.get(key) for key in (
+                    "algoId", "ordType", "state", "posSide", "sz",
+                    "slTriggerPx", "tpTriggerPx", "reduceOnly", "cTime", "uTime"
+                ) if key in row}
+                for row in live_rows
+            ]
+            enriched["protection_snapshot_source"] = "okx_pending_algo_orders"
+        except Exception as protection_exc:
+            enriched["protectionStatus"] = "unknown_unavailable"
+            enriched["protection_snapshot_error"] = f"{type(protection_exc).__name__}: {str(protection_exc)[:200]}"
+            enriched["protection_snapshot_source"] = "okx_pending_algo_orders_error"
+        return enriched
+
+    if active_positions:
+        with ThreadPoolExecutor(max_workers=min(8, len(active_positions))) as protection_executor:
+            active_positions = list(protection_executor.map(
+                _enrich_exchange_protection, active_positions))
+
+    for active_position in active_positions:
+        if not isinstance(active_position, dict) or not active_position.get("instId"):
+            continue
+        active_by_inst.setdefault(str(active_position["instId"]), []).append(active_position)
+    trader_factor_by_inst = {
+        str(item.get("instId")): item
+        for item in (trader_factors or [])
+        if isinstance(item, dict) and item.get("instId")
+    }
+    for p in packages or []:
+        inst_id = str(p.get("instId") or "")
+        row = standard_cache.get(inst_id) if isinstance(standard_cache, dict) else None
+        if not isinstance(row, dict):
+            continue
+        decision = row.get("decision") if isinstance(row.get("decision"), dict) else {}
+        direction = row.get("direction_input") if isinstance(row.get("direction_input"), dict) else {}
+        main_action = str(decision.get("action", "WAIT") or "WAIT").upper()
+        decision_margin = _jev_shadow_float(decision.get("margin_usdt"), 0.0)
+        decision_leverage = _jev_shadow_float(decision.get("leverage"), 0.0)
+        risk_budget = _jev_shadow_float(p.get("risk_per_trade_usd"), 0.0)
+        configured_margin = str(os.environ.get("R20_JEV_SHADOW_MARGIN_USDT", "")).strip()
+        configured_leverage = str(os.environ.get("R20_JEV_SHADOW_LEVERAGE", "")).strip()
+        if main_action != "WAIT" and decision_margin > 0:
+            shadow_margin = decision_margin
+            shadow_margin_source = "main_decision"
+        elif configured_margin and _jev_shadow_float(configured_margin, 0.0) > 0:
+            shadow_margin = _jev_shadow_float(configured_margin, 0.0)
+            shadow_margin_source = "configured_shadow_margin"
+        elif risk_budget > 0:
+            shadow_margin = risk_budget
+            shadow_margin_source = "risk_per_trade_usd"
+        else:
+            shadow_margin = max(0.01, _jev_shadow_float(
+                os.environ.get("R20_JEV_SHADOW_DEFAULT_MARGIN_USDT", "15"), 15.0))
+            shadow_margin_source = "default_shadow_margin"
+        if main_action != "WAIT" and decision_leverage > 0:
+            shadow_leverage = decision_leverage
+            shadow_leverage_source = "main_decision"
+        elif configured_leverage and _jev_shadow_float(configured_leverage, 0.0) > 0:
+            shadow_leverage = _jev_shadow_float(configured_leverage, 1.0)
+            shadow_leverage_source = "configured_shadow_leverage"
+        else:
+            shadow_leverage = 1.0
+            shadow_leverage_source = "default_shadow_leverage"
+        active_for_inst = active_by_inst.get(inst_id, [])
+        trader_factor = trader_factor_by_inst.get(inst_id) or {}
+        direction_observation = trader_factor.get("direction_observation")
+        if direction_observation is None:
+            direction_observation = compare_directions(trader_factor, row)
+        direction_layer_snapshot = (
+            trader_factor.get("direction_layers") or
+            direction_layers(trader_factor.get("calculus"))
+        )
+        matching_side = any(
+            _jev_shadow_side(position.get("side") or position.get("posSide")) ==
+            _jev_shadow_side(main_action)
+            for position in active_for_inst
+        )
+        if main_action in {"BUY_LONG", "SELL_SHORT"} and matching_side:
+            entry_mode = "scale_in"
+        elif active_for_inst:
+            entry_mode = "position_management"
+        else:
+            entry_mode = "initial"
+        proposals.append({
+            "instId": inst_id,
+            "cycle_id": row.get("cycle_id", ""),
+            "decision_id": row.get("decision_id", f"{time_str}:{inst_id}"),
+            "decision_timestamp": row.get("timestamp", 0),
+            "action": main_action,
+            "confidence": decision.get("confidence", 0),
+            "leverage": decision.get("leverage", 0),
+            "margin_usdt": decision.get("margin_usdt", 0),
+            "shadow_margin_usdt": shadow_margin,
+            "shadow_margin_source": shadow_margin_source,
+            "shadow_leverage": shadow_leverage,
+            "shadow_leverage_source": shadow_leverage_source,
+            "entry_mode": entry_mode,
+            "entry_price": decision.get("entry_price", 0),
+            "take_profit_price": decision.get("take_profit_price", 0),
+            "stop_loss_price": decision.get("stop_loss_price", 0),
+            "risk_reward_ratio": decision.get("risk_reward_ratio", "--"),
+            "data_quality": row.get("data_quality"),
+            "macro_4h": direction.get("macro_4h"),
+            "calculus_regime": direction.get("calculus_regime"),
+            "trend_4h_bullish": p.get("trend_4h_bullish"),
+            "trend_4h_bearish": p.get("trend_4h_bearish"),
+            "direction_observation": direction_observation,
+            "direction_layers": direction_layer_snapshot,
+            "price": p.get("price", 0),
+            "bidPx": p.get("bidPx", 0),
+            "askPx": p.get("askPx", 0),
+            "ctVal": p.get("ctVal", 1.0),
+            "minSz": p.get("minSz", 1.0),
+            "base_sz": p.get("base_sz", 0.0),
+            "max_leverage": p.get("max_leverage", 0.0),
+            "risk_per_trade_usd": p.get("risk_per_trade_usd", 0.0),
+            # Keep the decision-time quote immutable. Jev's delayed-entry
+            # paper fill is refreshed after the API response below.
+            "main_price": p.get("price", 0),
+            "main_bidPx": p.get("bidPx", 0),
+            "main_askPx": p.get("askPx", 0),
+            "main_quote_timestamp": time.time(),
+            "price_position_in_range": direction.get("price_position_in_range"),
+            "candle_ts_4h": direction.get("candle_ts_4h"),
+        })
+
+    management_by_inst = {
+        str(item.get("instId")): item
+        for item in (position_management or [])
+        if isinstance(item, dict) and item.get("instId")
+    }
+    position_proposals = []
+    for position in active_positions:
+        if not isinstance(position, dict) or not position.get("instId"):
+            continue
+        inst_id = str(position.get("instId"))
+        row = standard_cache.get(inst_id) if isinstance(standard_cache, dict) else None
+        management = management_by_inst.get(inst_id) or {
+            "action": "HOLD", "confidence": 0, "suggested_sl_price": 0.0,
+            "reason": "主脑未提供该持仓指令，按 HOLD 处理",
+        }
+        position_proposals.append({
+            "instId": inst_id,
+            "decision_id": position.get("decision_id") or (row or {}).get("decision_id", f"{time_str}:{inst_id}"),
+            "cycle_id": position.get("cycle_id") or (row or {}).get("cycle_id", ""),
+            "entry_order_id": position.get("entry_order_id"),
+            "entry_intent_id": position.get("entry_intent_id"),
+            "entry_order_ts": position.get("entry_order_ts"),
+            "entry_order_avg_px": position.get("entry_order_avg_px"),
+            "entry_order_fill_sz": position.get("entry_order_fill_sz"),
+            "entry_order_source": position.get("entry_order_source"),
+            "entry_identity_status": position.get("entry_identity_status"),
+            "entry_time": position.get("entry_time", position.get("open_time")),
+            "entryTime": position.get("entryTime"),
+            "entryTs": position.get("entryTs"),
+            "entry_venue": position.get("entry_venue", position.get("venue", "okx")),
+            "venue": position.get("venue", "okx"),
+            "side": position.get("side", position.get("posSide", "")),
+            "pos": position.get("pos", 0),
+            "avgPx": position.get("avgPx", 0),
+            "markPx": position.get("markPx", position.get("last", 0)),
+            "upl": position.get("upl", position.get("unrealized_pnl", 0)),
+            "trailingStopPx": position.get("trailingStopPx"),
+            "takeProfitPx": position.get("takeProfitPx"),
+            "stage_desc": position.get("stage_desc", ""),
+            "atr": position.get("atr", 0),
+            "ctVal": position.get("ctVal", 1.0),
+            "bidPx": position.get("bidPx"),
+            "askPx": position.get("askPx"),
+            "lever": position.get("lever", position.get("leverage")),
+            "leverage": position.get("leverage", position.get("lever")),
+            "notional_usdt": position.get("notional_usdt", position.get("notionalUsd")),
+            "margin_usdt": position.get("margin_usdt", position.get("margin", position.get("imr"))),
+            "imr": position.get("imr"),
+            "mmr": position.get("mmr"),
+            "liqPx": position.get("liqPx", position.get("liq_price")),
+            "bePx": position.get("bePx"),
+            "mgnMode": position.get("mgnMode"),
+            "ccy": position.get("ccy"),
+            "adl": position.get("adl"),
+            "cTime": position.get("cTime"),
+            "uTime": position.get("uTime"),
+            "open_time": position.get("open_time"),
+            "funding_fee": position.get("funding_fee", position.get("fundingFee")),
+            "realized_pnl": position.get("realized_pnl", position.get("realizedPnl")),
+            "fee": position.get("fee"),
+            "exchangeSl": position.get("exchangeSl"),
+            "exchangeTp": position.get("exchangeTp"),
+            "protectionStatus": position.get("protectionStatus"),
+            "protectionAlgoId": position.get("protectionAlgoId"),
+            "protectionCoveragePct": position.get("protectionCoveragePct"),
+            "protection_orders": position.get("protection_orders", []),
+            "protection_snapshot_source": position.get("protection_snapshot_source"),
+            "protection_snapshot_error": position.get("protection_snapshot_error"),
+            "highWaterMark": position.get("highWaterMark"),
+            "lowWaterMark": position.get("lowWaterMark"),
+            "tp1Hit": position.get("tp1Hit"),
+            "tp2Hit": position.get("tp2Hit"),
+            "environment": position.get("environment"),
+            "account_mode": position.get("account_mode"),
+            "main_action": management.get("action", "HOLD"),
+            "main_confidence": management.get("confidence", 0),
+            "main_suggested_sl_price": management.get("suggested_sl_price", 0),
+            "main_reason": management.get("reason", ""),
+        })
+
+    macro_assessment = next(
+        (str(v.get("macro_assessment")) for v in standard_cache.values()
+         if isinstance(v, dict) and v.get("macro_assessment")), "")
+    neutral_candidates = [{
+        key: proposal.get(key)
+        for key in (
+            "instId", "cycle_id", "decision_id", "decision_timestamp", "data_quality",
+            "macro_4h", "calculus_regime", "trend_4h_bullish", "trend_4h_bearish",
+            "direction_observation", "direction_layers", "price", "bidPx", "askPx",
+            "price_position_in_range", "candle_ts_4h",
+        )
+    } for proposal in proposals]
+    neutral_positions = []
+    audit_positions = []
+    for position in position_proposals:
+        context = _jev_shadow_position_audit_context(position)
+        audit_positions.append(context)
+        neutral_positions.append({key: value for key, value in context.items()
+                                  if key not in {
+                                      "main_action", "main_confidence",
+                                      "main_suggested_sl_price", "main_reason",
+                                  }})
+
+    # The independent lane is deliberately assembled from a whitelist. A future
+    # field added to proposals cannot accidentally leak the main conclusion.
+    neutral_state = {
+        "cycle_time": time_str,
+        "market": {"candidates": neutral_candidates},
+        "positions": neutral_positions,
+        "execution": {
+            "fee_rate": _jev_shadow_float(
+                os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005),
+            "slippage_bps": _jev_shadow_float(
+                os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0),
+            "liquidity_state": "UNKNOWN",
+        },
+        "risk_context": {
+            "available_usdt": usdt_available,
+            "pending_order_count": len(pending_orders_detail or []),
+            "source": "cycle_snapshot_without_main_proposal",
+        },
+    }
+    audit_state = {
+        "cycle_time": time_str,
+        "neutral_market_state": neutral_state["market"],
+        "neutral_position_state": neutral_positions,
+        "account": {
+            "available_usdt": usdt_available,
+            "snapshot_source": "cycle_account_snapshot",
+        },
+        "pending_orders": pending_orders_detail if isinstance(pending_orders_detail, list) else [],
+        "main_proposals": proposals,
+        "main_position_proposals": audit_positions,
+    }
+
+    independent_questions: Dict[str, Any] = {
+        "cycle_data_valid": {
+            "type": "boolean",
+            "instructions": (
+                "Is the supplied point-in-time market and position data sufficiently "
+                "complete and internally consistent?"
+            ),
+        },
+    }
+    audit_questions: Dict[str, Any] = {
+        "audit_data_valid": {
+            "type": "boolean",
+            "instructions": (
+                "Is the audit state complete enough to review the main proposals "
+                "without guessing missing facts?"
+            ),
+        },
+    }
+    for index, proposal in enumerate(proposals):
+        inst_id = proposal["instId"]
+        prefix = f"candidate_{index}"
+        # The audit lane only ever reviews a REAL entry proposal. Auditing a WAIT
+        # "proposal" (which by construction has no entry/stop/target/size/leverage)
+        # drove `proposal_complete` to a ~0.07 median and manufactured a constant,
+        # content-free AUDIT_REJECT on 98% of cycles. Nothing to audit => ask nothing.
+        has_proposal = str(proposal.get("action") or "WAIT").upper() in ENTRY_ACTIONS
+        independent_questions.update({
+            # NOTE(2026-09-26): no `*_action` choice question. The typesafe endpoint
+            # rejects `type: "choice"` with HTTP 422 (it expects a nested
+            # `choice.criteria` object that is not documented anywhere usable), which
+            # killed this whole lane 62/62 cycles. The three `*_would_*` compatibility
+            # votes below already carry the same information AND let `_jev_rank_votes`
+            # derive `suggested_action` together with an action margin — something a
+            # single choice answer cannot express. Keeping the question set
+            # boolean-only also makes both lanes structurally identical, so a payload
+            # shape accepted by one is accepted by the other.
+            f"{prefix}_data_valid": {
+                "type": "boolean",
+                "instructions": (
+                    f"Is the neutral market data for {inst_id} sufficient for an "
+                    "independent direction judgment?"
+                ),
+            },
+            f"{prefix}_execution_ready": {
+                "type": "boolean",
+                "instructions": (
+                    f"Based only on the neutral state for {inst_id}, is a directional "
+                    "action executable after normal cost and liquidity friction?"
+                ),
+            },
+            f"{prefix}_would_buy_long": {
+                "type": "boolean",
+                "instructions": (
+                    f"As a compatibility vote, would you choose BUY_LONG for {inst_id} "
+                    "using only the neutral state?"
+                ),
+            },
+            f"{prefix}_would_sell_short": {
+                "type": "boolean",
+                "instructions": (
+                    f"As a compatibility vote, would you choose SELL_SHORT for {inst_id} "
+                    "using only the neutral state?"
+                ),
+            },
+            f"{prefix}_would_wait": {
+                "type": "boolean",
+                "instructions": (
+                    f"As a compatibility vote, would you choose WAIT for {inst_id} "
+                    "using only the neutral state?"
+                ),
+            },
+        })
+        if has_proposal:
+            audit_questions.update({
+                f"{prefix}_thesis_supported": {
+                    "type": "boolean",
+                    "instructions": (
+                        f"Using main_proposals for {inst_id}, is the main proposal supported "
+                        "by the neutral market evidence?"
+                    ),
+                },
+                f"{prefix}_direction_conflict": {
+                    "type": "boolean",
+                    "instructions": (
+                        f"Does the main proposal direction conflict with material "
+                        f"multi-timeframe evidence for {inst_id}?"
+                    ),
+                },
+                f"{prefix}_entry_is_chasing": {
+                    "type": "boolean",
+                    "instructions": f"Does the main proposal for {inst_id} chase the current price or momentum?",
+                },
+                f"{prefix}_stop_structurally_valid": {
+                    "type": "boolean",
+                    "instructions": f"Is the main proposal stop for {inst_id} on a structurally valid invalidation side of the entry?",
+                },
+                f"{prefix}_reward_after_cost_sufficient": {
+                    "type": "boolean",
+                    "instructions": f"After estimated fees and slippage, does the main proposal for {inst_id} retain sufficient reward relative to risk?",
+                },
+                f"{prefix}_omits_counter_evidence": {
+                    "type": "boolean",
+                    "instructions": f"Does the main proposal for {inst_id} omit material counter-evidence visible in the neutral state?",
+                },
+                f"{prefix}_proposal_complete": {
+                    "type": "boolean",
+                    "instructions": f"Is the main proposal for {inst_id} complete for code-side audit, including entry, stop, target, size, leverage, and margin?",
+                },
+            })
+    for index, proposal in enumerate(position_proposals):
+        inst_id = proposal["instId"]
+        prefix = f"position_{index}"
+        independent_questions.update({
+            # Same as the candidate lane above: no `*_action` choice question.
+            # The `*_would_hold/_would_close/_would_update_sl` votes drive
+            # `suggested_action` through `_jev_rank_votes`.
+            f"{prefix}_data_valid": {
+                "type": "boolean",
+                "instructions": f"Is the neutral position and market state for {inst_id} sufficiently complete for independent management?",
+            },
+            f"{prefix}_would_hold": {
+                "type": "boolean",
+                "instructions": f"As a compatibility vote, would you independently HOLD {inst_id}?",
+            },
+            f"{prefix}_would_close": {
+                "type": "boolean",
+                "instructions": f"As a compatibility vote, would you independently CLOSE_MARKET {inst_id}?",
+            },
+            f"{prefix}_would_update_sl": {
+                "type": "boolean",
+                "instructions": f"As a compatibility vote, would you independently UPDATE_SL for {inst_id}?",
+            },
+        })
+        audit_questions.update({
+            f"{prefix}_protection_ready": {
+                "type": "boolean",
+                "instructions": f"Are the exchange protection orders and local protection state for {inst_id} complete and ready?",
+            },
+            f"{prefix}_close_needed": {
+                "type": "boolean",
+                "instructions": f"Does the full audit state indicate that {inst_id} should be closed now?",
+            },
+        })
+
+    independent_payload = _jev_shadow_provider_payload(
+        model, neutral_state, independent_questions, provider)
+    audit_payload = _jev_shadow_provider_payload(
+        model, audit_state, audit_questions, provider)
+    started = time.perf_counter()
+    review_started_timestamp = time.time()
+    cycle_id = (proposals[0].get("cycle_id") if proposals
+                else f"cycle-{int(time.time() * 1000)}")
+
+    def _state_hash(value: Dict[str, Any]) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    review: Dict[str, Any] = {
+        "schema_version": 3,
+        "timestamp": int(review_started_timestamp),
+        "review_started_timestamp": review_started_timestamp,
+        "time_str": time_str,
+        "model": model,
+        "provider": provider,
+        "endpoint": endpoint,
+        "candidate_count": len(proposals),
+        "position_count": len(position_proposals),
+        "cycle_id": cycle_id,
+        "candidate_snapshot": proposals,
+        "position_snapshot": position_proposals,
+        "neutral_state_hash": _state_hash(neutral_state),
+        "audit_state_hash": _state_hash(audit_state),
+        "independent_state": neutral_state,
+        "audit_state": audit_state,
+        # Phase A is hard-coded shadow-only. Keep the requested value visible,
+        # but never let an environment typo turn this observer into a gate.
+        "configured_enforcement": (
+            os.environ.get("R20_JEV_ENFORCEMENT", "shadow").strip().lower() or "shadow"
+        ),
+        "enforcement_mode": "shadow",
+    }
+
+    def _request_lane(channel: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            result = _jev_shadow_request(endpoint, api_key, payload, timeout, channel)
+            result["channel"] = channel
+            return result
+        except Exception as exc:
+            return {
+                "channel": channel,
+                "status": "error",
+                "attempts": [],
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
+
+    with ThreadPoolExecutor(max_workers=2) as request_executor:
+        independent_future = request_executor.submit(
+            _request_lane, "independent", independent_payload)
+        audit_future = request_executor.submit(_request_lane, "audit", audit_payload)
+        independent_result = independent_future.result()
+        audit_result = audit_future.result()
+    independent_answers = _jev_shadow_normalize_answers(
+        independent_result.get("response"), provider)
+    audit_answers = _jev_shadow_normalize_answers(
+        audit_result.get("response"), provider)
+    independent_ok = independent_result.get("status") == "ok"
+    audit_ok = audit_result.get("status") == "ok"
+
+    def _threshold(name: str, fallback: float) -> float:
+        try:
+            return max(0.0, min(float(os.environ.get(name, str(fallback))), 1.0))
+        except (TypeError, ValueError):
+            return fallback
+
+    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.70)
+    min_margin = _threshold("R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
+    position_min_confidence = _threshold(
+        "R20_JEV_POSITION_MIN_CONFIDENCE", min_confidence)
+    position_min_margin = _threshold(
+        "R20_JEV_POSITION_MIN_ACTION_MARGIN", min_margin)
+    audit_min_confidence = _threshold("R20_JEV_AUDIT_MIN_CONFIDENCE", 0.70)
+
+    def _candidate_review(index: int, proposal: Dict[str, Any]) -> Dict[str, Any]:
+        prefix = f"candidate_{index}"
+        data_valid = independent_answers.get(f"{prefix}_data_valid")
+        execution_ready = independent_answers.get(f"{prefix}_execution_ready")
+        vote_result = _jev_rank_votes({
+            "BUY_LONG": independent_answers.get(f"{prefix}_would_buy_long"),
+            "SELL_SHORT": independent_answers.get(f"{prefix}_would_sell_short"),
+            "WAIT": independent_answers.get(f"{prefix}_would_wait"),
+        }, min_confidence=min_confidence, min_margin=min_margin,
+            data_valid=data_valid, execution_ready=execution_ready)
+        choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
+        if choice not in {"BUY_LONG", "SELL_SHORT", "WAIT", "INSUFFICIENT_DATA"}:
+            choice = vote_result["suggested_action"]
+        data_probability = _jev_policy_probability(data_valid)
+        if data_probability < 0:
+            action, action_status, data_status = "INSUFFICIENT_DATA", "missing_data_valid", "invalid"
+        elif data_probability < 0.5:
+            action, action_status, data_status = "INSUFFICIENT_DATA", "invalid_data", "invalid"
+        else:
+            action, action_status, data_status = choice, vote_result["action_status"], "valid"
+            if action_status in {"not_ready", "low_confidence", "ambiguous", "missing_action_votes"}:
+                action = "WAIT" if action_status != "missing_action_votes" else "INSUFFICIENT_DATA"
+
+        # Mirror the question-side gate: a WAIT proposal has no audit answers, so
+        # every flag would be "missing" and the verdict would be a meaningless
+        # REJECT. Short-circuit to NOT_APPLICABLE instead of running the flag logic.
+        if str(proposal.get("action") or "WAIT").upper() not in ENTRY_ACTIONS:
+            audit = _jev_audit_verdict([], has_proposal=False,
+                                       min_confidence=audit_min_confidence)
+            # Still referenced by the record below; None is the honest value when
+            # no `proposal_complete` answer was ever requested.
+            audit_complete = None
+            # `None` (not a dict of zeros) is the point: a WAIT proposal was never
+            # audited, so it must be impossible to average its "scores" into the
+            # pool. See the runbook note on `audit_probabilities` in the record.
+            audit_probabilities = None
+        else:
+            flag_map = (
+                ("direction_conflict", "direction_conflict"),
+                ("entry_is_chasing", "entry_is_chasing"),
+                ("stop_structurally_valid", "stop_structure_invalid"),
+                ("reward_after_cost_sufficient", "reward_after_cost_insufficient"),
+                ("omits_counter_evidence", "omits_counter_evidence"),
+            )
+            # Record every raw audit probability per candidate. Without this the only
+            # way to analyse the audit lane is to re-join `instrument_reviews[i]` with
+            # `response.audit.answers[candidate_i_*]` by index — and that join silently
+            # mixes WAIT candidates (which used to be audited against entry=0/sl=0)
+            # into the pool, which reads as "JEV thinks the stop is invalid 95% of the
+            # time" when it really means "there was no stop to look at". `-1.0` is the
+            # existing "answer missing" sentinel from `_jev_policy_probability`.
+            audit_probabilities = {
+                field: _jev_policy_probability(audit_answers.get(f"{prefix}_{field}"))
+                for field, _flag in flag_map
+            }
+            audit_complete = audit_answers.get(f"{prefix}_proposal_complete")
+            audit_probabilities["thesis_supported"] = _jev_policy_probability(
+                audit_answers.get(f"{prefix}_thesis_supported"))
+            audit_probabilities["proposal_complete"] = _jev_policy_probability(
+                audit_complete)
+
+            flags = []
+            for field, flag in flag_map:
+                value = audit_probabilities[field]
+                if field in {"stop_structurally_valid", "reward_after_cost_sufficient"}:
+                    if value >= 0 and value < 0.5:
+                        flags.append(flag)
+                elif value >= 0.5:
+                    flags.append(flag)
+            if not audit_ok or _jev_policy_probability(
+                    audit_answers.get("audit_data_valid")) < 0.5:
+                flags.append("audit_unavailable")
+            audit = _jev_audit_verdict(flags, data_complete=audit_complete,
+                                       min_confidence=audit_min_confidence)
+        combined = _jev_combine_candidate(
+            main_action=proposal.get("action", "WAIT"),
+            independent={
+                "suggested_action": action,
+                "confidence": vote_result.get("confidence", 0),
+                "action_margin": vote_result.get("action_margin", 0),
+                "data_status": data_status,
+                "action_status": action_status,
+            },
+            audit=audit,
+            enforcement=review["enforcement_mode"],
+        )
+        return {
+            "instId": proposal["instId"],
+            "cycle_id": proposal.get("cycle_id", ""),
+            "decision_id": proposal.get("decision_id", ""),
+            "main_action": proposal.get("action", "WAIT"),
+            "data_valid": data_valid,
+            "direction_consistent": independent_answers.get(f"{prefix}_direction_consistent"),
+            "execution_ready": execution_ready,
+            "data_valid_probability": max(0.0, data_probability),
+            "execution_ready_probability": max(
+                0.0, _jev_policy_probability(execution_ready)),
+            "suggested_action": action,
+            "suggested_action_votes": {
+                "BUY_LONG": independent_answers.get(f"{prefix}_would_buy_long"),
+                "SELL_SHORT": independent_answers.get(f"{prefix}_would_sell_short"),
+                "WAIT": independent_answers.get(f"{prefix}_would_wait"),
+            },
+            "jev_confidence": vote_result.get("confidence", 0),
+            "jev_action_margin": vote_result.get("action_margin", 0),
+            "jev_action_status": action_status,
+            "quote_source": "okx",
+            "audit_proposal_complete": audit_complete,
+            "audit_proposal_consistent": audit_answers.get(f"{prefix}_thesis_supported"),
+            # None = 本候选从未被审计（WAIT 提议）。绝不要把它当 0 分参与统计。
+            "audit_probabilities": audit_probabilities,
+            "audit_flags": audit["flags"],
+            "audit_verdict": audit["verdict"],
+            "independent_action": action,
+            "decision_relation": combined["jev_relation_to_main"],
+            **combined,
+        }
+
+    def _position_review(index: int, proposal: Dict[str, Any]) -> Dict[str, Any]:
+        prefix = f"position_{index}"
+        data_valid = independent_answers.get(f"{prefix}_data_valid")
+        vote_result = _jev_rank_votes({
+            "HOLD": independent_answers.get(f"{prefix}_would_hold"),
+            "CLOSE_MARKET": independent_answers.get(f"{prefix}_would_close"),
+            "UPDATE_SL": independent_answers.get(f"{prefix}_would_update_sl"),
+        }, min_confidence=position_min_confidence, min_margin=position_min_margin,
+            data_valid=data_valid)
+        choice = _jev_normalize_choice(independent_answers.get(f"{prefix}_action"))
+        if choice not in {"HOLD", "CLOSE_MARKET", "UPDATE_SL", "INSUFFICIENT_DATA"}:
+            choice = vote_result["suggested_action"]
+        data_probability = _jev_policy_probability(data_valid)
+        if data_probability < 0:
+            action, status = "INSUFFICIENT_DATA", "missing_data_valid"
+        elif data_probability < 0.5:
+            action, status = "INSUFFICIENT_DATA", "invalid_data"
+        else:
+            action, status = choice, vote_result["action_status"]
+            if status in {"low_confidence", "ambiguous", "missing_action_votes"}:
+                action = "INSUFFICIENT_DATA" if status == "missing_action_votes" else "HOLD"
+        flags = []
+        protection = _jev_policy_probability(
+            audit_answers.get(f"{prefix}_protection_ready"))
+        close_needed = _jev_policy_probability(
+            audit_answers.get(f"{prefix}_close_needed"))
+        if protection >= 0 and protection < 0.5:
+            flags.append("protection_not_ready")
+        if close_needed >= 0.5:
+            flags.append("audit_close_needed")
+        if not audit_ok or _jev_policy_probability(
+                audit_answers.get("audit_data_valid")) < 0.5:
+            flags.append("audit_unavailable")
+        audit = _jev_audit_verdict(flags, min_confidence=audit_min_confidence)
+        main_action = proposal.get("main_action", "HOLD")
+        if audit["verdict"] == "REJECT":
+            relation = "AUDIT_REJECT"
+        elif action == "INSUFFICIENT_DATA":
+            relation = "ABSTAIN"
+        elif action == main_action:
+            relation = "AGREE"
+        else:
+            relation = "POSITION_DISAGREEMENT"
+        return {
+            "instId": proposal["instId"],
+            "cycle_id": proposal.get("cycle_id", ""),
+            "decision_id": proposal.get("decision_id", ""),
+            "main_action": main_action,
+            "main_confidence": proposal.get("main_confidence", 0),
+            "main_reason": proposal.get("main_reason", ""),
+            "data_valid": data_valid,
+            "data_valid_probability": max(0.0, data_probability),
+            "suggested_action": action,
+            "suggested_action_votes": {
+                "HOLD": independent_answers.get(f"{prefix}_would_hold"),
+                "CLOSE_MARKET": independent_answers.get(f"{prefix}_would_close"),
+                "UPDATE_SL": independent_answers.get(f"{prefix}_would_update_sl"),
+            },
+            "jev_confidence": vote_result.get("confidence", 0),
+            "jev_action_margin": vote_result.get("action_margin", 0),
+            "jev_action_status": status,
+            "audit_protection_ready": audit_answers.get(f"{prefix}_protection_ready"),
+            "audit_close_needed": audit_answers.get(f"{prefix}_close_needed"),
+            "audit_data_quality": _jev_shadow_position_audit_context(proposal).get("data_quality"),
+            "audit_flags": audit["flags"],
+            "audit_verdict": audit["verdict"],
+            "decision_relation": relation,
+            "jev_relation_to_main": relation,
+            "jev_enforcement": review["enforcement_mode"].upper(),
+        }
+
+    # The market quote used to score a delayed Jev paper entry is refreshed only
+    # after both answers arrive, so request latency is not mistaken for fill price.
+    def _refresh_jev_quote(proposal: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            ticker = fetch_okx_ticker(proposal["instId"])
+            if not ticker:
+                raise RuntimeError("OKX ticker unavailable")
+            refreshed_at = time.time()
+            proposal["jev_price"] = _jev_shadow_float(ticker.get("last"), 0.0)
+            proposal["jev_bidPx"] = _jev_shadow_float(ticker.get("bidPx"), 0.0)
+            proposal["jev_askPx"] = _jev_shadow_float(ticker.get("askPx"), 0.0)
+            proposal["jev_quote_timestamp"] = refreshed_at
+            proposal["jev_quote_source"] = "okx"
+            if proposal["jev_price"] <= 0:
+                proposal["jev_quote_error"] = "OKX ticker missing last price"
+        except Exception as quote_exc:
+            proposal["jev_price"] = 0.0
+            proposal["jev_bidPx"] = 0.0
+            proposal["jev_askPx"] = 0.0
+            proposal["jev_quote_error"] = f"{type(quote_exc).__name__}: {quote_exc}"
+            proposal["jev_quote_timestamp"] = time.time()
+            proposal["jev_quote_source"] = "okx_unavailable"
+        return proposal
+
+    if proposals:
+        with ThreadPoolExecutor(max_workers=min(8, len(proposals))) as quote_executor:
+            proposals = list(quote_executor.map(_refresh_jev_quote, proposals))
+    instrument_reviews = [_candidate_review(index, proposal)
+                          for index, proposal in enumerate(proposals)]
+    position_reviews = [_position_review(index, proposal)
+                        for index, proposal in enumerate(position_proposals)]
+    review.update({
+        "status": "ok" if independent_ok else "error",
+        "audit_status": "ok" if audit_ok else "error",
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "channel_requests": {
+            "independent": {key: independent_result.get(key) for key in (
+                "status", "request_id", "latency_ms", "attempts", "error")},
+            "audit": {key: audit_result.get(key) for key in (
+                "status", "request_id", "latency_ms", "attempts", "error")},
+        },
+        "attempts": (independent_result.get("attempts", []) +
+                     audit_result.get("attempts", [])),
+        "aggregate_answers": {
+            "independent_data_valid": independent_answers.get("cycle_data_valid"),
+            "audit_data_valid": audit_answers.get("audit_data_valid"),
+        },
+        "instrument_reviews": instrument_reviews,
+        "position_reviews": position_reviews,
+        "response": {
+            "independent": independent_result.get("response"),
+            "audit": audit_result.get("response"),
+        },
+        "independent_request_id": independent_result.get("request_id", ""),
+        "audit_request_id": audit_result.get("request_id", ""),
+    })
+    if not independent_ok:
+        review["error"] = independent_result.get("error", "independent lane failed")
+        print(f"[AI Brain Jev Shadow] ⚠️ 独立决策通道失败（不影响执行）: {review['error']}")
+    else:
+        suffix = "，审计通道失败" if not audit_ok else ""
+        print(f"[AI Brain Jev Shadow] ✅ 双通道影子复核完成 (候选 {len(proposals)} 个, "
+              f"耗时 {review['latency_ms']}ms{suffix}; 结果不参与执行)")
+
+    review["completed_timestamp"] = time.time()
+    review["timestamp"] = int(review["completed_timestamp"])
+    review["response_latency_seconds"] = max(
+        0.0, review["completed_timestamp"] - review_started_timestamp)
+    _jev_shadow_update_entry_outcomes(
+        proposals,
+        review.get("instrument_reviews", []),
+        active_positions,
+        review,
+    )
+    _jev_shadow_update_position_outcomes(position_proposals, review.get("position_reviews", []), review)
+
+    path = os.path.join(DATA_DIR, "jev_shadow_reviews.jsonl")
+    try:
+        from r20_backend.file_locks import file_lock
+        try:
+            retention_days = max(1, min(int(os.environ.get("R20_JEV_SHADOW_RETENTION_DAYS", "7")), 30))
+        except (TypeError, ValueError):
+            retention_days = 7
+        try:
+            max_records = max(100, min(int(os.environ.get("R20_JEV_SHADOW_MAX_RECORDS", "1000")), 5000))
+        except (TypeError, ValueError):
+            max_records = 1000
+        cutoff = int(time.time()) - retention_days * 24 * 60 * 60
+        with file_lock(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            retained = []
+            dropped = 0
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            item = json.loads(line)
+                            item_ts = int(item.get("timestamp", 0) or 0)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            dropped += 1
+                            continue
+                        if item_ts < cutoff:
+                            dropped += 1
+                            continue
+                        retained.append(item)
+            retained.append(review)
+            if len(retained) > max_records:
+                dropped += len(retained) - max_records
+                retained = retained[-max_records:]
+
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".jev-shadow-", suffix=".tmp", dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for item in retained:
+                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            if dropped:
+                print(f"[AI Brain Jev Shadow] 清理 {dropped} 条过期/无效记录，"
+                      f"保留最近 {retention_days} 天共 {len(retained)} 条")
+    except Exception as exc:
+        print(f"[AI Brain Jev Shadow] warn 影子结果落盘失败（不影响执行）: {exc}")
+
+    # 原始响应按短周期清理；评估台账保留结构化快照更久，确保 20-30 笔
+    # 完整交易跨周时仍能按 decision_id 回看。这里不重复保存 provider 原始元数据，
+    # 减少磁盘占用，完整响应仍在上面的短期文件中。
+    evaluation_path = os.path.join(DATA_DIR, "jev_shadow_evaluation.jsonl")
+    try:
+        from r20_backend.file_locks import file_lock
+        try:
+            evaluation_days = max(14, min(
+                int(os.environ.get("R20_JEV_EVALUATION_RETENTION_DAYS", "60")), 180))
+        except (TypeError, ValueError):
+            evaluation_days = 60
+        try:
+            evaluation_max_records = max(200, min(
+                int(os.environ.get("R20_JEV_EVALUATION_MAX_RECORDS", "5000")), 20000))
+        except (TypeError, ValueError):
+            evaluation_max_records = 5000
+        evaluation_record = dict(review)
+        evaluation_record.pop("response", None)
+        cutoff = int(time.time()) - evaluation_days * 24 * 60 * 60
+        with file_lock(evaluation_path):
+            os.makedirs(os.path.dirname(evaluation_path), exist_ok=True)
+            retained = []
+            if os.path.exists(evaluation_path):
+                with open(evaluation_path, "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            item = json.loads(line)
+                            if int(item.get("timestamp", 0) or 0) >= cutoff:
+                                retained.append(item)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+            retained.append(evaluation_record)
+            retained = retained[-evaluation_max_records:]
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".jev-evaluation-", suffix=".tmp", dir=os.path.dirname(evaluation_path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for item in retained:
+                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, evaluation_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+    except Exception as exc:
+        print(f"[AI Brain Jev Shadow] warn 评估台账落盘失败（不影响执行）: {exc}")
 
 
 def execute_batch_ai_brain_cycle(
@@ -811,6 +3183,7 @@ def execute_batch_ai_brain_cycle(
     active_positions_detail: List[Dict[str, Any]] = None,
     usdt_available: float = None,
     policy_snapshot: Optional[Dict[str, Any]] = None,
+    trader_factors: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch all six crypto symbols, call the LLM once, then persist an auditable result."""
     base_url, api_key = get_cpa_client_config()
@@ -921,7 +3294,7 @@ def execute_batch_ai_brain_cycle(
     telemetry = ModelCallTelemetry(
         "trading_brain", model_name, str(effort), effective_system_prompt, prompt
     )
-    return dispatch_llm_and_persist_decisions(
+    result = dispatch_llm_and_persist_decisions(
         AI_DECISION_CACHE_FILE=AI_DECISION_CACHE_FILE,
         AI_DECISION_HISTORY_FILE=AI_DECISION_HISTORY_FILE,
         AI_POSITION_MANAGEMENT_FILE=AI_POSITION_MANAGEMENT_FILE,
@@ -958,6 +3331,26 @@ def execute_batch_ai_brain_cycle(
         time=time,
         time_str=time_str,
         urllib=urllib    )
+    if result:
+        position_management = []
+        try:
+            with open(AI_POSITION_MANAGEMENT_FILE, "r", encoding="utf-8") as handle:
+                _management_payload = json.load(handle)
+            if isinstance(_management_payload, dict) and isinstance(_management_payload.get("instructions"), list):
+                position_management = _management_payload["instructions"]
+        except Exception as _management_exc:
+            print(f"[AI Brain Jev Shadow] warn 无法读取本轮持仓管理指令: {_management_exc}")
+        _run_jev_shadow_review(
+            result,
+            packages,
+            time_str,
+            active_positions_detail=active_positions_detail,
+            position_management=position_management,
+            usdt_available=usdt_available,
+            pending_orders_detail=pending_orders_list,
+            trader_factors=trader_factors,
+        )
+    return result
 
 def get_latest_ai_decision(inst_id: str, max_age_seconds: int = DECISION_MAX_AGE_SECONDS) -> Optional[Dict[str, Any]]:
     """Read a validated decision only while its cache timestamp is fresh."""

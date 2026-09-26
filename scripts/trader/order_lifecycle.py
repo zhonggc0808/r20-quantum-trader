@@ -34,6 +34,18 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from scripts.trader.order_lease import (
+    AI_KEEP_LEASE_MS,
+    load_leases,
+    prune_leases,
+    remove_lease,
+)
+
+
+ORPHAN_GRACE_MS = 5 * 60 * 1000
+MAX_ORDER_AGE_MS = 60 * 60 * 1000
+PARTIAL_REMAINDER_MAX_AGE_MS = 30 * 60 * 1000
+
 
 def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                               *,
@@ -43,7 +55,8 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                               current_environment,
                               load_instruments,
                               okx_rest,
-                              venue_registry) -> Tuple[bool, str]:
+                              venue_registry,
+                              data_dir=None) -> Tuple[bool, str]:
     """Cancel stale entry orders; any inability to verify/cancel blocks the trading cycle.
 
     审计④8(2026-09-13)·外所 GTC 回收：路由能把信号派到 gate/binance（三所平权+
@@ -53,26 +66,93 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
     适配器故障也绝不拖累主链）；核验/撤销失败与 OKX 同标准 fail-closed 拦本周期。
     """
     keep_ord_ids = keep_ord_ids or set()
-    STALE_MS = 240_000
+    try:
+        leases = load_leases(data_dir)
+    except Exception as exc:
+        print(f"[挂单租约] warn 读取租约失败，按无有效租约处理: {exc}")
+        leases = {}
+    active_lease_ids = set()
+
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _partial_since(order: Dict[str, Any], created_at: int) -> Tuple[bool, int]:
+        state = str(order.get("state", "live")).lower()
+        filled = _as_float(order.get("accFillSz"))
+        total = _as_float(order.get("sz"))
+        partial = state == "partially_filled" or (filled > 0 and total > filled)
+        raw_since = order.get("uTime") or order.get("fillTime") or created_at
+        try:
+            since = int(raw_since)
+        except (TypeError, ValueError):
+            since = created_at
+        return partial, since
+
+    def _lease_active(order_id: str, inst_id: str, now_ts: int) -> bool:
+        lease = leases.get(order_id)
+        if not isinstance(lease, dict) or str(lease.get("instId") or "") != inst_id:
+            return False
+        try:
+            return int(lease.get("lease_until", 0) or 0) > now_ts
+        except (TypeError, ValueError):
+            return False
+
+    def _may_retain(order_id: str, inst_id: str, age_ms: int, partial_since: int,
+                    partial: bool, attributed: bool, now_ts: int) -> bool:
+        """Return whether the order is still inside an explicit bounded window."""
+        if age_ms >= MAX_ORDER_AGE_MS:
+            return False
+        if partial and now_ts - partial_since >= PARTIAL_REMAINDER_MAX_AGE_MS:
+            return False
+        if not attributed:
+            return age_ms <= ORPHAN_GRACE_MS
+        if _lease_active(order_id, inst_id, now_ts):
+            active_lease_ids.add(order_id)
+            return True
+        # A newly attributed order gets one review window; it must then receive
+        # an explicit KEEP lease from the brain rather than living on intent TTL.
+        return age_ms <= AI_KEEP_LEASE_MS
+
+    def _cancel_okx(inst_id: str, order_id: str, reason: str) -> Tuple[bool, str]:
+        try:
+            okx_rest.cancel_order(inst_id, order_id)
+        except Exception as exc:
+            return False, f"failed to cancel {reason} order {inst_id}/{order_id}: {exc}"
+        try:
+            remove_lease(order_id, data_dir=data_dir)
+        except Exception as exc:
+            print(f"[挂单租约] warn 撤单成功但租约清理失败: {inst_id}/{order_id}: {exc}")
+        return True, ""
+
     try:
         open_orders = okx_rest.pending_orders()
     except Exception as exc:
         return False, f"invalid open-orders response: {exc}"
     now_ts = int(time.time() * 1000)
     for order in open_orders:
+        if not isinstance(order, dict):
+            continue
         inst_id = str(order.get("instId") or "")
         order_id = str(order.get("ordId") or "")
-        if order_id and order_id in keep_ord_ids:
-            continue  # 挂单对账已判定归属（接管），不受超时生命周期清理影响
         state = str(order.get("state", "live")).lower()
         created_at = int(order.get("cTime", now_ts) or now_ts)
-        if state not in {"live", "partially_filled"} or not order_id or now_ts - created_at <= STALE_MS:
+        age_ms = now_ts - created_at
+        if order_id:
+            active_lease_ids.add(order_id)
+        if state not in {"live", "partially_filled"} or not order_id:
             continue
-        try:
-            okx_rest.cancel_order(inst_id, order_id)
-        except Exception as exc:
-            return False, f"failed to cancel stale order {inst_id}/{order_id}: {exc}"
-        print(f"[挂单生命周期管理] 自动撤销超时挂单: {inst_id} (ordId={order_id}, state={state})")
+        partial, partial_since = _partial_since(order, created_at)
+        if _may_retain(order_id, inst_id, age_ms, partial_since, partial,
+                       order_id in keep_ord_ids, now_ts):
+            continue
+        ok, error = _cancel_okx(inst_id, order_id, "超时")
+        if not ok:
+            return False, error
+        print(f"[挂单生命周期管理] 自动撤销挂单: {inst_id} (ordId={order_id}, state={state}, "
+              f"age_ms={age_ms}, partial={partial})")
 
     try:
         _env_mode = str(current_environment().mode or "demo")
@@ -133,7 +213,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                 continue
             _raw = o.get("raw") if isinstance(o.get("raw"), dict) else {}
             order_id = str(o.get("order_id") or o.get("id") or _raw.get("id") or "")
-            if not order_id or order_id in keep_ord_ids:
+            if not order_id:
                 continue
             _side = str(o.get("side") or _raw.get("side") or "").lower()
             if not _side:
@@ -168,7 +248,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                     dupes.append(best[key])
                 best[key] = entry
         for created_ms, order_id, inst_disp in dupes:
-            if now_ts - created_ms <= STALE_MS:
+            if now_ts - created_ms <= ORPHAN_GRACE_MS:
                 continue  # 宽限期内不动手
             _b0 = inst_disp.replace("_USDT", "").replace("USDT", "").split("-")[0].upper()
             try:
@@ -177,15 +257,45 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
             except Exception as exc:
                 return False, f"failed to cancel duplicate order {_v} {inst_disp}/{order_id}: {exc}"
         for (venue_base, dir_word), (created_ms, order_id, inst_disp) in best.items():
-            if now_ts - created_ms <= STALE_MS:
+            age_ms = now_ts - created_ms
+            active_lease_ids.add(order_id)
+            raw_order = next((x for x in _rows
+                              if str(x.get("order_id") or x.get("id") or
+                                     (x.get("raw") or {}).get("id") or "") == order_id), {})
+            raw = raw_order.get("raw") if isinstance(raw_order.get("raw"), dict) else {}
+            state = str(raw.get("status") or raw.get("state") or "live").lower()
+            total = _as_float(raw.get("origQty") or raw.get("size") or raw.get("amount"))
+            filled = _as_float(raw.get("executedQty") or raw.get("filled") or raw.get("filledSize"))
+            left = _as_float(raw.get("left"))
+            partial = "partial" in state or (filled > 0 and ((total > filled) or (left > 0)))
+            partial_since = created_ms
+            for key in ("updateTime", "uTime", "fillTime", "create_time"):
+                if raw.get(key):
+                    try:
+                        partial_since = int(float(raw[key]))
+                        if key == "create_time":
+                            partial_since *= 1000
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            attributed = _intent_covers(venue_base, dir_word) or order_id in keep_ord_ids
+            if _may_retain(order_id, inst_disp, age_ms, partial_since, partial,
+                           attributed, now_ts):
                 continue
-            if _intent_covers(venue_base, dir_word):
-                continue  # 新鲜意图归属 → 保留（与 OKX kept 同语义）
             try:
                 _ad.cancel_order(venue_base, order_id)
-                print(f"[挂单生命周期管理] 自动撤销超时挂单({_v.upper()}): {inst_disp} (id={order_id})")
+                try:
+                    remove_lease(order_id, data_dir=data_dir)
+                except Exception as exc:
+                    print(f"[挂单租约] warn 外所撤单成功但租约清理失败: {inst_disp}/{order_id}: {exc}")
+                print(f"[挂单生命周期管理] 自动撤销超时挂单({_v.upper()}): {inst_disp} (id={order_id}, "
+                      f"age_ms={age_ms}, partial={partial})")
             except Exception as exc:
                 return False, f"failed to cancel stale order {_v} {inst_disp}/{order_id}: {exc}"
+    try:
+        prune_leases(active_lease_ids, data_dir=data_dir)
+    except Exception as exc:
+        print(f"[挂单租约] warn 清理已不存在订单租约失败: {exc}")
     return True, "open orders verified"
 
 
@@ -273,7 +383,16 @@ def reconcile_pending_orders(trackers: Dict[str, Any] = None, now_ms: int = None
             kept.add(ord_id)
             continue
         # 3) 孤儿单：无任何本地意图可归属
+        # 交易所刚返回、尚未完成本地落盘/跨进程对账的订单先给 5 分钟宽限；
+        # 没有 cTime 的旧夹具/异常响应不能证明是新单，继续按孤儿立即处理。
+        try:
+            created_at = int(order.get("cTime"))
+        except (TypeError, ValueError):
+            created_at = None
+        if created_at is not None and now_ms - created_at <= ORPHAN_GRACE_MS:
+            print(f"[挂单对账] 宽限新孤儿单 instId={inst_id} ordId={ord_id} side={side} "
+                  f"原因=等待归属落盘")
+            continue
         if not _cancel_orphan(RECONCILE_REASON_ORPHAN):
             return False, kept
     return True, kept
-

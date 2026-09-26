@@ -536,7 +536,8 @@ def amend_algo_sl(
 
 
 def pending_algo_orders(inst_id: str | None = None, *, inst_type: str = "SWAP", ord_type: str = "oco",
-                        limit: int = 100, before: str | None = None, after: str | None = None, env: OKXEnvironment | None = None) -> list[dict[str, Any]]:
+                        limit: int = 100, before: str | None = None, after: str | None = None,
+                        env: OKXEnvironment | None = None, timeout: float = DEFAULT_TIMEOUT) -> list[dict[str, Any]]:
     """GET /api/v5/trade/orders-algo-pending. ``instId`` is sent to the API and
     additionally filtered locally — older deployments ignored the query filter."""
     if not 1 <= limit <= 100:
@@ -546,7 +547,7 @@ def pending_algo_orders(inst_id: str | None = None, *, inst_type: str = "SWAP", 
     rows = request("GET", "/api/v5/trade/orders-algo-pending", {
         "instType": inst_type, "instId": inst_id, "ordType": ord_type, "limit": limit,
         "before": before, "after": after,
-    }, env=env)
+    }, env=env, timeout=timeout)
     if inst_id:
         rows = [row for row in rows if str(row.get("instId") or "") == inst_id]
     return rows

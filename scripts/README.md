@@ -5,7 +5,7 @@
 `sys.path` 上的顶层名互相 `import`，同时也支持 `scripts.xxx` 双拼写
 （见本文末「双拼写」一节）。
 
-> ⚠️ **为什么要有这份文档**：本目录根层有 **33 个 `.py`**，
+> ⚠️ **为什么要有这份文档**：本目录根层有 **36 个 `.py`**，
 > 此前**没有任何 README**，其中 23 个在全仓文档里连一次都没被提到。
 > 新人（或下一个 Agent）只能靠逐个打开文件猜哪个是入口、哪个是库。
 >
@@ -30,6 +30,7 @@
 
 | 模块 | 行数 | 说明 |
 |---|---|---|
+| `direction_observation.py` | 176 | 多周期方向一致性观测与版本化快照字段 |
 | `ai_brain_trader.py` | 1117 | AI 主脑全标的池决策引擎（与主脚本共用风控常量） |
 | `factor_library.py` | 298 | 多因子库：`compute_instrument_factors()` 逐标的装配因子 |
 | `instrument_pool.py` | 409 | 交易宇宙（标的池）的**校验后**单一来源 |
@@ -79,6 +80,7 @@
 
 | 模块 | 行数 | 说明 |
 |---|---|---|
+| `account_scope.py` | 86 | 实盘/模拟盘账户数据隔离与台账行筛选 |
 | `backup_runtime.py` | 481 | 备份作业运行时：打包 / 加密 / 校验 / 投递 |
 | `backup_upload.py` | 282 | 备份上传目标：S3 / OSS / WebDAV / 百度网盘 |
 | `self_improvement_engine.py` | 782 | LLM 原生自省与策略演化引擎 |

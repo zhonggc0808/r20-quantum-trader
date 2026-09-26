@@ -30,7 +30,8 @@ except ImportError:
     standalone_settings = None
 
 WORKSPACE_DIR = PROJECT_ROOT
-DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
+# 测试沙箱与独立实例通过 R20_DATA_DIR 重定向全部账户态数据。
+DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
 LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
@@ -246,6 +247,7 @@ def _match_snapshot(journal_by_inst, inst, open_time, side=None):
 
 
 def load_closed_trades(start_time_override: str | None = None):
+    from scripts.account_scope import scoped_rows
     account_init_file = os.path.join(DATA_DIR, "account_initial_state.json")
     reset_time_str = "1970-01-01 00:00:00"
     evo_start_str = os.getenv("R20_EVOLUTION_START_TIME", "").strip()
@@ -275,7 +277,7 @@ def load_closed_trades(start_time_override: str | None = None):
         try:
             with open(LEDGER_JSON_FILE, "r", encoding="utf-8") as f:
                 t_list = json.load(f)
-                for t in t_list:
+                for t in scoped_rows(t_list, DATA_DIR):
                     if t.get("status") == "holding":
                         continue
                     

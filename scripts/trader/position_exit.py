@@ -24,8 +24,39 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _recent_entry_intent(inst_id: str, side: str, now_ms: int) -> Dict[str, Any]:
+    """Return the latest bounded entry intent for a position identity.
+
+    The intent is evidence of the accepted order, not proof of fill. It is
+    copied into the tracker only after the exchange position snapshot exists.
+    """
+    data_dir = os.environ.get("R20_DATA_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "data")
+    path = os.path.join(data_dir, "open_order_intents.json")
+    wanted_side = "buy" if str(side).lower() == "long" else "sell"
+    candidates = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        rows = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or str(row.get("instId")) != str(inst_id):
+            continue
+        row_side = str(row.get("side", "")).lower()
+        if row_side not in {wanted_side, str(side).lower()}:
+            continue
+        ts_ms = int(float(row.get("ts", 0) or 0))
+        if ts_ms <= 0 or ts_ms > now_ms + 120000 or now_ms - ts_ms > 6 * 3600 * 1000:
+            continue
+        candidates.append((ts_ms, row))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else {}
 
 
 def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, executed_actions,
@@ -66,6 +97,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
     pos_key = f"{inst_id}_{curr_pos['side']}"
 
     now_ts = int(time.time())
+    entry_intent = _recent_entry_intent(inst_id, curr_pos.get("side", ""), now_ts * 1000)
     if pos_key not in trackers:
         score, action, reasons, strat_tag, strat_desc = evaluate_asset_signal(f)
         trackers[pos_key] = {
@@ -78,31 +110,43 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
             "entryPx": entry_px,
             "entryTs": now_ts,
             "entryTime": timestamp_full,
+            "cycle_id": entry_intent.get("cycle_id") or f.get("cycle_id", ""),
+            "decision_id": entry_intent.get("decision_id") or f.get("decision_id", ""),
+            "entry_order_id": entry_intent.get("order_id"),
+            "entry_intent_id": entry_intent.get("intent_id"),
+            "entry_order_ts": entry_intent.get("ts"),
+            "entry_venue": entry_intent.get("venue", "okx"),
             "initialSz": pos_sz,
             "currentSz": pos_sz,
             "highWaterMark": cur_px,
             "lowWaterMark": cur_px,
             "trailingStopPx": round((entry_px - atr * profile["sl_atr_mult"]) if is_long else (entry_px + atr * profile["sl_atr_mult"]), prec),
             "takeProfitPx": round((entry_px + max(atr * profile["tp_atr_mult"], entry_px * profile["min_profit_ratio"])) if is_long else (entry_px - max(atr * profile["tp_atr_mult"], entry_px * profile["min_profit_ratio"])), prec),
-            "signal_snapshot": build_signal_snapshot(f),
+            # direction_observation is populated later in the cycle, after the
+            # brain scan. Keep the tracker pending until that observation is
+            # available so the entry journal captures the complete snapshot.
+            "signal_snapshot": None,
+            "signal_snapshot_pending": True,
             "stage_desc": "持有监控中"
         }
-        record_signal_snapshot({
-            "instId": inst_id,
-            "name": name,
-            "side": curr_pos["side"],
-            "entryTs": now_ts,
-            "entryTime": timestamp_full,
-            "entryPx": entry_px,
-            "sz": pos_sz,
-            "policy_version": f.get("policy_version", ""),
-            "snapshot": trackers[pos_key]["signal_snapshot"],
-        })
 
     t = trackers[pos_key]
+    if entry_intent and not t.get("entry_order_id"):
+        t["entry_order_id"] = entry_intent.get("order_id")
+        t["entry_intent_id"] = entry_intent.get("intent_id")
+        t["entry_order_ts"] = entry_intent.get("ts")
+        t["entry_venue"] = entry_intent.get("venue", "okx")
+        if entry_intent.get("decision_id"):
+            t["decision_id"] = entry_intent["decision_id"]
+        if entry_intent.get("cycle_id"):
+            t["cycle_id"] = entry_intent["cycle_id"]
     if not t.get("policy_version") and f.get("policy_version"):
         t["policy_version"] = f.get("policy_version")
         t["policy_hash"] = f.get("policy_hash", "")
+    if f.get("cycle_id") and not t.get("cycle_id"):
+        t["cycle_id"] = f.get("cycle_id")
+    if f.get("decision_id") and not t.get("decision_id"):
+        t["decision_id"] = f.get("decision_id")
     t["currentSz"] = pos_sz
     if "entryTs" not in t:
         t["entryTs"] = now_ts
@@ -320,4 +364,3 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
             return True, "已移动止盈"
 
     return False, "持仓监控中"
-

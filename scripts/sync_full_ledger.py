@@ -661,12 +661,13 @@ def build_lifecycle_ledger():
         except Exception:
             pass
 
+    from scripts.account_scope import scoped_rows
     existing_closed_ids = set()
     old_trades = []
     if os.path.exists(LEDGER_JSON_FILE):
         try:
             with open(LEDGER_JSON_FILE, "r", encoding="utf-8") as f:
-                old_trades = json.load(f)
+                old_trades = scoped_rows(json.load(f), DATA_DIR)
                 existing_closed_ids = {t["id"] for t in old_trades if t.get("status") == "closed"}
         except Exception:
             old_trades = []
@@ -810,7 +811,7 @@ def build_lifecycle_ledger():
               f"{', '.join(_purged_holdings[:8])}")
 
     combined_trades = sorted(
-        trades_map.values(),
+        scoped_rows(list(trades_map.values()), DATA_DIR),
         key=lambda x: str(x.get("close_time") or x.get("time") or x.get("open_time") or ""),
         reverse=True
     )

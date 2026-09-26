@@ -65,7 +65,26 @@ def collect_okx_position_payloads(all_factors: List[Dict[str, Any]],
         position_payload["lowWaterMark"] = tracker.get("lowWaterMark")
         position_payload["takeProfitPx"] = tracker.get("takeProfitPx")
         position_payload["stage_desc"] = tracker.get("stage_desc", "")
+        # Keep the decision identity on the live-position snapshot so the Jev
+        # entry counterfactual can distinguish a real fill from a same-symbol
+        # position opened by another cycle.
+        position_payload["cycle_id"] = tracker.get("cycle_id", "")
+        position_payload["decision_id"] = tracker.get("decision_id", "")
+        position_payload["entry_order_id"] = tracker.get("entry_order_id")
+        position_payload["entry_intent_id"] = tracker.get("entry_intent_id")
+        position_payload["entry_order_ts"] = tracker.get("entry_order_ts")
+        position_payload["entry_order_avg_px"] = tracker.get("entry_order_avg_px")
+        position_payload["entry_order_fill_sz"] = tracker.get("entry_order_fill_sz")
+        position_payload["entry_order_source"] = tracker.get("entry_order_source")
+        position_payload["entry_identity_status"] = tracker.get("entry_identity_status")
+        position_payload["entry_venue"] = tracker.get("entry_venue", "okx")
+        position_payload["entry_time"] = tracker.get("entryTime")
+        position_payload["entryTime"] = tracker.get("entryTime")
+        position_payload["entryTs"] = tracker.get("entryTs")
         position_payload["atr"] = f.get("atr", 0.0)
+        position_payload["ctVal"] = f.get("ctVal", position_payload.get("ctVal", 1.0))
+        position_payload["bidPx"] = f.get("bidPx", position_payload.get("bidPx"))
+        position_payload["askPx"] = f.get("askPx", position_payload.get("askPx"))
         active_pos_list.append(position_payload)
     return active_pos_list
 
@@ -99,6 +118,7 @@ def merge_cross_venue_positions(active_pos_list: List[Dict[str, Any]],
                         "pos": abs(float(p.get("size_signed") or 0)),
                         "avgPx": float(p.get("entry_price") or 0),
                         "markPx": float(p.get("mark_price") or 0),
+                        "ctVal": float(p.get("ct_val") or 1.0),
                         "margin": float(p.get("margin") or 0),
                         "upl": float(p.get("unrealized_pnl") or 0),
                         "atr": match_f.get("atr", 0.0),

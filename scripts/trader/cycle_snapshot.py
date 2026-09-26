@@ -152,12 +152,23 @@ def build_state_payload(*, timestamp_full, active_pos_count, max_positions, long
             "market_regime": f.get("market_regime", "CHOP"),
             "structure_1h": f.get("structure_1h", "CHOP"),
             "trend_1h": "多头" if f.get("trend_1h_bullish") else "空头",
-            "trend_4h": "多头" if f.get("trend_4h_bullish") else "空头",
+            "trend_4h": ("多头" if f.get("trend_4h_bullish") else
+                          ("空头" if f.get("trend_4h_bearish") else "未知/震荡")),
             "score": score,
             "action": action,
             "strategy": strat_tag,
             "desc": strat_desc,
             "position": f["position"]
         })
+        if (f.get("direction_observation") is not None or
+                f.get("direction_layers") is not None or
+                f.get("range_4h_high") is not None):
+            payload["instruments"][-1].update({
+                "direction_observation": f.get("direction_observation"),
+                "direction_layers": f.get("direction_layers"),
+                "range_4h_high": f.get("range_4h_high"),
+                "range_4h_low": f.get("range_4h_low"),
+                "price_position_in_range": f.get("price_position_in_range"),
+            })
 
     return payload

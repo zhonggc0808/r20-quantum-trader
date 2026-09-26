@@ -27,6 +27,9 @@ def run_script(script: Any, *, timeout: int = 20, label: Optional[str] = None,
     cp = subprocess.run([sys.executable, str(script)],
                         capture_output=True, text=True, timeout=timeout, env=env)
     if cp.returncode != 0:
-        err = (cp.stderr or cp.stdout or "").strip().replace("\n", " / ")[:200]
+        combined_output = "\n".join(
+            part for part in (cp.stdout or "", cp.stderr or "") if part
+        )
+        err = combined_output.strip().replace("\n", " / ")[:200]
         print(f"[spawn] {label or script} 退出码 {cp.returncode}：{err or '无输出'}")
     return cp
