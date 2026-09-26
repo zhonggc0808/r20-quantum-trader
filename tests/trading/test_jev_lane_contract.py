@@ -577,6 +577,152 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
                          "三个兼容票决必须仍在记录里（choice 的信息并未丢失）")
 
 
+class EnforcementModeIsConfigurableTest(unittest.TestCase):
+    """方案 §6：`shadow` / `review` / `soft_veto` 必须**可配置回滚**。
+
+    此前 `enforcement_mode` 被硬编码成 `"shadow"`，环境变量只被记进
+    `configured_enforcement` —— 于是 `R20_JEV_ENFORCEMENT` **读了却不生效**，
+    而切档位恰恰必须改代码，与 §6 的要求正好相反。本类钉住修复。
+    """
+
+    def test_all_four_documented_modes_resolve(self):
+        for mode in ("shadow", "review", "soft_veto", "hard_veto"):
+            got = abt._jev_resolve_enforcement(mode)
+            self.assertEqual(got["mode"], mode)
+            self.assertTrue(got["valid"], f"{mode} 是方案规定的合法档位")
+
+    def test_case_and_whitespace_are_tolerated(self):
+        for raw in ("SOFT_VETO", " soft_veto ", "Soft_Veto"):
+            self.assertEqual(abt._jev_resolve_enforcement(raw)["mode"], "soft_veto")
+
+    def test_unknown_value_fails_closed_to_shadow(self):
+        """笔误绝不能把观察者变成门禁 —— 必须回落到唯一不改变执行的档位。"""
+        for raw in ("typo", "", None, 1, "enforce", "veto"):
+            got = abt._jev_resolve_enforcement(raw)
+            self.assertEqual(got["mode"], "shadow",
+                             f"非法值 {raw!r} 必须 fail-closed 回 shadow")
+            self.assertFalse(got["valid"])
+
+    def test_no_mode_ever_affects_execution_yet(self):
+        """阶段 C/D 的执行门控需要样本外证据（§9 阶段 D）。
+
+        在证据到位之前把判定接到执行上，等于用未标定的信号动真钱。
+        本断言是**看门狗**：若有人提前接通执行，它会失败。
+        """
+        independent = {"suggested_action": "SELL_SHORT", "data_status": "valid",
+                       "action_status": "accepted"}
+        for mode in ("shadow", "review", "soft_veto", "hard_veto"):
+            got = abt._jev_enforcement_decision(
+                mode=mode, main_action="BUY_LONG", independent=independent,
+                entry_mode="initial", hard_gates_passed=True)
+            self.assertFalse(got["affects_execution"],
+                             f"{mode} 不得在无样本外证据时改变执行")
+
+
+class EnforcementDecisionCriteriaTest(unittest.TestCase):
+    """§9 阶段 C 的软否决判据：只针对主脑**新开仓**，且 Jev 必须过门槛。"""
+
+    def _decide(self, mode="soft_veto", main="BUY_LONG", action="SELL_SHORT",
+                status="accepted", data_status="valid", entry_mode="initial",
+                hard_gates=True):
+        return abt._jev_enforcement_decision(
+            mode=mode, main_action=main,
+            independent={"suggested_action": action, "data_status": data_status,
+                         "action_status": status},
+            entry_mode=entry_mode, hard_gates_passed=hard_gates)
+
+    def test_opposite_direction_past_thresholds_is_soft_veto_candidate(self):
+        got = self._decide()
+        self.assertEqual(got["decision"], "SOFT_VETO_CANDIDATE")
+
+    def test_explicit_wait_past_thresholds_is_soft_veto_candidate(self):
+        got = self._decide(action="WAIT", status="no_edge")
+        self.assertEqual(got["decision"], "SOFT_VETO_CANDIDATE")
+
+    def test_weak_vote_is_not_a_veto_ground(self):
+        """弱票 WAIT 表示「拿不准」，不是「反对」—— 不得当作否决依据。"""
+        for status in ("low_confidence", "ambiguous", "not_ready"):
+            got = self._decide(action="WAIT", status=status)
+            self.assertEqual(got["decision"], "NONE", f"{status} 不应产生否决候选")
+            self.assertIn("independent_thresholds_not_passed", got["reasons"])
+
+    def test_agreement_is_never_a_veto(self):
+        got = self._decide(action="BUY_LONG")
+        self.assertEqual(got["decision"], "NONE")
+        self.assertIn("independent_agrees", got["reasons"])
+
+    def test_scale_in_is_out_of_scope(self):
+        """只针对**新开仓**；在已有仓位上加仓不适用（§9 阶段 C）。"""
+        got = self._decide(entry_mode="scale_in")
+        self.assertEqual(got["decision"], "NONE")
+        self.assertIn("not_an_initial_entry", got["reasons"])
+
+    def test_main_wait_is_out_of_scope(self):
+        got = self._decide(main="WAIT", action="BUY_LONG")
+        self.assertEqual(got["decision"], "NONE")
+        self.assertIn("main_not_a_new_entry", got["reasons"])
+
+    def test_abstain_is_not_an_opposite_signal(self):
+        """`INSUFFICIENT_DATA` 不得当反向信号（§6 规则 5）。"""
+        got = self._decide(action="INSUFFICIENT_DATA", status="code_state_incomplete",
+                           data_status="invalid")
+        self.assertEqual(got["decision"], "NONE")
+        self.assertIn("independent_abstained", got["reasons"])
+
+    def test_code_hard_gate_is_a_hard_veto_independent_of_jev(self):
+        """代码硬门禁失败 ⇒ HARD_VETO，由代码产生，不需要 Jev 证明（§6 规则 1）。"""
+        got = self._decide(mode="shadow", action="BUY_LONG", hard_gates=False)
+        self.assertEqual(got["decision"], "HARD_VETO")
+        self.assertEqual(got["reasons"], ["code_hard_gate_failed"])
+
+    def test_hard_veto_code_only_caps_jev_at_soft(self):
+        """`R20_JEV_HARD_VETO_ONLY_CODE_GATES=1` ⇒ Jev 自身最高只能软否决。"""
+        capped = self._decide(mode="hard_veto")
+        self.assertEqual(capped["decision"], "SOFT_VETO")
+        uncapped = self._decide(mode="hard_veto")
+        uncapped = abt._jev_enforcement_decision(
+            mode="hard_veto", main_action="BUY_LONG",
+            independent={"suggested_action": "SELL_SHORT", "data_status": "valid",
+                         "action_status": "accepted"},
+            entry_mode="initial", hard_gates_passed=True, hard_veto_code_only=False)
+        self.assertEqual(uncapped["decision"], "HARD_VETO")
+
+
+class ProtectionIsNeverVetoedTest(_Harness):
+    """§9 阶段 D 的硬不变量：平仓保护、止损与交易所安全门禁**始终**由代码控制。
+
+    即使有人把档位设成 `soft_veto` / `hard_veto`，持仓通道也必须恒为
+    SHADOW、恒不影响执行 —— 保护单不能被一个影子信号拆掉。
+    """
+
+    probabilities: Dict[str, float] = {}
+
+    def test_position_lane_stays_shadow_under_any_mode(self):
+        for mode in ("shadow", "review", "soft_veto", "hard_veto"):
+            with patch.dict(os.environ, {"R20_JEV_ENFORCEMENT": mode}):
+                review = self.run_review(
+                    {"BTC-USDT-SWAP": "WAIT"},
+                    positions=[{"instId": "BTC-USDT-SWAP", "side": "long", "pos": 1.0,
+                                "avgPx": 100.0, "markPx": 101.0, "venue": "okx"}],
+                    management=[{"instId": "BTC-USDT-SWAP", "action": "HOLD"}])
+            pos = review["position_reviews"][0]
+            self.assertEqual(pos["jev_enforcement"], "SHADOW",
+                             f"{mode} 下持仓通道仍必须是 SHADOW")
+            self.assertEqual(pos["jev_enforcement_decision"], "SHADOW")
+            self.assertFalse(pos["jev_enforcement_affects_execution"])
+            self.assertEqual(pos["jev_enforcement_reasons"],
+                             ["protection_always_code_controlled"])
+
+    def test_candidate_lane_records_the_configured_mode(self):
+        """候选侧则必须如实记录配置档位（方案 §6 要求可配置可回滚）。"""
+        for mode, expected in (("review", "REVIEW"), ("soft_veto", "SOFT_VETO")):
+            with patch.dict(os.environ, {"R20_JEV_ENFORCEMENT": mode}):
+                review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
+            self.assertEqual(review["enforcement_mode"], mode)
+            self.assertTrue(review["enforcement_mode_valid"])
+            self.assertEqual(review["instrument_reviews"][0]["jev_enforcement"], expected)
+
+
 class JevVerdictHelperTest(unittest.TestCase):
     def test_audit_verdict_not_applicable_short_circuits(self):
         got = abt._jev_audit_verdict(["direction_conflict"], has_proposal=False)

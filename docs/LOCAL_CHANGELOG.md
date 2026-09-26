@@ -1,5 +1,53 @@
 # R20 本地改动记录
 
+## 2026-09-26（下半场之二）
+
+### Jev 执行档位：从「读了不生效」改为真正可配置
+
+问题：`enforcement_mode` 被硬编码成 `"shadow"`，`R20_JEV_ENFORCEMENT` 只被记进
+`configured_enforcement` —— 环境变量**读了却不生效**，而切换档位恰恰必须改代码，
+与方案 §6「`shadow`、`review`、`soft_veto` 必须可配置回滚，不得通过修改代码切换」
+正好相反。**已确认为漏实现**（原注释写的是防环境变量笔误的安全意图，但代价是档位
+不可配置，方向错了）。
+
+修复：
+
+- 新增 `_jev_resolve_enforcement`：解析 `R20_JEV_ENFORCEMENT`，接受
+  `shadow` / `review` / `soft_veto` / `hard_veto`（大小写与空白容忍）。
+  **非法值 fail-closed 回 `shadow`** —— 那是唯一在结构上不可能改变主脑执行的档位，
+  因此「防笔误把观察者变成门禁」这个原始安全意图被完整保留，同时档位可配置。
+- 新增 `_jev_enforcement_decision`：按方案 §9 阶段 C 逐候选判定「若该档位已启用，
+  本候选会被怎么处理」，并把 `jev_enforcement_decision` / `jev_enforcement_reasons`
+  落盘。判据：
+  - 只针对主脑**新开仓**（`entry_mode == "initial"`），加仓与持仓管理不适用；
+  - Jev 的 `data_status` 必须 `valid`，且**票决必须过门槛**；
+  - **弱票不算否决依据**：`low_confidence` / `ambiguous` / `not_ready` 表示「拿不准」，
+    不是「明确 WAIT」。把它当否决依据等于用弱信号推翻主脑，并把「模型犹豫」误读成
+    「模型反对」；
+  - 必须与主脑反向**或**明确 WAIT（`no_edge`），否则 `no_veto_grounds`；
+  - `INSUFFICIENT_DATA` 不得当反向信号（§6 规则 5）。
+- 代码硬门禁失败 ⇒ `HARD_VETO`，由代码产生、不需要 Jev 证明（§6 规则 1）。
+- 新增 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`（默认 1）：置 1 时 Jev 自身最高只能
+  到软否决，硬否决只允许来自代码门禁。放开时需显式设为 0。
+- **硬不变量**：持仓通道恒为 `SHADOW`、恒不影响执行，理由是
+  `protection_always_code_controlled` —— 即使有人把档位设成 `soft_veto` 或
+  `hard_veto`，也**改变不了保护单与止损**（§9 阶段 D：「平仓保护、止损和交易所
+  安全门禁始终由代码控制」）。
+- **`jev_enforcement_affects_execution` 恒为 `false`** 并显式落盘。阶段 C/D 的执行
+  门控需要样本外证据（§9 阶段 D）；在证据到位前把判定接到执行上，等于用未标定的
+  信号动真钱。写出来是为了让台账能自证这一点，而不是让读者去猜。
+- 测试 `test_no_mode_ever_affects_execution_yet` 是**看门狗**：若有人提前接通执行，
+  它会失败并提醒先拿出样本外证据。
+
+验证（定向套件）：
+
+- JEV 契约测试 **42/42** 通过，含新增三组：
+  `EnforcementModeIsConfigurableTest`（5 条）、`EnforcementDecisionCriteriaTest`
+  （10 条）、`ProtectionIsNeverVetoedTest`（2 条）。
+- 相关套件（JEV / 方向观测 / 网关调度 / 路由拆包 / 账户范围）**67/67** 通过。
+- 全量测试在本轮改动后跑过一次：失败集与改动前逐项相同（各 34 个既有失败），
+  零新增。后续不再重复跑全量（约 10 分钟），改用定向套件。
+
 ## 2026-09-26（下半场）
 
 ### Jev 独立通道：拆分「完整性 / 一致性 / 方向性优势」

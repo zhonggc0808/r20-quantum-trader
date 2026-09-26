@@ -2265,9 +2265,128 @@ def _jev_policy_relation(main_action: Any, independent_action: Any, *, data_stat
     return "ABSTAIN"
 
 
+#: 方案 §6 允许的执行档位，按强度递增。
+#:
+#: `shadow` 是唯一**在结构上不可能改变主脑执行**的档位，因此任何无法识别的配置值
+#: 都必须回落到它 —— 环境变量笔误绝不能把观察者变成门禁（fail-closed 到安全侧）。
+_JEV_ENFORCEMENT_MODES = ("shadow", "review", "soft_veto", "hard_veto")
+
+
+def _jev_resolve_enforcement(configured: Any) -> Dict[str, Any]:
+    """把 `R20_JEV_ENFORCEMENT` 解析成合法档位。
+
+    方案 §6 要求 `shadow` / `review` / `soft_veto` **可配置回滚、不得通过修改代码
+    切换**。此前的实现把 `enforcement_mode` 硬编码成 `"shadow"`，只把环境变量记进
+    `configured_enforcement` —— 于是环境变量**读了却不生效**，而切档位恰恰必须改
+    代码，与 §6 正好相反。
+    """
+    raw = str(configured or "").strip().lower()
+    if raw in _JEV_ENFORCEMENT_MODES:
+        return {"mode": raw, "configured": raw, "valid": True,
+                "reason": "configured"}
+    return {"mode": "shadow", "configured": raw, "valid": False,
+            "reason": "unknown_enforcement_falls_back_to_shadow"}
+
+
+def _jev_enforcement_decision(*, mode: str, main_action: Any, independent: Mapping[str, Any],
+                              entry_mode: str, hard_gates_passed: bool,
+                              hard_veto_code_only: bool = True) -> Dict[str, Any]:
+    """按方案 §9 判定本候选在各档位下**应当**被如何处理（只判定，不执行）。
+
+    返回的是「若该档位已启用，本候选会被怎么处理」，用于落盘与评估。它**不**改变
+    主脑动作：阶段 C/D 的执行门控需要先有样本外证据（§9 阶段 D），在没有证据之前
+    把判定接到执行上，等于用未标定的信号动真钱。
+
+    判据（§9 阶段 C，只针对主脑**新开仓**）：
+
+    - 主脑必须是入场动作，且 `entry_mode == "initial"`（加仓/持仓管理不适用）；
+    - Jev 的 `data_status` 必须是 `valid`（`INSUFFICIENT_DATA` 不得当反向信号）；
+    - 独立动作置信度与 margin 都已通过门槛（由调用方在 `data_status` 上体现）；
+    - 且与主脑**反向**，或明确 `WAIT`。
+    """
+    normalized_mode = str(mode or "shadow").strip().lower()
+    if normalized_mode not in _JEV_ENFORCEMENT_MODES:
+        normalized_mode = "shadow"
+    main = _jev_normalize_choice(main_action)
+    independent_action = _jev_normalize_choice(independent.get("suggested_action"))
+    data_status = str(independent.get("data_status") or "invalid")
+    action_status = str(independent.get("action_status") or "")
+    reasons: List[str] = []
+
+    # 代码硬门禁失败时，否决由代码产生，与 Jev 无关（§6 规则 1 / §9 阶段 D）。
+    if not hard_gates_passed:
+        return {"decision": "HARD_VETO", "mode": normalized_mode,
+                "reasons": ["code_hard_gate_failed"],
+                "affects_execution": False}
+
+    # §9 阶段 C 要求「独立动作置信度和 margin 都过门槛」。票决未过门槛时
+    # action_status 是 low_confidence / ambiguous / not_ready —— 那表示 Jev
+    # **拿不准**（或执行条件不备），不是「明确 WAIT」。把它算作否决依据，等于
+    # 用弱信号推翻主脑，且会把「模型犹豫」误读成「模型反对」。
+    passed_thresholds = action_status in {"accepted", "no_edge"}
+    explicit_wait = action_status == "no_edge"
+    opposite = (main in ENTRY_ACTIONS and independent_action in ENTRY_ACTIONS
+                and independent_action != main)
+
+    eligible = True
+    if main not in ENTRY_ACTIONS:
+        eligible = False
+        reasons.append("main_not_a_new_entry")
+    if str(entry_mode or "") != "initial":
+        eligible = False
+        reasons.append("not_an_initial_entry")
+    if data_status != "valid":
+        eligible = False
+        reasons.append("independent_data_status_not_valid")
+    if not passed_thresholds:
+        eligible = False
+        reasons.append("independent_thresholds_not_passed")
+    if independent_action == "INSUFFICIENT_DATA":
+        eligible = False
+        reasons.append("independent_abstained")
+    if main in ENTRY_ACTIONS and independent_action == main:
+        eligible = False
+        reasons.append("independent_agrees")
+    if eligible and not (opposite or explicit_wait):
+        # 过门槛但不是反向、也不是明确 WAIT ⇒ 没有否决依据（§9 阶段 C）。
+        eligible = False
+        reasons.append("no_veto_grounds")
+
+    if normalized_mode == "shadow":
+        return {"decision": "SHADOW", "mode": normalized_mode,
+                "reasons": reasons or ["shadow_mode_records_only"],
+                "affects_execution": False}
+    if normalized_mode == "review":
+        return {"decision": "REVIEW", "mode": normalized_mode,
+                "reasons": reasons or ["review_mode_flags_for_human"],
+                "affects_execution": False}
+    if normalized_mode == "hard_veto":
+        # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES=1`：硬否决只允许来自代码门禁
+        # （在上面的分支已返回）。Jev 自身的判定最高只能到软否决，因此这里与
+        # soft_veto 档位同解 —— 不满足条件时必须是 NONE，而不是假装有个候选。
+        if hard_veto_code_only:
+            return {"decision": "SOFT_VETO" if eligible else "NONE",
+                    "mode": normalized_mode,
+                    "reasons": (reasons + ["hard_veto_capped_to_soft_by_code_only_gate"]
+                                if eligible else
+                                reasons + ["hard_veto_capped_to_soft_by_code_only_gate",
+                                           "no_veto_grounds"]),
+                    "affects_execution": False}
+        return {"decision": "HARD_VETO" if eligible else "NONE",
+                "mode": normalized_mode, "reasons": reasons,
+                "affects_execution": False}
+    # soft_veto：标记待评估，不自行改变执行（§9 阶段 C）。
+    return {"decision": "SOFT_VETO_CANDIDATE" if eligible else "NONE",
+            "mode": normalized_mode,
+            "reasons": reasons or ["soft_veto_eligible"],
+            "affects_execution": False}
+
+
 def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
                        audit: Mapping[str, Any], enforcement: str = "shadow",
-                       hard_gates_passed: bool = True) -> Dict[str, Any]:
+                       hard_gates_passed: bool = True,
+                       entry_mode: str = "initial",
+                       hard_veto_code_only: bool = True) -> Dict[str, Any]:
     """Combine both Jev lanes without changing the executable main action."""
     independent_action = _jev_normalize_choice(independent.get("suggested_action"))
     audit_value = str(audit.get("verdict") or "REVIEW").upper()
@@ -2280,6 +2399,11 @@ def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
         data_status=data_status,
         audit_verdict_value=audit_value,
     )
+    enforcement_outcome = _jev_enforcement_decision(
+        mode=enforcement, main_action=main_action, independent=independent,
+        entry_mode=entry_mode, hard_gates_passed=hard_gates_passed,
+        hard_veto_code_only=hard_veto_code_only,
+    )
     return {
         "jev_independent_action": independent_action,
         "jev_independent_confidence": independent.get("confidence", 0.0),
@@ -2289,6 +2413,12 @@ def _jev_combine_candidate(*, main_action: Any, independent: Mapping[str, Any],
         "jev_audit_flags": list(audit.get("flags") or []),
         "jev_relation_to_main": decision_relation,
         "jev_enforcement": str(enforcement or "shadow").upper(),
+        "jev_enforcement_decision": enforcement_outcome["decision"],
+        "jev_enforcement_reasons": enforcement_outcome["reasons"],
+        # 本轮是否有任何档位**真的**改变了主脑执行。阶段 C/D 的执行门控需要样本外
+        # 证据（§9 阶段 D），因此当前恒为 False；写出来是为了让台账能自证这一点，
+        # 而不是让读者去猜。
+        "jev_enforcement_affects_execution": enforcement_outcome["affects_execution"],
         "main_action": _jev_normalize_choice(main_action),
         "execution_action": _jev_normalize_choice(main_action),
     }
@@ -2971,6 +3101,16 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         model, neutral_state, independent_questions, provider)
     audit_payload = _jev_shadow_provider_payload(
         model, audit_state, audit_questions, provider)
+    # 执行档位（方案 §6）必须在 `review` 字典之前解析：`review["enforcement_mode"]`
+    # 会被候选/持仓评审读取，且档位要求可配置回滚、不得靠改代码切换。
+    enforcement_resolution = _jev_resolve_enforcement(
+        os.environ.get("R20_JEV_ENFORCEMENT", "shadow"))
+    enforcement_mode = enforcement_resolution["mode"]
+    # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
+    # 硬否决只允许来自代码门禁（默认 1，即最保守）。
+    hard_veto_code_only = str(
+        os.environ.get("R20_JEV_HARD_VETO_ONLY_CODE_GATES", "1")
+    ).strip().lower() not in {"0", "false", "no", "off"}
     started = time.perf_counter()
     review_started_timestamp = time.time()
     cycle_id = (proposals[0].get("cycle_id") if proposals
@@ -3003,12 +3143,18 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         "audit_state_hash": _state_hash(audit_state),
         "independent_state": neutral_state,
         "audit_state": audit_state,
-        # Phase A is hard-coded shadow-only. Keep the requested value visible,
-        # but never let an environment typo turn this observer into a gate.
+        # 档位由 `R20_JEV_ENFORCEMENT` 决定（方案 §6 要求可配置回滚、不得靠改代码切换）。
+        # 非法/未知值 fail-closed 回 `shadow`——那是唯一在结构上不可能改变主脑执行的
+        # 档位，因此环境变量笔误只会让观察者保持观察。
         "configured_enforcement": (
             os.environ.get("R20_JEV_ENFORCEMENT", "shadow").strip().lower() or "shadow"
         ),
-        "enforcement_mode": "shadow",
+        "enforcement_mode": enforcement_mode,
+        "enforcement_mode_valid": enforcement_resolution["valid"],
+        "enforcement_mode_reason": enforcement_resolution["reason"],
+        # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
+        # 硬否决只允许来自代码门禁。
+        "hard_veto_code_only": hard_veto_code_only,
     }
 
     def _request_lane(channel: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3168,6 +3314,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             },
             audit=audit,
             enforcement=review["enforcement_mode"],
+            entry_mode=str(proposal.get("entry_mode") or "initial"),
+            hard_veto_code_only=review.get("hard_veto_code_only", True),
         )
         return {
             "instId": proposal["instId"],
@@ -3272,6 +3420,14 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "management_warranted": management_warranted,
             "management_warranted_probability": _jev_policy_probability(
                 management_warranted),
+            # §9 阶段 D 的硬不变量：**平仓保护、止损与交易所安全门禁始终由代码
+            # 控制**，任何档位下 Jev 都不得否决它们。因此持仓通道的判定恒为
+            # SHADOW、恒不影响执行 —— 即使有人把 R20_JEV_ENFORCEMENT 设成
+            # soft_veto/hard_veto，也改变不了保护单与止损。
+            "jev_enforcement": "SHADOW",
+            "jev_enforcement_decision": "SHADOW",
+            "jev_enforcement_reasons": ["protection_always_code_controlled"],
+            "jev_enforcement_affects_execution": False,
             "suggested_action": action,
             "suggested_action_votes": {
                 "HOLD": independent_answers.get(f"{prefix}_would_hold"),
@@ -3290,7 +3446,6 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "audit_verdict": audit["verdict"],
             "decision_relation": relation,
             "jev_relation_to_main": relation,
-            "jev_enforcement": review["enforcement_mode"].upper(),
         }
 
     # The market quote used to score a delayed Jev paper entry is refreshed only
