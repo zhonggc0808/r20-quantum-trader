@@ -1566,6 +1566,32 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                      _jev_shadow_float(package.get("askPx"), 0.0),
         }
 
+    def capture_horizon(
+            item: Dict[str, Any], field: str, value: Optional[float], source: str,
+            target_ts: float, observed_ts: float, *,
+            terminal_source: bool = False, allow_baseline_late: bool = False) -> bool:
+        """Capture one fixed horizon once; reject stale mark snapshots."""
+        if item.get(field) is not None:
+            return True
+        status_key = f"{field}_measurement_status"
+        if item.get(status_key) == "missed_target_window":
+            return False
+        lag = max(0.0, observed_ts - target_ts)
+        item[f"{field}_target_at"] = target_ts
+        item[f"{field}_observed_at"] = observed_ts
+        item[f"{field}_lag_seconds"] = lag
+        if (not terminal_source and not allow_baseline_late
+                and lag > cycle_seconds + 1e-9):
+            item[status_key] = "missed_target_window"
+            item[f"{field}_miss_reason"] = "observation_lag_exceeded_cycle"
+            return False
+        if value is None:
+            return False
+        item[field] = value
+        item[f"{field}_source"] = source
+        item[status_key] = "observed"
+        return True
+
     try:
         from r20_backend.file_locks import file_lock
         retention_days = max(14, min(int(os.environ.get(
@@ -1698,56 +1724,53 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                         _jev_shadow_float(item.get("max_adverse_excursion"), 0.0), pnl["net"])
                     item["max_favorable_excursion"] = max(
                         _jev_shadow_float(item.get("max_favorable_excursion"), 0.0), pnl["net"])
-                    if elapsed >= cycle_seconds and item.get("pnl_after_1_cycle") is None:
-                        item["pnl_after_1_cycle"] = pnl["net"]
-                        item["pnl_after_1_cycle_source"] = "mark_to_market"
-                        item["pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
-                        item["pnl_after_1_cycle_observed_at"] = now_ts
-                        item["pnl_after_1_cycle_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + cycle_seconds))
-                    if elapsed >= horizon_seconds and item.get("pnl_after_4h") is None:
-                        item["pnl_after_4h"] = pnl["net"]
-                        item["pnl_after_4h_source"] = "mark_to_market"
-                        item["pnl_after_4h_target_at"] = item_ts + horizon_seconds
-                        item["pnl_after_4h_observed_at"] = now_ts
-                        item["pnl_after_4h_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + horizon_seconds))
-                elif jev_status == "WAIT_BASELINE":
+                    if elapsed >= cycle_seconds:
+                        capture_horizon(
+                            item, "pnl_after_1_cycle", pnl["net"],
+                            "mark_to_market", item_ts + cycle_seconds, now_ts)
+                    if elapsed >= horizon_seconds:
+                        capture_horizon(
+                            item, "pnl_after_4h", pnl["net"],
+                            "mark_to_market", item_ts + horizon_seconds, now_ts)
+                elif jev_status in {"WAIT_BASELINE", "NO_EDGE"}:
                     item["jev_delayed_entry_pnl"] = None
                     item["jev_no_entry_pnl"] = 0.0
-                    if elapsed >= cycle_seconds and item.get("pnl_after_1_cycle") is None:
-                        item["pnl_after_1_cycle"] = 0.0
-                        item["pnl_after_1_cycle_source"] = "no_entry_baseline"
-                        item["pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
-                        item["pnl_after_1_cycle_observed_at"] = now_ts
-                        item["pnl_after_1_cycle_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + cycle_seconds))
-                    if elapsed >= horizon_seconds and item.get("pnl_after_4h") is None:
-                        item["pnl_after_4h"] = 0.0
-                        item["pnl_after_4h_source"] = "no_entry_baseline"
-                        item["pnl_after_4h_target_at"] = item_ts + horizon_seconds
-                        item["pnl_after_4h_observed_at"] = now_ts
-                        item["pnl_after_4h_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + horizon_seconds))
+                    if elapsed >= cycle_seconds:
+                        capture_horizon(
+                            item, "pnl_after_1_cycle", 0.0,
+                            "no_entry_baseline", item_ts + cycle_seconds, now_ts,
+                            allow_baseline_late=True)
+                    if elapsed >= horizon_seconds:
+                        capture_horizon(
+                            item, "pnl_after_4h", 0.0,
+                            "no_entry_baseline", item_ts + horizon_seconds, now_ts,
+                            allow_baseline_late=True)
 
-                if elapsed >= cycle_seconds and item.get("main_pnl_after_1_cycle") is None:
-                    if item.get("main_trade_pnl") is not None:
-                        item["main_pnl_after_1_cycle"] = item["main_trade_pnl"]
-                        item["main_pnl_after_1_cycle_source"] = item.get(
-                            "main_trade_pnl_source", "mark_to_market")
-                        item["main_pnl_after_1_cycle_target_at"] = item_ts + cycle_seconds
-                        item["main_pnl_after_1_cycle_observed_at"] = now_ts
-                        item["main_pnl_after_1_cycle_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + cycle_seconds))
-                if elapsed >= horizon_seconds and item.get("main_pnl_after_4h") is None:
-                    if item.get("main_trade_pnl") is not None:
-                        item["main_pnl_after_4h"] = item["main_trade_pnl"]
-                        item["main_pnl_after_4h_source"] = item.get(
-                            "main_trade_pnl_source", "mark_to_market")
-                        item["main_pnl_after_4h_target_at"] = item_ts + horizon_seconds
-                        item["main_pnl_after_4h_observed_at"] = now_ts
-                        item["main_pnl_after_4h_lag_seconds"] = max(
-                            0.0, now_ts - (item_ts + horizon_seconds))
+                main_source = str(item.get("main_trade_pnl_source") or "")
+                main_terminal = main_source in {
+                    "actual_close", "trading_ledger", "live_position_close_net"}
+                if elapsed >= cycle_seconds:
+                    if item.get("main_action") == "WAIT":
+                        capture_horizon(
+                            item, "main_pnl_after_1_cycle", 0.0,
+                            "no_entry_baseline", item_ts + cycle_seconds, now_ts,
+                            allow_baseline_late=True)
+                    elif item.get("main_trade_pnl") is not None:
+                        capture_horizon(
+                            item, "main_pnl_after_1_cycle", item["main_trade_pnl"],
+                            main_source or "mark_to_market", item_ts + cycle_seconds,
+                            now_ts, terminal_source=main_terminal)
+                if elapsed >= horizon_seconds:
+                    if item.get("main_action") == "WAIT":
+                        capture_horizon(
+                            item, "main_pnl_after_4h", 0.0,
+                            "no_entry_baseline", item_ts + horizon_seconds, now_ts,
+                            allow_baseline_late=True)
+                    elif item.get("main_trade_pnl") is not None:
+                        capture_horizon(
+                            item, "main_pnl_after_4h", item["main_trade_pnl"],
+                            main_source or "mark_to_market", item_ts + horizon_seconds,
+                            now_ts, terminal_source=main_terminal)
 
                 if item.get("main_trade_pnl") is not None and item.get("jev_delayed_entry_pnl") is not None:
                     item["jev_minus_main_pnl"] = (
@@ -1900,7 +1923,12 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                         "review_status": review.get("status", "unknown"),
                         "review_error": review.get("error", ""),
                         "main_action": main_action,
+                        "main_raw_action": proposal.get("main_raw_action", main_action),
                         "main_confidence": proposal.get("confidence", 0),
+                        "main_raw_confidence": proposal.get("main_raw_confidence", proposal.get("confidence", 0)),
+                        "main_decision_reason": proposal.get("main_decision_reason", ""),
+                        "main_decision_outcome_source": proposal.get("main_decision_outcome_source", "unknown"),
+                        "main_decision_rejection_code": proposal.get("main_decision_rejection_code", ""),
                         "main_entry_price": main_requested,
                         "main_executable_entry_price": main_quote,
                         "jev_action": jev_action,
@@ -2747,6 +2775,11 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "decision_timestamp": row.get("timestamp", 0),
             "action": main_action,
             "confidence": decision.get("confidence", 0),
+            "main_raw_action": decision.get("raw_action", main_action),
+            "main_raw_confidence": decision.get("raw_confidence", decision.get("confidence", 0)),
+            "main_decision_reason": decision.get("summary_reason", ""),
+            "main_decision_outcome_source": decision.get("decision_outcome_source", "unknown"),
+            "main_decision_rejection_code": decision.get("decision_rejection_code", ""),
             "leverage": decision.get("leverage", 0),
             "margin_usdt": decision.get("margin_usdt", 0),
             "shadow_margin_usdt": shadow_margin,
@@ -3370,6 +3403,13 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "cycle_id": proposal.get("cycle_id", ""),
             "decision_id": proposal.get("decision_id", ""),
             "main_action": proposal.get("action", "WAIT"),
+            "main_raw_action": proposal.get("main_raw_action", proposal.get("action", "WAIT")),
+            "main_confidence": proposal.get("confidence", 0),
+            "main_raw_confidence": proposal.get("main_raw_confidence", proposal.get("confidence", 0)),
+            "main_decision_reason": proposal.get("main_decision_reason", ""),
+            "main_decision_outcome_source": proposal.get("main_decision_outcome_source", "unknown"),
+            "main_decision_rejection_code": proposal.get("main_decision_rejection_code", ""),
+            "entry_mode": proposal.get("entry_mode", "initial"),
             "direction_consistent": independent_answers.get(f"{prefix}_direction_consistent"),
             "execution_ready": execution_ready,
             # 代码侧的完整性与一致性判定（拆分后 INSUFFICIENT_DATA 的唯一来源）。

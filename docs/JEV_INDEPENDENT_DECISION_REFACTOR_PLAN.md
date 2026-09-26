@@ -316,6 +316,42 @@ persist_shadow_review(
 
 不能只统计同意率。至少计算扣除费用和滑点后的收益、平均 R、胜率、最大回撤、交易次数、尾部亏损，以及 Choice 概率的校准误差。概率校准应使用固定时间点样本，不能用未来数据回填当时的输入。
 
+只读评估工具落在 `scripts/jev_shadow_evaluator.py`，默认读取 review 与 entry outcome
+JSONL，并通过唯一 `decision_id` 关联。工具不修改台账、不默认写报告文件：
+
+```bash
+.venv/bin/python scripts/jev_shadow_evaluator.py --semantics-version latest --horizon both
+.venv/bin/python scripts/jev_shadow_evaluator.py --semantics-version latest --format json
+```
+
+评估口径必须满足：
+
+- `question_semantics_version` 和费用/滑点假设分别成 cohort，禁止跨组求均值；
+- `no_entry_baseline` 不计入测量收益，只能在 source 明确且 value 恰为 `0` 时作为 WAIT policy baseline；缺值或非零值必须标为无效来源，禁止静默补零；
+- 每类同时输出 total、matured、measured、baseline、excluded 和 source 分布；
+- `n < 30` 为证据不足，`30 <= n < 100` 仅供探索，`n >= 100` 才进入决策评估；
+- 当前纸面 entry 没有统一风险单位，平均 R 必须标记为不支持；当前三个独立 Noul
+  分数不是互斥 Choice 概率，Choice 校准误差也必须标记为不支持，不得伪造数值。
+- entry 实验只接受 `entry_mode=initial|scale_in`；`position_management` 属于持仓通道，
+  即使 Jev 给出方向也必须归为 `OUT_OF_SCOPE`，不得伪造一笔新开仓；
+- `main=WAIT + Jev=WAIT + no_edge` 单列为 `BOTH_WAIT_NO_EDGE`，用于描述双方一致不入场，
+  不进入收益证据门禁，也不再与持仓管理记录混入 `OUT_OF_SCOPE`；
+- 诊断区必须列出 `entry_mode`、纸面 entry 状态、成熟度、缺失收益原因，以及主脑
+  `decision_outcome_source` / `decision_rejection_code` 分布；quote/RR 拒绝码必须来自
+  `order_risk` 的结构化 detailed API，不得解析人类文本；历史台账缺少新字段时明确显示
+  `missing`；
+- relation 漂移不能只输出累计裸数字；必须给出首末 mismatch 时间、最新匹配时间、
+  末次 mismatch 后的干净记录数和北京时间小时分布；只有 mismatch 真正位于全部干净记录之前才可称为历史前缀，中段漂移必须单独标识；
+- 终端摘要必须独立显示 baseline source rows，不能用 `matured` 代替，避免把
+  `no_entry_baseline` 误读为测量失败。
+- sample-sequence drawdown 必须携带 overlap factor：默认 1cycle 为约 1x、可作近似序列
+  代理；4h 为约 16x、`drawdown_meaningful=false`，只能描述，不能用于阶段决策；同一时间戳的多标的收益必须先聚合再累计，避免文件顺序改变回撤。
+- `--since/--until` 遵循北京时间契约：无 offset 文本按北京时间，epoch 秒不平移，epoch 毫秒先归一化为秒；报告回显统一为 `+08:00`。
+- 固定 horizon 的 `mark_to_market` / `live_position_mark_net` 只接受不超过一个轮询周期的观察滞后；超窗记录为 `missed_target_window`，不写入收益。`actual_close`、`trading_ledger`、`live_position_close_net` 属于终态来源，不受该快照窗口限制。
+- `NO_EDGE` 与 Jev `WAIT` 都必须写显式 `no_entry_baseline=0`；主脑 `WAIT` 也写对应的 main baseline，不能因没有真实开仓而留下未配对的空值。
+- relation 诊断必须区分已校验匹配、mismatch、缺失 recorded relation 和无 expected relation；未校验记录不能计入 clean tail，且必须标出末次 mismatch 后的未校验数量。
+- 主脑诊断必须同时保留未经归一化的 `raw_action` 和未经 clamp 的 `raw_confidence`；不支持的动作归为 `unsupported_action`，不得伪装成模型主动 `WAIT`。
+
 ## 9. 灰度阶段
 
 ### 阶段 A：双通道影子

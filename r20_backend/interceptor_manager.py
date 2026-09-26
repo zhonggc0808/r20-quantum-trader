@@ -316,26 +316,44 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
     - If all checks & enabled plugins pass: returns (raw_action, "", rr)
     - If any check or plugin rejects: returns ("WAIT", rejection_reason, rr)
     """
-    from scripts.order_risk import validate_quote_geometry_and_rr
+    from scripts.order_risk import (
+        validate_quote_geometry_and_rr, validate_quote_geometry_and_rr_detailed,
+    )
 
     inst_id = str(package.get("instId") or "")
-    raw_action = str(decision.get("action", "WAIT")).upper()
-    if raw_action not in {"BUY_LONG", "SELL_SHORT", "WAIT"}:
-        raw_action = "WAIT"
+    raw_action = str(decision.get("action", "WAIT") or "WAIT").strip().upper()
+
+    def _finish(final_action: str, reason: str, rr: float,
+                outcome_source: str, rejection_code: str) -> tuple[str, str, float]:
+        # Preserve the public tuple contract; context carries structured telemetry.
+        context["_decision_trace"] = {
+            "raw_action": raw_action,
+            "final_action": final_action,
+            "outcome_source": outcome_source,
+            "rejection_code": rejection_code,
+        }
+        return final_action, reason, rr
 
     entry = decision.get("entry_price")
     tp = decision.get("take_profit_price")
     sl = decision.get("stop_loss_price")
 
+    if raw_action not in {"BUY_LONG", "SELL_SHORT", "WAIT"}:
+        return _finish(
+            "WAIT", f"核心风控拦截：不支持的动作 {raw_action!r}", 0.0,
+            "interceptor_reject", "unsupported_action",
+        )
+
     # If already WAIT, return immediately
     if raw_action == "WAIT":
         # Calculate rr if possible for telemetry, but never open
         _, _, rr_val = validate_quote_geometry_and_rr("BUY_LONG" if str(entry or 0) > str(sl or 0) else "SELL_SHORT", entry, tp, sl)
-        return "WAIT", "", rr_val
+        return _finish("WAIT", "", rr_val, "model_wait", "model_wait")
 
     # 1. Base Core Pre-check: Data Completeness & Direction Collisions
     if package.get("data_quality") != "valid":
-        return "WAIT", "关键原始行情不完整，安全降级为 WAIT。", 0.0
+        return _finish("WAIT", "关键原始行情不完整，安全降级为 WAIT。", 0.0,
+                       "interceptor_reject", "data_quality_invalid")
 
     active_inst_ids = context.get("active_inst_ids", set())
     active_position_sides = context.get("active_position_sides", {})
@@ -343,22 +361,27 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         pos_side = active_position_sides.get(inst_id, "")
         is_same = (pos_side == "long" and raw_action == "BUY_LONG") or (pos_side == "short" and raw_action == "SELL_SHORT")
         if not is_same:
-            return "WAIT", "已有反向或不兼容持仓，禁止借决策通道反向开仓，安全降级为 WAIT。", 0.0
+            return _finish("WAIT", "已有反向或不兼容持仓，禁止借决策通道反向开仓，安全降级为 WAIT。", 0.0,
+                           "interceptor_reject", "position_conflict")
 
     # 2. Non-Bypassable Core Safety Floor: Finite values, Geometry & Global Minimum RR >= 2.0
-    quote_valid, quote_reason, rr = validate_quote_geometry_and_rr(raw_action, entry, tp, sl)
+    quote_valid, quote_reason, rr, quote_code = validate_quote_geometry_and_rr_detailed(
+        raw_action, entry, tp, sl)
     if not quote_valid:
-        return "WAIT", quote_reason, rr
+        return _finish("WAIT", quote_reason, rr,
+                       "interceptor_reject", quote_code)
 
     # 3. Non-Bypassable Core Safety Floor: Confidence threshold (per-instrument conf_floor from pool, global default 75%)
     try:
         conf = float(decision.get("confidence", 0) or 0)
     except (TypeError, ValueError):
-        return "WAIT", "核心风控拦截：置信度必须是有效数字", rr
+        return _finish("WAIT", "核心风控拦截：置信度必须是有效数字", rr,
+                       "interceptor_reject", "confidence_invalid")
 
     conf_floor = _conf_floor_for(inst_id)
     if conf < conf_floor:
-        return "WAIT", f"核心风控拦截：置信度低于安全底线 ({conf:.1f}% < {conf_floor:.1f}%)", rr
+        return _finish("WAIT", f"核心风控拦截：置信度低于安全底线 ({conf:.1f}% < {conf_floor:.1f}%)", rr,
+                       "interceptor_reject", "confidence_below_floor")
 
     # 4. Pipeline Execution across all enabled plugins (with input isolation & fail-closed)
     plugins = list_plugins(create_if_missing=False)
@@ -369,12 +392,14 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         filename = p_info["filename"]
         file_path = PLUGINS_DIR / filename
         if not file_path.exists():
-            return "WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 文件缺失，安全降级为 WAIT", rr
+            return _finish("WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 文件缺失，安全降级为 WAIT", rr,
+                           "interceptor_error", "plugin_missing")
 
         try:
             mod = _load_module_from_file(file_path)
             if not hasattr(mod, "check_risk"):
-                return "WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 缺少 check_risk 入口，安全降级为 WAIT", rr
+                return _finish("WAIT", f"风控拦截拦截：启用的风控插件 [{filename}] 缺少 check_risk 入口，安全降级为 WAIT", rr,
+                               "interceptor_error", "plugin_contract_invalid")
 
             # Deepcopy inputs so user plugins cannot mutate decision/package to bypass core checks
             p_pkg = copy.deepcopy(package)
@@ -383,12 +408,14 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
 
             passed, reason = mod.check_risk(p_pkg, p_dec, p_ctx)
             if not passed:
-                return "WAIT", str(reason or f"触发风控拦截插件 [{p_info.get('name', filename)}] 规则"), rr
+                return _finish("WAIT", str(reason or f"触发风控拦截插件 [{p_info.get('name', filename)}] 规则"), rr,
+                               "interceptor_reject", "plugin_reject")
         except Exception as e:
             logger.error("Error executing interceptor plugin %s: %s", filename, e)
-            return "WAIT", f"风控插件 [{p_info.get('name', filename)}] 运行异常: {e}，安全降级为 WAIT", rr
+            return _finish("WAIT", f"风控插件 [{p_info.get('name', filename)}] 运行异常: {e}，安全降级为 WAIT", rr,
+                           "interceptor_error", "plugin_error")
 
-    return raw_action, "", rr
+    return _finish(raw_action, "", rr, "accepted_entry", "")
 
 
 def run_sandbox_test(custom_scenario: Optional[dict[str, Any]] = None) -> dict[str, Any]:

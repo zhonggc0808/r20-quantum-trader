@@ -126,6 +126,12 @@ class InjectionContractTest(unittest.TestCase):
         # 契约：4 个位置参数（门面负责 curry safe_float）
         def spy(p, d_item, active_inst_ids, active_position_sides):
             calls.append(d_item.get("action"))
+            d_item["_decision_trace"] = {
+                "raw_action": "BUY_LONG",
+                "final_action": "WAIT",
+                "outcome_source": "interceptor_reject",
+                "rejection_code": "confidence_below_floor",
+            }
             return "WAIT", "哨兵理由", 0.0
 
         entry = decisions.assemble_decision_cache(
@@ -141,6 +147,22 @@ class InjectionContractTest(unittest.TestCase):
         self.assertEqual(calls, ["WAIT"], "装配器没有走注入的 validate")
         self.assertEqual(entry["decision"]["action"], "WAIT")
         self.assertEqual(entry["decision"]["summary_reason"], "哨兵理由")
+        self.assertEqual(entry["decision"]["raw_action"], "BUY_LONG")
+        self.assertEqual(entry["decision"]["decision_outcome_source"], "interceptor_reject")
+        self.assertEqual(entry["decision"]["decision_rejection_code"], "confidence_below_floor")
+
+    def test_cache_preserves_raw_confidence_and_unsupported_action(self):
+        decision = dict(_DECISION, action="BROKEN", confidence=150.0)
+        entry = _call(
+            decisions_dict={"BTC-USDT-SWAP": decision},
+        )["BTC-USDT-SWAP"]["decision"]
+
+        self.assertEqual(entry["action"], "WAIT")
+        self.assertEqual(entry["raw_action"], "BROKEN")
+        self.assertEqual(entry["confidence"], 100.0)
+        self.assertEqual(entry["raw_confidence"], 150.0)
+        self.assertEqual(entry["decision_outcome_source"], "interceptor_reject")
+        self.assertEqual(entry["decision_rejection_code"], "unsupported_action")
 
 
 class SubmoduleContractTest(unittest.TestCase):

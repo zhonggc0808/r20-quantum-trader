@@ -11,7 +11,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from scripts.order_risk import validate_quote_geometry_and_rr
+from scripts.order_risk import (
+    validate_quote_geometry_and_rr, validate_quote_geometry_and_rr_detailed,
+)
 import r20_backend.interceptor_manager as im
 
 
@@ -63,6 +65,19 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         self.assertIn("盈亏比不足 2.0", reason)
         self.assertAlmostEqual(rr, 1.5)
 
+    def test_quote_validation_exposes_structured_failure_codes(self):
+        cases = [
+            (("BUY_LONG", "bad", 120.0, 90.0), "quote_parse_error"),
+            (("BUY_LONG", 100.0, 120.0, 105.0), "quote_geometry_invalid"),
+            (("BUY_LONG", 100.0, 115.0, 90.0), "rr_below_floor"),
+        ]
+        for args, expected_code in cases:
+            with self.subTest(code=expected_code):
+                valid, reason, _rr, code = validate_quote_geometry_and_rr_detailed(*args)
+                self.assertFalse(valid)
+                self.assertTrue(reason)
+                self.assertEqual(code, expected_code)
+
     def test_quote_geometry_and_rr_non_finite_or_nan(self):
         ok, reason, _ = validate_quote_geometry_and_rr("BUY_LONG", float("nan"), 120.0, 90.0)
         self.assertFalse(ok)
@@ -71,6 +86,22 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         ok, reason, _ = validate_quote_geometry_and_rr("BUY_LONG", 100.0, float("inf"), 90.0)
         self.assertFalse(ok)
         self.assertIn("有限数值", reason)
+
+    def test_pipeline_rejects_unsupported_action_without_losing_raw_value(self):
+        pkg = {"instId": "BTC-USDT-SWAP", "data_quality": "valid"}
+        ctx = {"active_inst_ids": set(), "active_position_sides": {}}
+        decision = {"action": "BROKEN", "confidence": 90.0}
+
+        action, reason, rr = im.run_interceptor_pipeline(pkg, decision, ctx)
+
+        self.assertEqual(action, "WAIT")
+        self.assertEqual(rr, 0.0)
+        self.assertIn("不支持的动作", reason)
+        self.assertEqual(ctx["_decision_trace"]["raw_action"], "BROKEN")
+        self.assertEqual(
+            ctx["_decision_trace"]["rejection_code"], "unsupported_action")
+        self.assertEqual(
+            ctx["_decision_trace"]["outcome_source"], "interceptor_reject")
 
     def test_pipeline_core_floor_active_when_all_plugins_disabled(self):
         # Set all plugins to disabled in config
@@ -84,12 +115,15 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         act, reason, _ = im.run_interceptor_pipeline(pkg, dec, ctx)
         self.assertEqual(act, "WAIT")
         self.assertIn("置信度低于安全底线", reason)
+        self.assertEqual(ctx["_decision_trace"]["outcome_source"], "interceptor_reject")
+        self.assertEqual(ctx["_decision_trace"]["rejection_code"], "confidence_below_floor")
 
         # Insufficient RR (< 2.0)
         dec = {"action": "BUY_LONG", "confidence": 85.0, "entry_price": 100.0, "take_profit_price": 110.0, "stop_loss_price": 90.0}
         act, reason, rr = im.run_interceptor_pipeline(pkg, dec, ctx)
         self.assertEqual(act, "WAIT")
         self.assertIn("盈亏比不足 2.0", reason)
+        self.assertEqual(ctx["_decision_trace"]["rejection_code"], "rr_below_floor")
 
         # DOGE confidence floor 80
         pkg_doge = {"instId": "DOGE-USDT-SWAP", "data_quality": "valid"}
@@ -104,6 +138,8 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         self.assertEqual(act, "BUY_LONG")
         self.assertEqual(reason, "")
         self.assertAlmostEqual(rr, 2.5)
+        self.assertEqual(ctx["_decision_trace"]["outcome_source"], "accepted_entry")
+        self.assertEqual(ctx["_decision_trace"]["rejection_code"], "")
 
     def test_pipeline_fail_closed_when_plugin_missing_file_or_entry(self):
         # Configure an enabled plugin that does not exist on disk

@@ -50,6 +50,55 @@
 
 ## 2026-09-26（下半场）
 
+### Jev 只读影子评估工具
+
+- 新增 `scripts/jev_shadow_evaluator.py`：只读关联 review/outcome JSONL，默认按最新
+  `question_semantics_version` 评估，支持终端摘要和 JSON stdout。
+- 强制按语义版本和费用假设分 cohort；重复键、关联失败、损坏 JSON、relation 漂移、
+  未成熟 horizon 与收益来源均单独计数，避免把数据缺口解释成策略结论。
+- `no_entry_baseline` 不进入测量收益均值，只在 `WAIT_VS_ENTRY` /
+  `MAIN_WAIT_JEV_ENTRY` 中作为显式 policy baseline 参与配对差值。
+- 每类/每 horizon 输出净收益、胜率及 Wilson 区间、尾部、样本序列最大回撤和
+  Jev-minus-main；样本门禁为 `<30` 证据不足、`30-99` 仅探索、`>=100` 可评估。
+- 当前平均 R 与 Choice 校准不具备合法输入，明确输出 `unsupported`，不制造伪指标。
+- P1 修正实验范围：`position_management` 统一归为 `OUT_OF_SCOPE`，不再把已有
+  持仓上的方向回答伪造成独立新开仓样本。
+- P1 增加纸面状态、成熟度和收益缺失原因诊断，区分“未成熟”“策略基线”与
+  “成熟后仍无测量值”。
+- P2 为主脑决策增加结构化 `decision_outcome_source` 和 `decision_rejection_code`，
+  保持拦截器 `(action, reason, rr)` 接口不变，并贯穿 decision cache、Jev review 和
+  entry outcome；评估器可区分模型主动 WAIT、风控拒绝和拦截器异常。
+- P2 历史记录不会回填猜测值，统一显示 `missing`；从新周期开始累积可解释分布，
+  在有证据前不调整主脑入场门槛。
+- P2 将原 `quote_geometry_or_rr` 拆为 `quote_parse_error`、
+  `quote_geometry_invalid`、`risk_unit_invalid`、`rr_calculation_error`、
+  `rr_below_floor`、`rr_above_ceiling` 等源头结构化 code；既有三元组 API 保持兼容。
+- 新增 `BOTH_WAIT_NO_EDGE` 描述类，保留主脑与 Jev 一致不入场的信息，但不把
+  确定性零收益当成策略证据。
+- 回撤统计增加 `drawdown_overlap_factor`、`drawdown_meaningful` 和解释标签；默认
+  1cycle 为约 1x 近似代理，4h 为约 16x 高重叠、仅供描述。
+- relation mismatch 不再只输出累计数：新增首末 mismatch、最新记录、末次 mismatch
+  后记录数及北京时间小时分布；摘要可明确区分历史前缀漂移与当前持续异常。
+- 摘要表新增 `baseline` 列，来自源台账中的 baseline 行数；`matured`、`baseline`、
+  `measured` 三者分开展示，避免将无入场基线误读为收益测量失败。
+- 修复评估器 `--since/--until` 的时区契约：无 offset 文本现在通过
+  `r20_backend.time_utils.parse_beijing` 按北京时间解释，epoch 和显式 offset 保持原瞬间；
+  JSON 报告的 `generated_at/since/until` 统一回显 `+08:00`，避免静默偏移 8 小时。
+- 补齐评估器边界契约：epoch 毫秒会先归一化为秒；`no_entry_baseline` 仅接受显式 `0`，
+  缺值或非零值标为无效且不能生成配对收益；同一时间戳的多标的收益先聚合再计算序列回撤，
+  消除记录顺序对最大回撤的影响。
+- 修正 relation mismatch 范围命名：只有 mismatch 位于全部干净记录之前才标
+  `historical_prefix`；历史中段异常但后续恢复改标 `historical_segment_with_clean_tail`，
+  避免把 45 条旧漂移误写成“历史前缀”。
+- 修正 P2 原始诊断：不支持的模型动作保留原值并记为 `unsupported_action`，不再先归一化为
+  `WAIT/model_wait`；`raw_confidence` 保存 clamp 前输入，`confidence` 继续保存执行使用的 0-100 值。
+- 评估器将 `trading_ledger` 识别为真实终态收益来源；对有明确观测滞后的市价快照，超过一个轮询周期的
+  `mark_to_market` / `live_position_mark_net` 不再计为测量，报告为 `observation_lag_exceeded`。
+- 采集器固定 horizon 超窗时写 `missed_target_window` 且不重试；成交/平仓终态仍可结算。
+- 补齐 `NO_EDGE`、Jev `WAIT` 和主脑 `WAIT` 的显式 `no_entry_baseline`，避免基线缺失造成假性未配对。
+- relation 诊断新增 validated/missing/unvalidated 计数；缺关系记录不再被计入 mismatch 后的 clean tail。
+- 修复评估器两处诊断边界：市价快照存在但 `lag_seconds` 非法时标记为 `observation_lag_invalid`；`main_raw_action_counts` 保留 `HOLD/NONE` 等原始动作，不再套用 WAIT 别名。
+
 ### Jev 关系分类与兼容票绝对尺度修复
 
 - 修复主脑 `WAIT` 时审计 `NOT_APPLICABLE` 覆盖独立关系的问题：审计不适用只说明

@@ -45,12 +45,16 @@ def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], acti
     }
     try:
         from r20_backend.interceptor_manager import run_interceptor_pipeline
-        return run_interceptor_pipeline(p, d_item, context)
+        result = run_interceptor_pipeline(p, d_item, context)
+        trace = context.get("_decision_trace")
+        if isinstance(trace, dict):
+            d_item["_decision_trace"] = dict(trace)
+        return result
     except Exception as exc:
         # Fail-closed fallback in case interceptor manager cannot be reached
-        raw_action = str((d_item or {}).get("action", "WAIT")).upper()
-        if raw_action not in {"BUY_LONG", "SELL_SHORT", "WAIT"}:
-            raw_action = "WAIT"
+        raw_action = str(
+            (d_item or {}).get("action", "WAIT") or "WAIT"
+        ).strip().upper()
         entry = safe_float((d_item or {}).get("entry_price"))
         take_profit = safe_float((d_item or {}).get("take_profit_price"))
         stop_loss = safe_float((d_item or {}).get("stop_loss_price"))
@@ -59,6 +63,12 @@ def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], acti
             rr = (take_profit - entry) / (entry - stop_loss)
         elif raw_action == "SELL_SHORT" and stop_loss > entry > take_profit > 0:
             rr = (entry - take_profit) / (stop_loss - entry)
+        d_item["_decision_trace"] = {
+            "raw_action": raw_action,
+            "final_action": "WAIT",
+            "outcome_source": "interceptor_error",
+            "rejection_code": "interceptor_manager_exception",
+        }
         return "WAIT", f"拦截插件管线调用异常: {exc}，安全降级为 WAIT", rr
 
 
@@ -106,7 +116,8 @@ def assemble_decision_cache(
         entry = safe_float(d_item.get("entry_price") or d_item.get("limit_price"))
         take_profit = safe_float(d_item.get("take_profit_price") or d_item.get("take_profit"))
         stop_loss = safe_float(d_item.get("stop_loss_price") or d_item.get("stop_loss"))
-        confidence = max(0.0, min(100.0, safe_float(d_item.get("confidence"))))
+        raw_confidence = d_item.get("confidence")
+        confidence = max(0.0, min(100.0, safe_float(raw_confidence)))
         # 杠杆钳制与后台风控页杠杆区间 [MIN, MAX] 联动（2026-09-10：
         # 旧版下限钉死 2 且提示词示例 min(3,MAX) 锚定，导致上限配 7 仍单单一律 3x）
         lev_hi = max(1, int(round(max_leverage)))
@@ -135,6 +146,25 @@ def assemble_decision_cache(
         final_action, rejection_reason, rr = validate(
             p, normalized_d_item, active_inst_ids, active_position_sides,
         )
+        raw_action = str(d_item.get("action", "WAIT") or "WAIT").strip().upper()
+        decision_trace = normalized_d_item.pop("_decision_trace", None)
+        if not isinstance(decision_trace, dict):
+            if raw_action not in {"BUY_LONG", "SELL_SHORT", "WAIT"}:
+                outcome_source, rejection_code = "interceptor_reject", "unsupported_action"
+            elif raw_action == "WAIT":
+                outcome_source, rejection_code = "model_wait", "model_wait"
+            elif final_action == raw_action:
+                outcome_source, rejection_code = "accepted_entry", ""
+            elif rejection_reason:
+                outcome_source, rejection_code = "interceptor_reject", "unclassified_reject"
+            else:
+                outcome_source, rejection_code = "interceptor_error", "missing_trace"
+            decision_trace = {
+                "raw_action": raw_action,
+                "final_action": final_action,
+                "outcome_source": outcome_source,
+                "rejection_code": rejection_code,
+            }
 
         standard_cache[inst_id] = {
             "instId": inst_id,
@@ -181,7 +211,11 @@ def assemble_decision_cache(
             "adx_1h": p.get("adx_1h", "--"),
             "decision": {
                 "action": final_action,
+                "raw_action": decision_trace.get("raw_action", raw_action),
                 "confidence": confidence,
+                "raw_confidence": raw_confidence,
+                "decision_outcome_source": decision_trace.get("outcome_source", "unknown"),
+                "decision_rejection_code": decision_trace.get("rejection_code", ""),
                 "leverage": ai_leverage,
                 "margin_usdt": ai_margin,
                 "entry_price": entry,
