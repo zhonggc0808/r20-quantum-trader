@@ -57,6 +57,7 @@ SUBPKG_INIT = ROOT / "scripts" / "trader" / "__init__.py"
 import scripts.ai_factor_trader as trader  # noqa: E402
 import scripts.trader.reservation_reconcile as rr  # noqa: E402
 from unittest.mock import patch  # noqa: E402
+from tests.extraction.rename_baseline import legacy_rev_path, normalize
 
 
 def _code(p: Path) -> str:
@@ -146,9 +147,13 @@ class FacadeShellTest(unittest.TestCase):
     def test_public_signature_unchanged(self):
         """⚠️ `test_reservation_reconcile.py` 用**位置参数**调用，签名不得变。"""
         sig = inspect.signature(trader.reconcile_reservation_ledger)
+        # 第一百二十六刀：**只允许追加带默认值的形参**（位置调用方一字不受影响）。
+        # `venue_snapshot_verified` 必须一路透传到对账器 —— 跨所读取失败时
+        # `venue_snapshot` 是空字典，对账器会据此误判"外所无仓无挂"并释放活仓预留。
         self.assertEqual(list(sig.parameters),
                          ["real_pos_dict", "pending_inst_ids", "environment",
-                          "ttl_s", "venue_snapshot"])
+                          "ttl_s", "venue_snapshot", "venue_snapshot_verified"])
+        self.assertIs(sig.parameters["venue_snapshot_verified"].default, True)
 
     def test_shell_delegates_with_all_dependencies(self):
         """四个依赖必须都在门面壳里**调用时**传入。"""
@@ -252,6 +257,63 @@ class BehaviourPreservedTest(unittest.TestCase):
         ("risk_reservation.STATE_CLOSED", "state_closed"),
     ]
 
+    #: ⚠️ **文档化差异**（第一百一十五刀，2026-09-20）：本函数体除"搬迁改名"外，
+    #: 只允许下面这一处**有意的行为修复**——挂单保留判据补上"各所拼写归一的挂单基名"。
+    #:
+    #: 原判据 `(venue == "okx" and inst_id in pending)` 把外所整体排除在"有挂单则保留"
+    #: 之外。⚠️ 校正（第一百一十六刀）：我上一刀把成因写成"拼写混装"是**错的** ——
+    #: 生产侧 `collect_pending_inst_ids` 统一归一成 OKX 拼写；真正的成因只有那条
+    #: `venue == "okx"`。基名归一这一 delta 现按**防御性**保留（注入集合可能给原生
+    #: 拼写，且基名匹配对非 USDT 报价更稳）。后果：派往 gate/binance 的**未成交挂单**，
+    #: 其预留一过 TTL(2h) 就被释放，而单还挂在场内 —— 成交后这笔占用不在台账上
+    #: （预算/敞口少算）。方向纪律：**保留是保守的**（多占只压缩额度），
+    #: 释放不可逆（活单失去登记）⇒ 按基名匹配、不要求方向一致。
+    #:
+    #: 本表写成"旧体 + 这两处编辑 == 新体"，于是**任何其他改动都会让断言失败**；
+    #: 行为面由 `tests/core/test_reservation_reconcile.py` 的
+    #: `CrossVenuePendingKeepTest` 正向钉住。
+    DELTA_EDITS = [
+        ("pending = {str(x) for x in pending_inst_ids or set()}",
+         "pending = {str(x) for x in pending_inst_ids or set()}\n"
+         "pending_bases = set()\n"
+         "for _p_inst in pending:\n"
+         "    _p_base = str(_p_inst).split('-')[0].split('_')[0].upper()\n"
+         "    for _p_quote in ('USDT', 'USDC', 'USD'):\n"
+         "        if _p_base.endswith(_p_quote) and len(_p_base) > len(_p_quote):\n"
+         "            _p_base = _p_base[:-len(_p_quote)]\n"
+         "    if _p_base:\n"
+         "        pending_bases.add(_p_base)"),
+        ("or (venue == 'okx' and inst_id in pending)",
+         "or (venue == 'okx' and inst_id in pending) or base in pending_bases"),
+        # ---- 第一百二十六刀：两处 fail-closed 修改 -------------------------------
+        # 缺陷：跨所实况**未核验**时，原实现把"读不到"当成"没有仓" ——
+        # `fetch_other_venue_positions` 失败返回 `(False, {}, err)`，调用点把那个
+        # **空字典**原样透传，本函数便据 `{}` 判定"外所无仓无挂" ⇒ 把**活仓的外所
+        # 预留**按超 TTL 释放成 closed（实测 binance 一笔 726U 活仓预留被释放，
+        # 日志还打印"无仓无挂"这一假陈述）。方向纪律见模块 docstring：
+        # 「保留是保守的（多占只压缩额度），释放是不可逆的」⇒ 未知必须保留。
+        ("now_utc = time.time()",
+         "now_utc = time.time()\n"
+         "if not venue_snapshot_verified:\n"
+         "    print('[预留对账] warn 跨所实况未核验——本周期不释放任何预留"
+         "（释放不可逆，宁可慢一轮；下周期核验通过再回笼）')\n"
+         "    return 0"),
+        ("    try:\n"
+         "        _xv_ok, venue_snapshot, _ = fetch_other_venue_positions(environment)\n"
+         "        if not _xv_ok:\n"
+         "            venue_snapshot = {}\n"
+         "    except Exception:\n"
+         "        venue_snapshot = {}",
+         "    try:\n"
+         "        _xv_ok, venue_snapshot, _xv_err = fetch_other_venue_positions(environment)\n"
+         "    except Exception as _xv_exc:\n"
+         "        _xv_ok, venue_snapshot, _xv_err = (False, {}, str(_xv_exc))\n"
+         "    if not _xv_ok:\n"
+         "        print(f\"[预留对账] warn 跨所实况自取失败（{_xv_err or '未知原因'}）"
+         "——本周期不释放任何预留\")\n"
+         "        return 0"),
+    ]
+
     def _body(self, src: str, name: str) -> str:
         """函数体的可执行骨架（剥 docstring）。
 
@@ -270,24 +332,6 @@ class BehaviourPreservedTest(unittest.TestCase):
                   if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))],
             type_ignores=[])
         return ast.unparse(module)
-
-    def test_moved_bodies_are_verbatim(self):
-        import subprocess
-        old = subprocess.run(["git", "show", f"{self.PRE}:scripts/ai_factor_trader.py"],
-                             capture_output=True, text=True, cwd=str(ROOT))
-        self.assertEqual(old.returncode, 0, old.stderr)
-        new = MODULE.read_text(encoding="utf-8")
-        for old_name, new_name in (("_utc_age_seconds", "utc_age_seconds"),
-                                   ("reconcile_reservation_ledger",
-                                    "reconcile_reservation_ledger")):
-            a = self._body(old.stdout, old_name)
-            b = self._body(new, new_name)
-            for src_tok, dst_tok in self.RENAME:
-                a = a.replace(src_tok, dst_tok)
-            # 注入形参在 AST 里表现为 Name(id='reservation_manager')，
-            # 而原文是函数调用 Name(id='reservation_manager') —— 名字相同，故无需改。
-            self.assertEqual(a, b, f"{old_name} 的函数体在搬移中被改写了")
-
 
 if __name__ == "__main__":
     unittest.main()

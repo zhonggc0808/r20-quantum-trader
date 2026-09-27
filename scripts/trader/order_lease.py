@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from r20_backend.file_locks import file_lock
+from astra_backend.file_locks import file_lock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +18,7 @@ AI_KEEP_LEASE_MS = 20 * 60 * 1000
 
 def lease_file(data_dir: str | os.PathLike[str] | None = None) -> Path:
     """Resolve the shared state path while preserving the sandbox redirect contract."""
-    root = os.environ.get("R20_DATA_DIR") or data_dir or (PROJECT_ROOT / "data")
+    root = os.environ.get("ASTRA_DATA_DIR") or data_dir or (PROJECT_ROOT / "data")
     return Path(root) / LEASE_FILE_NAME
 
 

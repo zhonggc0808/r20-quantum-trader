@@ -48,7 +48,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sys
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -76,6 +78,25 @@ def _guard_offline() -> None:
         raise unittest.SkipTest("离线套件下不 spawn 子进程（守卫在 spawn 之前）")
 
 
+def setUpModule():
+    """本门的**存在目的**就是核对生产文件本身（只读 + 哈希/结构，不断言其内容）
+    ⇒ 显式放开 `tests/__init__.py` 的生产读守卫（第二百三十二刀）。"""
+    from tests import allow_real_data_reads
+    global _READ_SCOPE
+    _READ_SCOPE = allow_real_data_reads()
+    _READ_SCOPE.__enter__()
+
+
+def tearDownModule():
+    global _READ_SCOPE
+    if _READ_SCOPE is not None:
+        _READ_SCOPE.__exit__(None, None, None)
+        _READ_SCOPE = None
+
+
+_READ_SCOPE = None
+
+
 class SubprocessDataWritesRedirectedTest(unittest.TestCase):
     """⚠️ 第七十六刀：堵住 §91.6 登记的**后台子进程泄漏**。
 
@@ -84,9 +105,9 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
     `sync_full_ledger.py`）—— 子进程是**新解释器**，在进程沙箱
     （patch 模块常量）对它完全无效，它自己从真实 ROOT 拼路径 → 写生产。
 
-    修法：`isolate_config` 设 `R20_DATA_DIR` 环境变量（子进程经
+    修法：`isolate_config` 设 `ASTRA_DATA_DIR` 环境变量（子进程经
     `run_script` 继承），三个脚本的 `DATA_DIR` 改为
-    `os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")`。
+    `os.environ.get("ASTRA_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")`。
     **生产从不设置该变量 ⇒ 行为逐位不变。**
     """
 
@@ -103,8 +124,8 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
             src = (ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(script=rel):
                 self.assertIn(
-                    'DATA_DIR = os.environ.get("R20_DATA_DIR") or', src,
-                    f"{rel} 不再尊重 R20_DATA_DIR —— 子进程写生产泄漏会复发")
+                    'DATA_DIR = os.environ.get("ASTRA_DATA_DIR") or', src,
+                    f"{rel} 不再尊重 ASTRA_DATA_DIR —— 子进程写生产泄漏会复发")
 
     def test_fresh_interpreter_resolves_data_dir_into_sandbox(self):
         """端到端：真的**新起解释器** import factor_library，
@@ -119,8 +140,8 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
         from tests import config_sandbox
 
         config_sandbox.isolate_config(self)   # addCleanup 自动还原
-        expected = os.environ.get("R20_DATA_DIR")
-        self.assertTrue(expected, "isolate_config 未设置 R20_DATA_DIR")
+        expected = os.environ.get("ASTRA_DATA_DIR")
+        self.assertTrue(expected, "isolate_config 未设置 ASTRA_DATA_DIR")
 
         probe = (
             "import sys; sys.path.insert(0, 'scripts');"
@@ -136,14 +157,14 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
                          "env 传递链断了（泄漏仍在）")
 
     def test_env_absent_outside_isolation(self):
-        """⚠️ 边界钉：不进沙箱时 `R20_DATA_DIR` **必须不存在**
+        """⚠️ 边界钉：不进沙箱时 `ASTRA_DATA_DIR` **必须不存在**
         —— 否则"生产从不设置该变量"的前提被破坏，脚本行为就不再等价。
         （也验证 isolate_config 的 cleanup 真的还原了。）
         """
         import os
 
-        self.assertNotIn("R20_DATA_DIR", os.environ,
-                         "沙箱之外不该有 R20_DATA_DIR（cleanup 漏了或环境脏了）")
+        self.assertNotIn("ASTRA_DATA_DIR", os.environ,
+                         "沙箱之外不该有 ASTRA_DATA_DIR（cleanup 漏了或环境脏了）")
 
         from tests import config_sandbox
 
@@ -157,40 +178,57 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
         host = _Host()
         try:
             config_sandbox.isolate_config(host)
-            self.assertIn("R20_DATA_DIR", os.environ, "沙箱内应设置该 env")
+            self.assertIn("ASTRA_DATA_DIR", os.environ, "沙箱内应设置该 env")
         finally:
             for fn in reversed(host.cleaners):
                 fn()
-        self.assertNotIn("R20_DATA_DIR", os.environ,
-                         "还原后 R20_DATA_DIR 必须消失（与进入前一致）")
+        self.assertNotIn("ASTRA_DATA_DIR", os.environ,
+                         "还原后 ASTRA_DATA_DIR 必须消失（与进入前一致）")
 
     def test_bg_thread_spawn_uses_pre_thread_env_snapshot(self):
         """⚠️ 竞态钉（第七十六刀根因的另一半）：
         后台线程 spawn 子进程时**必须用线程创建前的环境快照**。
 
         实测事故形状：线程还没跑到 `subprocess.run`，测试已结束、
-        `isolate_config` 的 cleanup 已还原 `R20_DATA_DIR` ——
+        `isolate_config` 的 cleanup 已还原 `ASTRA_DATA_DIR` ——
         若靠"继承"，子进程拿到的是**干净环境** ⇒ 写生产
         （03:22:41 / 03:23:11 的 mtime 就是这条竞态留下的）。
 
         本用例把 `run_script` 换成"记录 env 的假 spawn"，在**沙箱内**调
         `sync_instruments_state()`，然后**还原沙箱**、再等线程真正走到
-        spawn —— 断言它拿到的 env **仍含沙箱 `R20_DATA_DIR`**（快照生效）。
-        未修复前：还原后 env 里没有 R20_DATA_DIR → 翻红。
+        spawn —— 断言它拿到的 env **仍含沙箱 `ASTRA_DATA_DIR`**（快照生效）。
+        未修复前：还原后 env 里没有 ASTRA_DATA_DIR → 翻红。
         """
         import threading
-        import time
 
         from tests import config_sandbox
         import scripts.instrument_pool as pool
-        from r20_backend import spawn as spawn_mod
+        from astra_backend import spawn as spawn_mod
 
+        # ⚠️ 第一百三十二刀去 flaky（本用例第三次红）：**按线程归属收敛判定**。
+        # patch 装在**模块属性**上 ⇒ 前序测试漏下的后台线程只要在此期间调
+        # `run_script` 也会被记进来（实测整包跑偶发 3/2 —— 方向是**多**，不是少，
+        # 故"等满 30s/结构变了"这个死因描述本身也是错的）。
+        # 本用例的真实性质是"**本用例自己 spawn 的那个线程**用的是线程创建前的 env
+        # 快照"，与"全场恰好 N 次"无关 ⇒ 只对"快照之后新出现的线程"断言。
+        _threads_before = {t.name for t in threading.enumerate()}
         seen: list[dict] = []
+        new_thread_calls: list[dict] = []
         real_run_script = spawn_mod.run_script
+        _done = threading.Event()
+        #: 期望的 spawn 次数**按实际存在的脚本算**（别写死 2：脚本缺席时用例会假红）。
+        _expected = sum(1 for _s in (ROOT / "scripts" / "factor_library.py",
+                                     ROOT / "scripts" / "news_sentiment_harvester.py")
+                        if _s.exists())
 
         def _fake_run_script(script, *, timeout=20, label=None, env=None):
             # 记录**实际传给子进程的 env**（None = 继承 = 竞态未修）
-            seen.append(dict(env) if env is not None else None)
+            _snap = dict(env) if env is not None else None
+            seen.append(_snap)
+            if threading.current_thread().name not in _threads_before:
+                new_thread_calls.append(_snap)
+                if len(new_thread_calls) >= _expected:
+                    _done.set()
 
             class _R:
                 returncode = 0
@@ -203,24 +241,30 @@ class SubprocessDataWritesRedirectedTest(unittest.TestCase):
         p.start()
         try:
             pool.sync_instruments_state()
-            # ⚠️ 必须在**撤 patch 之前**等后台线程把两次 run_script 都走完 ——
+            # ⚠️ 必须在**撤 patch 之前**等后台线程把 spawn 都走完 ——
             # 否则测试自己会漏出一次**真 spawn**（假想 cleanup 时序反而制造事故）。
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and len(seen) < 2:
-                time.sleep(0.02)
+            #
+            # ⚠️ 第一百二十一刀去 flaky：原来等的是**写死 5 秒**。本用例空载、
+            # 乃至 8 路 CPU 争用下都复现不了；只在**整包跑**里偶发（已两次：
+            # 第 20 刀、第 25 刀），而本机同时跑着活体 `astra_gateway.worker` ——
+            # 5 秒窗口被它抢走即可假红。现改成**事件驱动**（线程走完即返回），
+            # 30 秒只是安全网：真超时才说明"结构变了或卡死"。
+            _done.wait(30.0)
         finally:
             p.stop()
             self.doCleanups()          # 提前还原 env 与常量（幂等）
 
-        self.assertEqual(len(seen), 2,
-                         f"后台线程没走完两次 spawn（只见 {len(seen)} 次）"
-                         " —— 结构变了或卡死，本用例失去意义")
-        bad = [i for i, env in enumerate(seen) if env is None
-               or env.get("R20_DATA_DIR") != str(Path(sandbox) / "data")]
+        self.assertGreaterEqual(_expected, 1, "两个脚本都不在？本用例已失去意义")
+        self.assertGreaterEqual(
+            len(new_thread_calls), _expected,
+            f"本用例 spawn 的线程没走完（只见 {len(new_thread_calls)}/{_expected} 次，等满 30s）"
+            f"；同期全场共 {len(seen)} 次（含无关线程）")
+        bad = [i for i, env in enumerate(new_thread_calls) if env is None
+               or env.get("ASTRA_DATA_DIR") != str(Path(sandbox) / "data")]
         self.assertEqual(
             bad, [],
             f"后台线程 spawn 用的不是沙箱快照（竞态复发）："
-            f"{[seen[i] is None and '继承(竞态)' or 'env 缺 R20_DATA_DIR' for i in bad]}"
+            f"{[seen[i] is None and '继承(竞态)' or 'env 缺 ASTRA_DATA_DIR' for i in bad]}"
             " —— 修见 sync_instruments_state 的 _env_snapshot。")
 
 
@@ -234,7 +278,7 @@ class SyncInstrumentsStateNeverWritesProductionTest(unittest.TestCase):
     ⚠️ 判据范围在第七十六刀**修正过一次错误**：
     第一版把 sync 的 4 个写集文件全做"生产哈希不变"断言，
     但 `factor_library_snapshot` / `dashboard_last_good` **每 ~60s 被活体
-    `r20_gateway.worker` 重写**（实测 `-newermt '-3 minutes'` 命中）——
+    `astra_gateway.worker` 重写**（实测 `-newermt '-3 minutes'` 命中）——
     落在我的 before→after 窗口里就会**误报成泄漏**（潜伏的 flaky，
     本轮 8 连跑没撞上纯属窗口窄）。⇒ 生产哈希断言**只保留
     `trading_state.json`**（活体 worker 不碰它，只有 15 分钟周期与 sync 写）；
@@ -366,6 +410,161 @@ def _strip_docstrings_and_comments(src: str) -> str:
         i += 1
     return "".join(out)
 
+
+class ProductionDbConnectBlockedTest(unittest.TestCase):
+    """第一百一十四刀：**测试连接生产 sqlite 库**必须失败（新增的一类泄漏）。
+
+    ## 为什么单开一类
+
+    上面那套 `_assert_not_production` 管 `open()/replace/unlink` 等**文件级**写；
+    sqlite 库的连接走 `sqlite3.connect`（文件只开一次，之后全在 fd 上写）——
+    完全绕开那套闸。实测一次全量 `pytest tests` 会对生产 `data/*.db` 发起
+    **18 次连接**（admin 6 / quant 4 / reservation 6 / gateway 2），并且**真的**
+    在生产 `data/risk_reservation.db` 里留下一行
+    `environment=<MagicMock name='current_environment().mode'>` 的垃圾预留
+    （id=225，created_at 2026-09-20 04:59:03）。
+    """
+
+    def test_connect_to_production_db_is_blocked(self):
+        import sqlite3
+        target = ROOT / "data" / "risk_reservation.db"
+        with self.assertRaises(AssertionError) as ctx:
+            sqlite3.connect(str(target))
+        self.assertIn("禁止连接生产数据库", str(ctx.exception))
+
+    def test_memory_and_temp_connections_still_work(self):
+        """闸门只管生产目录——`:memory:` 与临时文件必须照常可用（否则测试没法活）。"""
+        import sqlite3
+        import tempfile
+        with sqlite3.connect(":memory:") as c:
+            c.execute("SELECT 1")
+        with tempfile.TemporaryDirectory() as d:
+            with sqlite3.connect(str(Path(d) / "x.db")) as c:
+                c.execute("CREATE TABLE t(a)")
+
+    def test_all_four_production_dbs_are_redirected_for_the_session(self):
+        """会话级默认重定向：四个库都指向临时目录，且不在生产 data/ 之下。"""
+        from astra_backend import admin_auth, risk_reservation
+        from astra_gateway import publisher
+        import scripts.db_manager as db_manager
+        prod = (ROOT / "data").resolve()
+        for name, value in (("admin_auth.DB_PATH", admin_auth.DB_PATH),
+                            ("risk_reservation.DEFAULT_DB_PATH", risk_reservation.DEFAULT_DB_PATH),
+                            ("db_manager.DB_PATH", db_manager.DB_PATH),
+                            ("publisher.DB_PATH", publisher.DB_PATH)):
+            with self.subTest(module=name):
+                resolved = Path(value).resolve()
+                self.assertFalse(str(resolved).startswith(str(prod) + os.sep),
+                                 f"{name} 仍指向生产 data/：{resolved}")
+
+    def test_default_manager_resolves_outside_production(self):
+        """`get_manager()` 的**缓存实例**也必须跟着走（常量改了、缓存没清=照样连生产）。"""
+        from astra_backend import risk_reservation
+        mgr = risk_reservation.get_manager()
+        self.assertFalse(str(Path(mgr.db_path).resolve()).startswith(
+            str((ROOT / "data").resolve()) + os.sep), f"默认管理器仍钉生产库：{mgr.db_path}")
+
+    def test_dashboard_render_does_not_touch_production_reservation_db(self):
+        """行为判据（本文件的一贯做法）：渲染仪表盘 stale 注入后，生产库哈希不变。"""
+        before = _hash_or_absent("data/risk_reservation.db")
+        import astra_backend.dashboard_cache as dashboard
+        dashboard._inject_local_data_into_stale({}, [], "2026-09-02 22:00:00 (北京时间)")
+        self.assertEqual(_hash_or_absent("data/risk_reservation.db"), before,
+                         "测试渲染仪表盘不得改动生产风控预留库")
+
+    def test_admin_auth_default_arg_reads_module_constant_at_call_time(self):
+        """回归：`def __init__(self, path=DB_PATH)` 的**定义期绑定**会让沙箱重定向失效。
+
+        实测那次泄漏就是它：`astra_backend/dependencies.py:30` 在 import 期
+        `AdminAuthStore()` 走的是定义期绑定的生产路径，`isolate_config` 改常量无效。
+        """
+        import tempfile
+        from astra_backend import admin_auth
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d) / "admin.db"
+            with patch.object(admin_auth, "DB_PATH", tmp):
+                store = admin_auth.AdminAuthStore()      # 不传 path ⇒ 必须用**当前**常量
+                self.assertEqual(Path(store.path), tmp,
+                                 "默认参数仍在定义期绑定 ⇒ 沙箱重定向对 dependencies 无效")
+            self.assertTrue(tmp.exists(), "构造 store 应在（临时）路径上建表")
+
+
+
+class ProductionReservationDbPollutionTest(unittest.TestCase):
+    """生产预留库不得再被测试污染（第一百四十三刀）。
+
+    ## 背景
+
+    本会话早些时候实测：一次全量 `pytest tests` 会在生产 `data/risk_reservation.db`
+    留下一行 `environment=<MagicMock name=\'current_environment().mode\'>` 的垃圾预留
+    （id=225）。随后补上了 sqlite 连接闸 + 会话级默认重定向（见本文件上一类）。
+    上面那类钉的是**机制**（"不许连生产库"）；本类钉的是**残留判据**：
+
+    > 生产库里除**显式登记**的历史那一行外，不得再出现"非真实环境名"的环境值。
+
+    价值：即便将来出现一条**没被闸拦到**的写入路径（新库/新连接方式/子进程），
+    只要它写进了生产预留库，本门就会翻红 —— 这是"机制门 + 数据门"的双保险。
+
+    ## 为什么用子进程读
+
+    本会话的 sqlite 闸会拦下**任何**指向生产目录的连接（`mode=ro` 也拦），
+    故只能在测试进程之外读；子进程读**只读**，不产生任何写入。
+    """
+
+    #: 已知历史污染（待人工删除）。删除后请把这里清空 —— 本门对"不存在"是宽容的。
+    _KNOWN_POLLUTION = {(225, "BTC-USDT-SWAP:buy:1789880343")}
+
+    #: 真实环境名形如 `demo` / `live`（小写短词）。测试夹具的 MagicMock repr 必然不符。
+    _REAL_ENV = re.compile(r"[a-z_]{2,16}")
+
+    @classmethod
+    def _polluted_rows(cls, db_path) -> list:
+        """返回生产库里的"污染行"：环境名不是真实环境名的行（只读子进程查询）。"""
+        import json as _json
+        import subprocess
+        code = (
+            "import sqlite3,json,sys\n"
+            "p=sys.argv[1]\n"
+            "con=sqlite3.connect('file:'+p+'?mode=ro',uri=True)\n"
+            "rows=con.execute('SELECT id,intent_id,environment FROM risk_reservations').fetchall()\n"
+            "print(json.dumps(rows))\n"
+        )
+        out = subprocess.run([sys.executable, "-c", code, str(db_path)],
+                             capture_output=True, text=True, timeout=60, check=True)
+        rows = _json.loads(out.stdout)
+        return [(r[0], r[1], r[2]) for r in rows
+                if not cls._REAL_ENV.fullmatch(str(r[2] or ""))]
+
+    def test_detector_flags_a_mock_environment(self):
+        """自检 + 负例：夹具写法（MagicMock repr）必须被判为污染。"""
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "res.db"
+            with sqlite3.connect(str(db)) as con:
+                con.execute("CREATE TABLE risk_reservations "
+                            "(id INTEGER PRIMARY KEY, intent_id TEXT, environment TEXT)")
+                # 参数化插入：避免在 SQL 里转义引号（模拟的正是测试夹具的写法）
+                mock_env = "<MagicMock name='" + "current_environment().mode" + "'>"
+                con.execute("INSERT INTO risk_reservations VALUES (?,?,?)",
+                            (1, "A:buy:1", "demo"))
+                con.execute("INSERT INTO risk_reservations VALUES (?,?,?)",
+                            (2, "B:buy:2", mock_env))
+            flagged = self._polluted_rows(db)
+        self.assertEqual([(r[0], r[1]) for r in flagged], [(2, "B:buy:2")],
+                         "检测器没抓到夹具污染（或误报真实环境名）")
+
+    def test_production_db_has_no_unregistered_pollution(self):
+        db = ROOT / "data" / "risk_reservation.db"
+        if not db.exists():
+            self.skipTest("生产预留库不存在（全新环境）")
+        flagged = self._polluted_rows(db)
+        unknown = [r for r in flagged
+                   if (r[0], r[1]) not in self._KNOWN_POLLUTION]
+        self.assertEqual(
+            unknown, [],
+            f"生产预留库出现**未经登记**的测试污染行 {unknown} ⇒ 有写入路径绕过了 sqlite 闸/"
+            "重定向（请修隔离，勿只删数据）")
 
 if __name__ == "__main__":
     unittest.main()

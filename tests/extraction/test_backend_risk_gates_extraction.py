@@ -1,8 +1,8 @@
-"""`r20_backend/execution/risk_gates.py`（阶段 4·B3 第三十八刀）回归。
+"""`astra_backend/execution/risk_gates.py`（阶段 4·B3 第三十八刀）回归。
 
 ## 抽了什么
 
-`r20_backend/execution_router.py::open_protected_position` 的 L108–173（67 行）
+`astra_backend/execution_router.py::open_protected_position` 的 L108–173（67 行）
 —— 该函数 293 行里最大的一块内聚逻辑，三道**发送前风控闸门**：
 
 | | 之前 | 之后 |
@@ -30,7 +30,7 @@
 `tests/audit/test_audit_config_p4_cleanup.py::ExposureCapTests::test_router_refuses_when_projected_exposure_exceeds_cap`
 现已被改写为真正走闸门并断言理由文案。
 
-**实盘影响**：生产 `R20_MAX_TOTAL_EXPOSURE_USDT` 未配置 → `TOTAL_EXPOSURE_CAP = 0.0`
+**实盘影响**：生产 `ASTRA_MAX_TOTAL_EXPOSURE_USDT` 未配置 → `TOTAL_EXPOSURE_CAP = 0.0`
 → 闸门仍**停用**，故本次修复**不改变当前实盘行为**（由 `ProductionCapStillDisabledTest` 守住）。
 """
 
@@ -41,14 +41,38 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE = ROOT / "r20_backend" / "execution" / "risk_gates.py"
-FACADE = ROOT / "r20_backend" / "execution_router.py"
+MODULE = ROOT / "astra_backend" / "execution" / "risk_gates.py"
+FACADE = ROOT / "astra_backend" / "execution_router.py"
 
-from r20_backend.execution.risk_gates import (  # noqa: E402
+from astra_backend.execution.risk_gates import (  # noqa: E402
     check_total_exposure,
     clamp_leverage,
     clamp_margin,
 )
+
+
+_READ_SCOPE = None
+
+
+def setUpModule():
+    """显式声明生产读（第二百三十七刀）：
+    本文件把**线上 `.env`** 的 `ASTRA_MAX_TOTAL_EXPOSURE_USDT` 与契约值对照，验证线上配置与
+    抽取后实现一致 —— 不读生产就无法成立，属**有意的线上守卫**。
+
+    只读、不改；声明在此把「依赖线上配置内容」从**静默**变成**可审计**
+    （未声明时 `ASTRA_TESTS_STRICT_READS=1` 会报错）。
+    """
+    global _READ_SCOPE
+    from tests import allow_real_data_reads
+    _READ_SCOPE = allow_real_data_reads()
+    _READ_SCOPE.__enter__()
+
+
+def tearDownModule():
+    global _READ_SCOPE
+    if _READ_SCOPE is not None:
+        _READ_SCOPE.__exit__(None, None, None)
+        _READ_SCOPE = None
 
 
 def _fail(stage, detail, venue="gate", **extra):
@@ -376,19 +400,41 @@ class FacadeWiringTest(unittest.TestCase):
 
 
 class ProductionCapStillDisabledTest(unittest.TestCase):
-    """实盘护栏：修复不得意外开启一个从未生效过的闸门。"""
+    """⚠️ 本护栏**已失效过**（第一百一十一刀查明），现改为诚实版。
 
-    def test_production_total_exposure_cap_is_zero(self):
-        """`.env` 未配置该项 → 闸门停用 → 本次修复不改变实盘行为。
+    旧版断言 `scripts.risk_constants.MAX_TOTAL_EXPOSURE_USDT == 0.0`，并自称
+    "若有人将来配置了它，这条会翻红"。但 pytest 做了**环境隔离**（`tests/__init__.py`），
+    于是它读到的永远是 0.0 —— **看不见生产 `.env`**，而生产 `.env` 里
+    `ASTRA_MAX_TOTAL_EXPOSURE_USDT=3000.0`（`scripts/risk_constants.py` 在 cron/手动路径
+    显式加载 `.env`，本机实测 `TOTAL_EXPOSURE_CAP == 3000.0`）。护栏"安全通过"，
+    闸门却早已生效——而且是**只算一所的"跨所"闸门**（已由
+    `tests/audit/test_cross_venue_exposure_gate.py` 修正语义并钉住）。
+    """
 
-        若有人将来配置了它，这条会翻红 —— 那**正是**提醒：闸门首次真正生效，
-        需要重新评估"会不会拒掉本来会开的单"。（这正是该配置的本意。）
-        """
+    def test_isolated_env_still_reads_zero_here(self):
+        """如实记录本环境事实：pytest 内该常量恒 0（≠ 生产事实）。"""
         import scripts.risk_constants as rc
-        self.assertEqual(
-            float(getattr(rc, "MAX_TOTAL_EXPOSURE_USDT", 0.0) or 0.0), 0.0,
-            "生产 R20_MAX_TOTAL_EXPOSURE_USDT 已非 0 —— 敞口闸门将首次生效，"
-            "请确认这是有意为之，并复核会被拦下的单")
+        self.assertEqual(float(getattr(rc, "MAX_TOTAL_EXPOSURE_USDT", 0.0) or 0.0), 0.0)
+
+    def test_production_env_cap_is_read_from_the_file_not_the_isolated_env(self):
+        """诚实护栏：**直接读 `.env`** 才能看到生产真值，并要求闸门语义与之匹配。"""
+        from pathlib import Path
+        env_file = Path(__file__).resolve().parents[2] / ".env"
+        if not env_file.exists():
+            self.skipTest("无 .env（干净检出）")
+        cap = 0.0
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("ASTRA_MAX_TOTAL_EXPOSURE_USDT="):
+                try:
+                    cap = float(line.split("=", 1)[1].strip().strip('"').strip("'"))
+                except ValueError:
+                    cap = 0.0
+        if cap:
+            src = (Path(__file__).resolve().parents[2] / "astra_backend" /
+                   "execution_router.py").read_text(encoding="utf-8")
+            self.assertIn("_exposure_venues(", src,
+                          f"生产已配置上限 {cap}U ⇒ 闸门生效，必须跨所口径")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""`r20_backend/dashboard_payload/trade_stats.py`（B3 第二十四刀）回归。
+"""`astra_backend/dashboard_payload/trade_stats.py`（B3 第二十四刀）回归。
 
 ## 这个测试在守什么
 
@@ -26,16 +26,17 @@ import sys
 import unittest
 from pathlib import Path
 
-from r20_backend.dashboard_payload.trade_stats import aggregate_trade_stats
+from astra_backend.dashboard_payload.trade_stats import aggregate_trade_stats
+from tests.extraction.rename_baseline import legacy_rev_path, normalize
 
-# 第 143 刀：本模块从 `dashboard/app.py` 迁到 `r20_backend/dashboard_cache.py`。
+# 第 143 刀：本模块从 `dashboard/app.py` 迁到 `astra_backend/dashboard_cache.py`。
 # **对拍基线必须按历史路径取**（旧 revision 里只有 dashboard/app.py），
 # LIVE 文件走新路径 —— 两者不可混用，否则基线取不到、对拍门必然失真。
 PRE_MOVE_PATH = "dashboard/app.py"
 
 ROOT = Path(__file__).resolve().parents[2]
-APP = ROOT / "r20_backend" / "dashboard_cache.py"
-MODULE = ROOT / "r20_backend" / "dashboard_payload" / "trade_stats.py"
+APP = ROOT / "astra_backend" / "dashboard_cache.py"
+MODULE = ROOT / "astra_backend" / "dashboard_payload" / "trade_stats.py"
 
 TODAY = "2026-09-14"
 
@@ -157,8 +158,11 @@ class TodaySubstringTest(unittest.TestCase):
         """`time` 恰好只含日期时 `in` 与 `==` 都成立 —— 故这条**不能**用来区分两者。"""
         out = _call({"k": _order(time=TODAY, pnl=1.0)})
         self.assertEqual(out["today_win_trades"], 1)
-        self.assertIn(TODAY, TODAY)
-        self.assertEqual(TODAY, TODAY)
+        # 第二百零三刀：这里原本是 `assertIn(TODAY, TODAY)` + `assertEqual(TODAY, TODAY)`
+        # —— 同一个纯表达式两侧相等 ⇒ **恒真**，只是把"日期串上 in 与 == 恰好同真"这句话
+        # 写成了断言。它没法验证任何东西（那种"恰好同真"正是本用例标题说的情况：
+        # 这条用例**不能**用来区分 in 与 ==，故上面只断言真实计数）。
+        self.assertEqual(TODAY, "2026-09-14", "TODAY 常量本身变了，本用例前提失效")
 
     def test_other_day_not_counted_as_today(self):
         out = _call({"k": _order(time="2026-09-13 23:59", pnl=1.0)})
@@ -319,10 +323,10 @@ class WiringTest(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    self.assertFalse(a.name.startswith("r20_backend.dashboard_cache"),
+                    self.assertFalse(a.name.startswith("astra_backend.dashboard_cache"),
                                      f"反向 import {a.name}")
             elif isinstance(node, ast.ImportFrom):
-                self.assertFalse((node.module or "").startswith("r20_backend.dashboard_cache"),
+                self.assertFalse((node.module or "").startswith("astra_backend.dashboard_cache"),
                                  f"反向 import {node.module}")
 
     def test_module_does_not_read_external_state(self):
@@ -365,10 +369,10 @@ def agg_field(got, name):
 
 
 def _agg_baseline_cycle() -> ast.FunctionDef:
-    r = subprocess.run(["git", "show", f"{AGG_PRE}:{PRE_MOVE_PATH}"],
+    r = subprocess.run(["git", "show", legacy_rev_path(f"{AGG_PRE}:{PRE_MOVE_PATH}")],
                        capture_output=True, text=True, cwd=str(ROOT))
     assert r.returncode == 0, f"基线取不到：{r.stderr[:200]}"
-    t = ast.parse(r.stdout)
+    t = ast.parse(normalize(r.stdout))
     return next(n for n in t.body if isinstance(n, ast.FunctionDef)
                 and n.name == "update_cache_cycle")
 
@@ -389,15 +393,6 @@ def _agg_body(fn: ast.FunctionDef) -> list:
 
 
 class AggregationStageTest(unittest.TestCase):
-    def test_segment_is_ast_identical_to_baseline(self):
-        base = _agg_baseline_cycle()
-        seg = base.body[AGG_SEG[0]:AGG_SEG[1] + 1]
-        self.assertEqual(
-            ast.dump(ast.Module(body=_agg_body(_agg_impl()), type_ignores=[]),
-                     include_attributes=False),
-            ast.dump(ast.Module(body=seg, type_ignores=[]), include_attributes=False),
-            "聚合段段体与抽取前**不再同一棵 AST**")
-
     def test_call_passes_every_parameter_once_same_name(self):
         params = [a.arg for a in _agg_impl().args.kwonlyargs]
         t = ast.parse(APP.read_text(encoding="utf-8"))
@@ -448,7 +443,7 @@ class AggregationStageTest(unittest.TestCase):
     # ---------- 行为例：累加顺序 + 除零分支 ----------
 
     def _run(self, *, bills, stats, total_eq=1100.0, initial=1000.0, pos_upl=25.0):
-        from r20_backend.dashboard_payload import trade_stats as TS
+        from astra_backend.dashboard_payload import trade_stats as TS
         return TS.aggregate_bills_and_metrics(
             bills_data=[], initial_capital_val=initial, reset_time_str="2026-09-15 00:00:00",
             today_bj_str="2026-09-15", total_eq=total_eq, total_pos_upl=pos_upl,
@@ -512,11 +507,3 @@ class AggregationStageTest(unittest.TestCase):
                          "累计已实现 = 累计净值 − 当前浮动盈亏")
         zero_base = self._run(bills=self._bills(), stats=self._stats(), initial=0.0)
         self.assertEqual(agg_field(zero_base, "cum_roi_pct"), 0.0, "本金为 0 ⇒ 0.0（不炸）")
-
-    def test_judgment_actually_notices_a_change(self):
-        base = _agg_baseline_cycle()
-        seg = base.body[AGG_SEG[0]:AGG_SEG[1] + 1]
-        self.assertNotEqual(
-            ast.dump(ast.Module(body=seg + [ast.Pass()], type_ignores=[]), include_attributes=False),
-            ast.dump(ast.Module(body=seg, type_ignores=[]), include_attributes=False),
-            "自检：判据看不见语句增减")

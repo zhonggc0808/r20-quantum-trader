@@ -104,14 +104,14 @@ class _Harness(unittest.TestCase):
 
     def setUp(self) -> None:
         self.captured: List[Dict[str, Any]] = []
-        self.tmp = tempfile.TemporaryDirectory(prefix="r20-jev-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="astra-jev-")
         self.addCleanup(self.tmp.cleanup)
         env = {
-            "R20_JEV_SHADOW_ENABLED": "1",
-            "R20_JEV_INDEPENDENT_ENABLED": "1",
-            "R20_JEV_TYPESAFE_API_KEY": "fake-key-for-contract-test",
-            "R20_JEV_PROVIDER": "typesafe",
-            "R20_JEV_MODEL": "jev-latest",
+            "ASTRA_JEV_SHADOW_ENABLED": "1",
+            "ASTRA_JEV_INDEPENDENT_ENABLED": "1",
+            "ASTRA_JEV_TYPESAFE_API_KEY": "fake-key-for-contract-test",
+            "ASTRA_JEV_PROVIDER": "typesafe",
+            "ASTRA_JEV_MODEL": "jev-latest",
         }
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -568,7 +568,7 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
         self.assertEqual(row["suggested_action"], "BUY_LONG",
                          "票决优势方向必须仍能产出独立动作（否则通道退化成永远 WAIT）")
         self.assertGreaterEqual(row["jev_action_margin"], 0.15,
-                                "动作间距应达到 R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN")
+                                "动作间距应达到 ASTRA_JEV_INDEPENDENT_MIN_ACTION_MARGIN")
         self.assertEqual(row["jev_action_status"], "accepted")
 
     def test_votes_are_still_present_and_recorded(self):
@@ -631,7 +631,7 @@ class EnforcementModeIsConfigurableTest(unittest.TestCase):
     """方案 §6：`shadow` / `review` / `soft_veto` 必须**可配置回滚**。
 
     此前 `enforcement_mode` 被硬编码成 `"shadow"`，环境变量只被记进
-    `configured_enforcement` —— 于是 `R20_JEV_ENFORCEMENT` **读了却不生效**，
+    `configured_enforcement` —— 于是 `ASTRA_JEV_ENFORCEMENT` **读了却不生效**，
     而切档位恰恰必须改代码，与 §6 的要求正好相反。本类钉住修复。
     """
 
@@ -783,7 +783,7 @@ class EnforcementDecisionCriteriaTest(unittest.TestCase):
         self.assertEqual(got["reasons"], ["code_hard_gate_failed"])
 
     def test_hard_veto_code_only_caps_jev_at_soft(self):
-        """`R20_JEV_HARD_VETO_ONLY_CODE_GATES=1` ⇒ Jev 自身最高只能软否决。"""
+        """`ASTRA_JEV_HARD_VETO_ONLY_CODE_GATES=1` ⇒ Jev 自身最高只能软否决。"""
         capped = self._decide(mode="hard_veto")
         self.assertEqual(capped["decision"], "SOFT_VETO")
         uncapped = abt._jev_enforcement_decision(
@@ -806,7 +806,7 @@ class ProtectionIsNeverVetoedTest(_Harness):
 
     def test_position_lane_stays_shadow_under_any_mode(self):
         for mode in ("shadow", "review", "soft_veto", "hard_veto"):
-            with patch.dict(os.environ, {"R20_JEV_ENFORCEMENT": mode}):
+            with patch.dict(os.environ, {"ASTRA_JEV_ENFORCEMENT": mode}):
                 review = self.run_review(
                     {"BTC-USDT-SWAP": "WAIT"},
                     positions=[{"instId": "BTC-USDT-SWAP", "side": "long", "pos": 1.0,
@@ -823,7 +823,7 @@ class ProtectionIsNeverVetoedTest(_Harness):
     def test_candidate_lane_records_the_configured_mode(self):
         """候选侧则必须如实记录配置档位（方案 §6 要求可配置可回滚）。"""
         for mode, expected in (("review", "REVIEW"), ("soft_veto", "SOFT_VETO")):
-            with patch.dict(os.environ, {"R20_JEV_ENFORCEMENT": mode}):
+            with patch.dict(os.environ, {"ASTRA_JEV_ENFORCEMENT": mode}):
                 review = self.run_review({"ETH-USDT-SWAP": "BUY_LONG"})
             self.assertEqual(review["enforcement_mode"], mode)
             self.assertTrue(review["enforcement_mode_valid"])

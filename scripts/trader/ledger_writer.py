@@ -26,7 +26,8 @@ import time
 
 
 def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None, *,
-                       OPEN_INTENT_FILE: str, OPEN_INTENT_TTL_MS: int) -> None:
+                       OPEN_INTENT_FILE: str, OPEN_INTENT_TTL_MS: int,
+                       _atomic_write_json) -> None:
     """下单成功后记录本地开仓意图，供重启后挂单对账归属（US-006）。
 
     审计(2026-09-13)·PEPE 永动机修复之二：写入时**清理**——过期(TTL 6h)条目丢弃、
@@ -56,8 +57,8 @@ def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None
                 if value not in (None, ""):
                     entry[key] = value
         intents.append(entry)
-        with open(OPEN_INTENT_FILE, "w", encoding="utf-8") as f:
-            json.dump(intents[-200:], f, ensure_ascii=False, indent=2)
+        # Preserve the previous valid file if the process crashes mid-write.
+        _atomic_write_json(OPEN_INTENT_FILE, intents[-200:])
     except Exception as e:
         print(f"[挂单对账] 记录开仓意图失败（不影响本单交易）: {e}")
 

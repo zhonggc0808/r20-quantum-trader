@@ -1,4 +1,4 @@
-"""`r20_backend/math_utils.py::clamp` 单一事实源（阶段 4·B3 第五十一刀）。
+"""`astra_backend/math_utils.py::clamp` 单一事实源（阶段 4·B3 第五十一刀）。
 
 ## 修了什么
 
@@ -19,9 +19,9 @@
 
 | 函数 | 位置 |
 |---|---|
-| `clamp_leverage` | `r20_backend/execution/risk_gates.py` |
+| `clamp_leverage` | `astra_backend/execution/risk_gates.py` |
 | `clamp_margin` | 同上 |
-| `clamp_council_timeout` | `r20_backend/council/roster.py` |
+| `clamp_council_timeout` | `astra_backend/council/roster.py` |
 
 它们不是"同一函数的拷贝"，而是**同一动词的不同业务规则**
 （取三道上限的最小值 / `0` 退化为不夹 / 处理 `NaN`·`±inf` / 夹动时打印运维文案）。
@@ -42,11 +42,11 @@ for p in (str(ROOT), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-MODULE = ROOT / "r20_backend" / "math_utils.py"
+MODULE = ROOT / "astra_backend" / "math_utils.py"
 SIGNALS = ROOT / "scripts" / "trader" / "signals.py"
 ENGINE = ROOT / "scripts" / "self_improvement_engine.py"
 
-from r20_backend.math_utils import clamp  # noqa: E402
+from astra_backend.math_utils import clamp  # noqa: E402
 
 
 class ClampSemanticsTest(unittest.TestCase):
@@ -205,7 +205,7 @@ class NotToBeMergedTest(unittest.TestCase):
 
     def test_clamp_council_timeout_rejects_nan(self):
         """`clamp_council_timeout` 会把 `NaN`/`±inf` 换成默认值；`clamp` 不会。"""
-        from r20_backend.council.roster import clamp_council_timeout, DEFAULT_COUNCIL_TIMEOUT
+        from astra_backend.council.roster import clamp_council_timeout, DEFAULT_COUNCIL_TIMEOUT
         self.assertEqual(clamp_council_timeout(float("nan")), DEFAULT_COUNCIL_TIMEOUT)
         self.assertEqual(clamp_council_timeout(float("inf")), DEFAULT_COUNCIL_TIMEOUT)
         # 反证：本模块的 clamp 对 NaN 不做这层过滤
@@ -214,23 +214,41 @@ class NotToBeMergedTest(unittest.TestCase):
 
     def test_clamp_margin_only_accepts_positive_finite_caps(self):
         """`clamp_margin` 的 `0` 表示"该上限不可用"，而 `clamp` 的 `0` 是真实边界。"""
-        src = (ROOT / "r20_backend" / "execution" / "risk_gates.py").read_text(encoding="utf-8")
+        src = (ROOT / "astra_backend" / "execution" / "risk_gates.py").read_text(encoding="utf-8")
         self.assertIn("math.isfinite(c) and c > 0", src,
                       "clamp_margin 的 `>0 且有限` 过滤是它的核心语义")
 
     def test_clamp_leverage_zero_means_no_clamping(self):
         """`clamp_leverage` 的 `0/None` 退化为**不夹**（用原值），
         而 `clamp` 的 `0` 会把值夹成 0 —— 语义相反。"""
-        src = (ROOT / "r20_backend" / "execution" / "risk_gates.py").read_text(encoding="utf-8")
+        src = (ROOT / "astra_backend" / "execution" / "risk_gates.py").read_text(encoding="utf-8")
         self.assertIn("MAX_LEVERAGE or leverage", src)
         # 反证：本模块的 clamp 遇 0 上界会把值夹成 0
         self.assertEqual(clamp(5, 0, 0, 1), 0)
 
+    #: 允许住在 `math_utils` 的**数值边界工具**（白名单：新增一项必须是有意识的编辑）。
+    ALLOWED_IN_MATH_UTILS = ("clamp", "safe_float")
+    #: 名字带 clamp 的兄弟函数**语义不同**，永远不得进本模块（风控红线）。
+    FORBIDDEN_IN_MATH_UTILS = ("clamp_council_timeout", "clamp_margin", "clamp_leverage")
+
     def test_the_three_siblings_are_not_defined_in_math_utils(self):
-        """本模块只应定义 `clamp` 一个名字（防止后来者把兄弟函数也塞进来）。"""
+        """本模块只能放**白名单内**的数值边界工具，且三个 `clamp_*` 兄弟永不得进来。
+
+        第一百五十刀说明：本用例原先断言"只能有 `clamp` 一个名字"。那条**字面**约束
+        把"数值边界工具"与"名字带 clamp 的语义不同的兄弟"混为一谈 —— 前者（如 `safe_float`）
+        收敛进来是**减少**漂移，后者进来才是改风控行为。故改为：
+        ①三个兄弟名**显式**禁止（比原来更直白）；②其余函数必须逐个列入白名单
+        （所以"顺手再塞一个"仍会翻红，只是现在要显式改白名单）。
+        """
         tree = ast.parse(MODULE.read_text(encoding="utf-8"))
         funcs = [n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        self.assertEqual(funcs, ["clamp"], f"math_utils 出现了额外函数: {funcs}")
+        for bad in self.FORBIDDEN_IN_MATH_UTILS:
+            with self.subTest(forbidden=bad):
+                self.assertNotIn(bad, funcs,
+                                 f"{bad} 与 clamp 语义不同，塞进本模块会改变风控行为（红线）")
+        self.assertIn("clamp", funcs, "clamp 必须仍在（单一事实源）")
+        extra = [f for f in funcs if f not in self.ALLOWED_IN_MATH_UTILS]
+        self.assertEqual(extra, [], f"math_utils 出现了未列入白名单的函数: {extra}")
 
 
 if __name__ == "__main__":

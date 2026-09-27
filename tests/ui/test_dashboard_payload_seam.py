@@ -2,7 +2,7 @@
 
 ## 背景：为什么需要这道闸
 
-`r20_backend/dashboard_cache.py` 的域代码正被逐步迁到 `r20_backend/dashboard_payload/`。迁移用
+`astra_backend/dashboard_cache.py` 的域代码正被逐步迁到 `astra_backend/dashboard_payload/`。迁移用
 **薄壳 + 核心**：核心收显式参数，门面薄壳在**调用时**解析门面模块全局（路径常量、
 甚至可调用对象）并注入。
 
@@ -23,8 +23,8 @@
    `(AI_DECISIONS_FILE, FACTOR_LIBRARY_FILE, STATE_JSON_FILE)` ——
    三个路径整体错配，症状是"因子库读到了决策文件"，而**单测全绿**
    （单测要么只喂 tracker、要么不校验这三个文件的具体来源），只有逐例差分才发现。
-4. **核心模块不得反向 import `r20_backend.dashboard_cache`**（会与 `routers/dashboard.py` 的
-   `import r20_backend.dashboard_cache` 构成循环）。
+4. **核心模块不得反向 import `astra_backend.dashboard_cache`**（会与 `routers/dashboard.py` 的
+   `import astra_backend.dashboard_cache` 构成循环）。
 
 另外钉住门面公开面：测试直接经 `dashboard.<name>` 调用的那批符号必须仍在。
 """
@@ -41,15 +41,15 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import r20_backend.dashboard_cache as app  # noqa: E402
-from r20_backend import dashboard_payload as payload_pkg  # noqa: E402
-from r20_backend.dashboard_payload import (  # noqa: E402
+import astra_backend.dashboard_cache as app  # noqa: E402
+from astra_backend import dashboard_payload as payload_pkg  # noqa: E402
+from astra_backend.dashboard_payload import (  # noqa: E402
     bills as bills_mod, cache, cache_payload, factors, health, integrity_sidecars,
     local_reads, market, order_view, position_view, slim, trade_stats,
     trader_leaderboard,
 )
 
-PAYLOAD_DIR = ROOT / "r20_backend" / "dashboard_payload"
+PAYLOAD_DIR = ROOT / "astra_backend" / "dashboard_payload"
 
 # 测试与沙箱会直接访问的门面符号（实测清单：tests/*.py 的 dashboard.<name>）
 FACADE_SURFACE = [
@@ -58,7 +58,7 @@ FACADE_SURFACE = [
     "AI_DECISIONS_FILE", "AI_HISTORY_FILE", "AI_LAST_PROMPT_FILE", "AI_MEMORY_MD_FILE",
     "NEWS_SENTIMENT_FILE", "REPORT_JSON_FILE", "LEDGER_JSON_FILE",
     "POSITION_TRACKER_FILE", "FACTOR_LIBRARY_FILE", "SNAPSHOTS_JSON_FILE",
-    # 已迁出的函数（必须仍可从 r20_backend.dashboard_cache 取到）
+    # 已迁出的函数（必须仍可从 astra_backend.dashboard_cache 取到）
     "slim_payload", "load_position_trackers", "enrich_position_risk_fields",
     "_load_local_factor_library", "_build_factors_from_local_files",
     "_load_cross_venue_data", "load_trading_memory_md", "build_ai_health",
@@ -77,7 +77,7 @@ CORE_MODULES = (slim, market, factors, health, cache, local_reads, bills_mod,
 
 
 def _core_aliases() -> dict[str, object]:
-    """收集 r20_backend.dashboard_cache 里 `from ...dashboard_payload.X import Y as _core_...` 的别名。"""
+    """收集 astra_backend.dashboard_cache 里 `from ...dashboard_payload.X import Y as _core_...` 的别名。"""
     out: dict[str, object] = {}
     for name, value in vars(app).items():
         if name.startswith("_core") and callable(value):
@@ -98,7 +98,7 @@ def _tokens(name: str) -> set[str]:
 class ShellDisciplineTests(unittest.TestCase):
     def setUp(self):
         self.aliases = _core_aliases()
-        self.assertTrue(self.aliases, "r20_backend.dashboard_cache 里找不到任何 _core_* 薄壳别名")
+        self.assertTrue(self.aliases, "astra_backend.dashboard_cache 里找不到任何 _core_* 薄壳别名")
 
     # ── 1/2/3. 薄壳调用形态 ────────────────────────────────────
     @staticmethod
@@ -126,11 +126,11 @@ class ShellDisciplineTests(unittest.TestCase):
     def test_every_shell_forwards_correctly(self):
         problems: list[str] = []
         checked = 0
-        app_module_name = getattr(app, "__name__", "r20_backend.dashboard_cache")
+        app_module_name = getattr(app, "__name__", "astra_backend.dashboard_cache")
         for fname, fobj in vars(app).items():
             if fname.startswith("__") or not inspect.isfunction(fobj):
                 continue
-            # 只审查**定义在本门面模块**里的函数：全量跑时别的测试会往 r20_backend.dashboard_cache
+            # 只审查**定义在本门面模块**里的函数：全量跑时别的测试会往 astra_backend.dashboard_cache
             # 上挂函数（inspect.getsource 拿到的首语句是赋值而非 def），
             # 单独跑该用例时不存在 → 曾导致"单跑通过、全量失败"。
             if getattr(fobj, "__module__", None) != app_module_name:
@@ -205,7 +205,7 @@ class ShellDisciplineTests(unittest.TestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for a in node.names:
-                        if a.name == "r20_backend.dashboard_cache" or a.name.startswith("dashboard."):
+                        if a.name == "astra_backend.dashboard_cache" or a.name.startswith("dashboard."):
                             offenders.append(f"{path.name}:{node.lineno} import {a.name}")
                 elif isinstance(node, ast.ImportFrom):
                     mod = node.module or ""
@@ -219,11 +219,11 @@ class ShellDisciplineTests(unittest.TestCase):
         missing = [m.__name__ for m in CORE_MODULES
                    if not any(getattr(v, "__module__", None) == m.__name__
                               for v in vars(app).values())]
-        self.assertEqual(missing, [], f"这些域模块未被 r20_backend.dashboard_cache 导入，沙箱覆盖不到: {missing}")
+        self.assertEqual(missing, [], f"这些域模块未被 astra_backend.dashboard_cache 导入，沙箱覆盖不到: {missing}")
 
     # ── 4b. 迁移完整性：导入的 _core_* 别名必须真的被调用 ──────────
     def test_every_core_alias_is_used(self):
-        """门面导入的每个 `_core_*` 别名，必须在 r20_backend/dashboard_cache.py 里被**真正引用**。
+        """门面导入的每个 `_core_*` 别名，必须在 astra_backend/dashboard_cache.py 里被**真正引用**。
 
         来历：第九刀替换 Phase 2 段落时，替换区间误把夹在中间的
         「2.5 Multi-Venue Parity」调用点一并删掉 —— 导入语句还在、函数也还在，
@@ -234,13 +234,13 @@ class ShellDisciplineTests(unittest.TestCase):
         实测是靠"直调适配器返回 2 条仓位 vs 线上 payload 0 条"才坐实的，
         故这里把它钉死：只导入不调用 = 迁移没做完。
         """
-        src = (ROOT / "r20_backend" / "dashboard_cache.py").read_text(encoding="utf-8")
+        src = (ROOT / "astra_backend" / "dashboard_cache.py").read_text(encoding="utf-8")
         # 按 AST 行号精确剔除导入语句本身（含括号多行形态），再数引用
         tree = ast.parse(src)
         drop: set[int] = set()
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                    "r20_backend.dashboard_payload"):
+                    "astra_backend.dashboard_payload"):
                 drop.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
         body = "\n".join(
             line for i, line in enumerate(src.splitlines(), 1) if i not in drop
@@ -251,20 +251,20 @@ class ShellDisciplineTests(unittest.TestCase):
                 unused.append(alias)
         self.assertEqual(
             unused, [],
-            "这些 _core_* 别名只被导入、在 r20_backend/dashboard_cache.py 里从不引用 —— "
+            "这些 _core_* 别名只被导入、在 astra_backend/dashboard_cache.py 里从不引用 —— "
             "很可能是替换段落时把调用点一起删掉了（静默丢失该域数据）: " + str(unused),
         )
 
     # ── 5. 公开面 ─────────────────────────────────────────────
     def test_facade_surface_intact(self):
         missing = [n for n in FACADE_SURFACE if not hasattr(app, n)]
-        self.assertEqual(missing, [], f"r20_backend.dashboard_cache 缺少测试直接引用的符号: {missing}")
+        self.assertEqual(missing, [], f"astra_backend.dashboard_cache 缺少测试直接引用的符号: {missing}")
 
     # ── 6. 接缝传导（最关键）：patch 门面路径常量必须影响已迁出的核心 ──
     def test_path_constant_patch_reaches_moved_cores(self):
         import json
         import tempfile
-        tmp = Path(tempfile.mkdtemp(prefix="r20-dash-seam-"))
+        tmp = Path(tempfile.mkdtemp(prefix="astra-dash-seam-"))
         (tmp / "t.json").write_text(json.dumps({"BTC-USDT-SWAP_long": {"strategy_tag": "SEAM"}}),
                                     encoding="utf-8")
         with patch.object(app, "POSITION_TRACKER_FILE", str(tmp / "t.json")):
@@ -299,7 +299,7 @@ class ShellDisciplineTests(unittest.TestCase):
         """`load_local_reads`（B2 第六刀）读 6 个路径，必须全部由门面在调用时注入。"""
         import json
         import tempfile
-        tmp = Path(tempfile.mkdtemp(prefix="r20-dash-localreads-"))
+        tmp = Path(tempfile.mkdtemp(prefix="astra-dash-localreads-"))
         (tmp / "report.json").write_text(json.dumps({"marker": "REPORT"}), encoding="utf-8")
         (tmp / "snaps.json").write_text(json.dumps([{"time": "2026-01-01 00:00:00", "total_eq": 200.0}]),
                                         encoding="utf-8")
@@ -335,5 +335,207 @@ class ShellDisciplineTests(unittest.TestCase):
         self.assertTrue(str(app.DATA_DIR).endswith("data") or "data" in str(app.DATA_DIR))
 
 
+class ReaderFamilyFailureSemanticsTest(unittest.TestCase):
+    """面板侧**读取器家族**：缺失静默、读不出来必披露（第一百四十九刀）。
+
+    缺陷形状：`readers.read_json` / `read_text` / `read_text_lines` 旧实现都是
+    "任何失败 ⇒ 默认值/空"（`except (OSError, ValueError, UnicodeDecodeError): return default`），
+    而同一模块里我在第 52 刀刚给 `load_json_dict_disclosed` 补了披露 ⇒ **一个模块两套失败语义**，
+    正是本仓反复吃过的"同一语义两处写"。这些读取器喂的是面板区块（AI 决策、因子库、
+    复盘报告、快讯、日志尾），静默失败等于把"读坏了"渲染成"确实没有"。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory(prefix="reader-family-")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def _corrupt(self, name, text="{ 半截"):
+        f = self.base / name
+        f.write_text(text, encoding="utf-8")
+        return f
+
+    def test_json_reader_discloses_corrupt_but_is_silent_when_missing(self):
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import read_json
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            missing = read_json(self.base / "nope.json", {"d": 1})
+        self.assertEqual(missing, {"d": 1})
+        self.assertEqual(buf.getvalue(), "", "文件不存在是合法空态，不应吵")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            broken = read_json(self._corrupt("broken.json"), {"d": 1})
+        self.assertEqual(broken, {"d": 1})
+        self.assertIn("[面板] warn", buf.getvalue())
+        self.assertIn("请勿据此判断", buf.getvalue())
+
+    def test_text_reader_discloses_corrupt_but_is_silent_when_missing(self):
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import read_text
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(read_text(self.base / "nope.txt", "d"), "d")
+        self.assertEqual(buf.getvalue(), "")
+        # 目录不是可读文本：存在但读不出来 ⇒ 必披露
+        (self.base / "adir").mkdir()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(read_text(self.base / "adir", "d"), "d")
+        self.assertIn("[面板] warn", buf.getvalue())
+
+    def test_text_lines_reader_discloses_corrupt_but_is_silent_when_missing(self):
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import read_text_lines
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(read_text_lines(self.base / "nope.log", 10), [])
+        self.assertEqual(buf.getvalue(), "")
+        (self.base / "adir").mkdir()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(read_text_lines(self.base / "adir", 10), [])
+        self.assertIn("[面板] warn", buf.getvalue())
+        # 正常读取不得吵，且语义不变（strip / limit）
+        f = self.base / "ok.log"
+        f.write_text("a\n\n b \nc\n", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(read_text_lines(f, 2), ["b", "c"])
+        self.assertEqual(buf.getvalue(), "")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class DisclosedJsonReaderTest(unittest.TestCase):
+    """面板侧读取必须**披露**而非静默返回空（第 52 刀）。
+
+    背景：同一个"读追踪器"语义此前有**两份实现**（`factors` 吃文件路径、
+    `ledger_view` 吃目录），且两份都是 `except Exception: return {}` ——
+    本仓两个经典坑叠在一起：*同一语义两处写 ⇒ 必然漂移* + *读不到被渲染成"没有"*。
+    本刀收敛到共享读取器并补披露（返回值不变，保持兼容）。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory(prefix="disclosed-read-")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def test_shared_reader_distinguishes_missing_from_unreadable(self):
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import load_json_dict_disclosed
+        missing = self.base / "nope.json"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            data, err = load_json_dict_disclosed(missing)
+        self.assertEqual((data, err), ({}, ""))
+        self.assertEqual(buf.getvalue(), "", "文件不存在是合法空态，不应吵")
+
+        broken = self.base / "broken.json"
+        broken.write_text("{ 半截", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            data, err = load_json_dict_disclosed(broken)
+        self.assertEqual(data, {})
+        self.assertTrue(err, "读不出来必须给出原因（返回值不变，但要能区分）")
+        self.assertIn("[面板] warn", buf.getvalue())
+        self.assertIn("请勿据此判断", buf.getvalue(), "披露必须点明'空不等于没有'")
+
+    def test_non_dict_json_is_reported_not_silently_emptied(self):
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import load_json_dict_disclosed
+        f = self.base / "list.json"
+        f.write_text("[1, 2, 3]", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            data, err = load_json_dict_disclosed(f)
+        self.assertEqual(data, {})
+        self.assertIn("顶层应为 dict", err)
+        self.assertIn("形状", buf.getvalue())
+
+    def test_valid_dict_returns_data_without_noise(self):
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.readers import load_json_dict_disclosed
+        f = self.base / "ok.json"
+        f.write_text(_json.dumps({"BTC-USDT-SWAP_long": {"scale_count": 1}}), encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            data, err = load_json_dict_disclosed(f)
+        self.assertEqual(err, "")
+        self.assertEqual(data["BTC-USDT-SWAP_long"]["scale_count"], 1)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_both_tracker_loaders_agree_and_both_disclose(self):
+        """防漂移的行为钉：两份实现（路径版 / 目录版）对同一输入必须一致。"""
+        import io
+        from contextlib import redirect_stdout
+        from astra_backend.dashboard_payload.factors import load_position_trackers as by_path
+        from astra_backend.dashboard_payload.ledger_view import load_position_trackers as by_dir
+        (self.base / "position_trackers.json").write_text("{ 坏", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            a = by_path(str(self.base / "position_trackers.json"))
+            b = by_dir(str(self.base))
+        self.assertEqual(a, b, "两份实现已经漂移（同输入不同结果）")
+        self.assertEqual(a, {})
+        self.assertGreaterEqual(buf.getvalue().count("[面板] warn"), 2,
+                                "两份实现都必须披露，而不是只有一份")
+
+    def test_multi_venue_fallback_discloses_instead_of_silently_empty(self):
+        """源码钉：多所组合的兜底分支必须带披露语（此前是静默 `return {}`）。"""
+        src = (Path(__file__).resolve().parents[2] / "astra_backend" / "dashboard_payload"
+               / "market.py").read_text(encoding="utf-8")
+        self.assertIn("多所组合读取失败", src)
+        self.assertIn("请勿据此判断", src)
+
+class ScaleOutSurfacedFromTrackerTest(unittest.TestCase):
+    """切分止盈状态必须从 tracker 接到持仓行上（第一百九十八刀）。
+
+    背景：`frontend/.../PositionsOrdersPanel.vue` 一直读 `p.scaleOutPhase`（决定切分徽标）
+    与 `p.scaleOutTp`（决定 TP 显示），而这两个键**后端从未发过** —— 数据其实一直在
+    tracker 里（`scripts/trader/scale_out.py` 写 `scale_out_phase`/`scale_out_tp`），
+    只是没被接出来 ⇒ 徽标永远不亮。
+    """
+
+    def setUp(self):
+        from astra_backend.dashboard_payload.factors import enrich_position_risk_fields
+        self.enrich = enrich_position_risk_fields
+
+    def _pos(self, inst="X-USDT-SWAP", side="long"):
+        return [{"instId": inst, "posSide": side, "pos": "10", "markPx": "2.0", "lever": "5"}]
+
+    def test_tracker_scale_out_state_reaches_the_row(self):
+        trackers = {"X-USDT-SWAP_long": {"scale_out_phase": 1, "scale_out_tp": 2.34}}
+        row = self.enrich("unused.json", self._pos(), trackers)[0]
+        self.assertEqual(row.get("scaleOutPhase"), 1)
+        self.assertAlmostEqual(row.get("scaleOutTp"), 2.34)
+
+    def test_absent_state_stays_absent_not_zero(self):
+        """**缺席即缺席**：没 tracker 就不写这两个键 —— 写成 0 等于替币安/Gate 行
+        断言"切分未开始"（读不到 ≠ 没有）。"""
+        rows = self.enrich("unused.json", self._pos("Y-USDT-SWAP"), {})
+        self.assertNotIn("scaleOutPhase", rows[0])
+        self.assertNotIn("scaleOutTp", rows[0])
+
+    def test_producer_and_consumer_names_agree(self):
+        """源码钉：tracker 侧写 `scale_out_phase`、行上给 `scaleOutPhase` —— 两侧名字都必须真实存在。"""
+        root = Path(__file__).resolve().parents[2]
+        producer = (root / "scripts" / "trader" / "scale_out.py").read_text(encoding="utf-8")
+        self.assertIn('t["scale_out_phase"]', producer)
+        self.assertIn('t["scale_out_tp"]', producer)
+        facet = (root / "astra_backend" / "dashboard_payload" / "factors.py").read_text(encoding="utf-8")
+        self.assertIn('"scaleOutPhase"', facet)
+        self.assertIn('"scaleOutTp"', facet)
+        ui = (root / "frontend" / "src" / "components" / "dashboard"
+              / "PositionsOrdersPanel.vue").read_text(encoding="utf-8")
+        self.assertIn("scaleOutPhase", ui)
+        self.assertIn("scaleOutTp", ui)

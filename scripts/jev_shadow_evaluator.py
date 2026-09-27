@@ -20,7 +20,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from r20_backend.time_utils import parse_beijing
+from astra_backend.time_utils import parse_beijing
 
 DEFAULT_REVIEWS = Path("data/jev_shadow_reviews.jsonl")
 DEFAULT_OUTCOMES = Path("data/jev_shadow_entry_outcomes.jsonl")

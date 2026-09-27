@@ -108,7 +108,14 @@ def _legacy_pending(pending_orders_detail, tz_bj):
                 side_str = "限价买多" if (side_raw == "buy" and ord_type != "market") else ("市价买多" if side_raw == "buy" else ("限价卖空" if ord_type != "market" else "市价卖空"))
             raw_px = str(o.get("px") or "").strip()
             px_val = raw_px if raw_px and raw_px != "0" else ("市价" if ord_type == "market" else "--")
-            sz_val = str(o.get("sz", "--"))
+            # aa6d4e0 归一（张数取绝对值 + 缺值给 `--`）：参照实现同步补齐，
+            # 否则差分在 `sz=None` / 负张数上失去意义。既有取数口径未改。
+            raw_sz = o.get("sz")
+            try:
+                sz_float = float(raw_sz or 0)
+                sz_val = f"{abs(sz_float):g}" if sz_float != 0 else str(raw_sz if raw_sz is not None else "--")
+            except (TypeError, ValueError):
+                sz_val = str(raw_sz if raw_sz is not None else "--")
             ord_id = str(o.get("ordId", ""))
             attach_list = o.get("attachAlgoOrds", [])
             tp_sl_info = ""
@@ -392,9 +399,27 @@ class PendingPriceDisplayTest(unittest.TestCase):
         out = build_pending_order_lines([o], tz_bj=TZ_BJ, datetime=datetime)
         self.assertIn("--张", out)
 
-    def test_sz_none_renders_literal_none(self):
-        """既有行为：`sz=None` 渲染成字面 `None`（不是 `--`）—— 钉住它。"""
-        self.assertIn("None张", self._line(sz=None))
+    def test_sz_none_renders_dash(self):
+        """`sz=None` 渲染成 `--`（**旧行为是字面 `None`**，见下）。
+
+        aa6d4e0（修复负数张数泄漏）把 sz 归一为：能转数 → `abs()` 后 `:g`；
+        否则 `--`。因此 `sz=None`（键存在但值为空）与「键缺失」现在**同解**，
+        而旧实现走 `str(o.get("sz", "--"))` 得到字面 `"None"` —— 那是渲染 bug，
+        会让主脑看到 "None张" 这种噪音。本用例的方向是**钉住修复后行为**。
+        """
+        self.assertIn("--张", self._line(sz=None))
+        self.assertNotIn("None张", self._line(sz=None))
+
+    def test_sz_negative_renders_absolute(self):
+        """带符号张数必须取绝对值：Gate 用「正多负空」，负号泄漏到提示词会让
+        主脑把「3 张空」读成「-3 张多」。这是 aa6d4e0 修的真雷，补钉。"""
+        self.assertIn("3张", self._line(sz="-3"))
+        self.assertIn("2.5张", self._line(sz=-2.5))
+        self.assertIn("3张", self._line(sz="3"))
+        # 非数字保持原样（不臆造 `--`，也不必抛）
+        self.assertIn("abc张", self._line(sz="abc"))
+        # 零是"确实 0 张"，不是缺值
+        self.assertIn("0张", self._line(sz="0"))
 
     def test_ord_id_default_empty(self):
         self.assertIn("[挂单ID: ]", self._line())
@@ -470,13 +495,30 @@ class RandomParityTest(unittest.TestCase):
     PX = ["", "0", "0.0", "100", "  100  ", None, "abc"]
     POS_SIDES = ["long", "short", "LONG", "buy", "sell", "", None]
 
+    #: ⚠️ **文档化差异**（第一百一十九刀，2026-09-20）：对拍前把"键存在但值为 None"
+    #: 按**缺失**处理。
+    #:
+    #: 搬到前的实现用 `p.get(k, 默认)` —— 键存在但值为 None 时**回退不生效**，
+    #: 于是提示词把字面量 `None` 喂给模型（真机实测 `data/dashboard_last_good.json`
+    #: 的 binance UNI 行：`trailingStopPx: None` 而 `trailingSl: 9.025`、
+    #: `takeProfitPx: None` 而 `exchangeTp: 8.365`、`stage_desc: None` 而
+    #: `stageDesc: '云端双腿防护中'` ⇒ 模型被告知"无止损/无止盈/状态 None"，
+    #: 而交易所那笔空仓**确实挂着**云端双腿）。
+    #:
+    #: 新实现一律走 `or` 链回退到真实来源，并追加 `保护:` 判据段。本差异**只**落在
+    #: "值为 None"这一点上（且新行为更正确），故对拍时把 None 值键删掉、两边吃同一份
+    #: 输入；新行为另由 `NoneFallbackTest` / `ProtectionVerdictPromptTest` 正向钉住。
+    @staticmethod
+    def _doc_delta_normalize(position):
+        return {k: v for k, v in position.items() if v is not None}
+
     def test_positions_random_parity(self):
         rng = random.Random(30301)
         for i in range(12000):
             n = rng.randint(0, 3)
             positions = []
             for _ in range(n):
-                positions.append({
+                positions.append(self._doc_delta_normalize({
                     "name": rng.choice(["BTC", None]), "instId": rng.choice(["B", "E"]),
                     "side": rng.choice(self.POS_SIDES),
                     "avgPx": rng.choice(["100", "0", None, "abc"]),
@@ -490,7 +532,7 @@ class RandomParityTest(unittest.TestCase):
                     "trailingStopPx": rng.choice(["95", None]),
                     "trailingSl": rng.choice(["94", None]),
                     "takeProfitPx": rng.choice(["130", None]),
-                })
+                }))
             arg = None if (n == 0 and rng.random() < 0.5) else positions
             got = build_position_lines(arg, safe_float=_sf)
             want = _legacy_positions(arg, _sf)
@@ -601,5 +643,230 @@ class WiringTest(unittest.TestCase):
                 self.assertFalse((node.module or "").startswith("scripts.ai_factor_trader"))
 
 
+class NoneFallbackTest(unittest.TestCase):
+    """第一百一十九刀：**键存在但值为 None** 时必须继续回退到真实来源。
+
+    真机形状（`data/dashboard_last_good.json` 的 binance UNI 行）：
+    `trailingStopPx=None` 而 `trailingSl=9.025`、`exchangeTp=8.365`、
+    `stage_desc=None` 而 `stageDesc='云端双腿防护中'`。
+    旧实现把 `None` / `--` 喂给模型 ⇒ 模型以为这笔空仓**没有止损止盈**。
+    """
+
+    LIVE_ROW = {"venue": "binance", "instId": "UNI-USDT-SWAP", "posSide": "short",
+                "avgPx": "8.825", "markPx": "8.774", "upl": "4.17", "uplRatio": "0.2",
+                "lever": "6", "trailingStopPx": None, "trailingSl": 9.025,
+                "takeProfitPx": None, "exchangeTp": 8.365, "stage_desc": None,
+                "stageDesc": "云端双腿防护中"}
+
+    def _line(self, **over):
+        row = dict(self.LIVE_ROW, **over)
+        return build_position_lines([row], safe_float=_sf)
+
+    def test_none_valued_stop_falls_back_to_real_stop(self):
+        out = self._line()
+        self.assertIn("动态止损线: 9.025", out)
+        self.assertIn("目标止盈: 8.365", out)
+
+    def test_none_valued_stage_falls_back_to_camel_key(self):
+        self.assertIn("状态: 云端双腿防护中", self._line())
+
+    def test_never_emits_the_literal_none(self):
+        """提示词里出现字面量 `None` 就是 bug（模型会当字符串读）。"""
+        self.assertNotIn("None", self._line())
+        self.assertNotIn("None", self._line(trailingSl=None, exchangeSl=None,
+                                           exchangeTp=None, stageDesc=None))
+
+    def test_absent_everything_still_shows_dashes(self):
+        out = self._line(trailingStopPx=None, trailingSl=None, takeProfitPx=None,
+                         exchangeTp=None, stageDesc=None)
+        self.assertIn("动态止损线: --", out)
+        self.assertIn("目标止盈: --", out)
+        self.assertIn("状态: 持有监控中", out)
+
+    def test_exchange_sl_is_the_last_fallback(self):
+        out = self._line(trailingStopPx=None, trailingSl=None, exchangeSl=9.5)
+        self.assertIn("动态止损线: 9.5", out)
+
+
+class ProtectionVerdictPromptTest(unittest.TestCase):
+    """第一百一十八/十九刀：把**保护判据**如实告诉模型（此前完全没有这个信息）。"""
+
+    def _line(self, **over):
+        row = {"venue": "binance", "instId": "UNI-USDT-SWAP", "posSide": "short",
+               "avgPx": "9", "markPx": "8.9", "upl": "1", "uplRatio": "0.1"}
+        row.update(over)
+        return build_position_lines([row], safe_float=_sf)
+
+    def test_fully_protected_is_stated(self):
+        out = self._line(protectionStatus="fully_protected",
+                         protectionCoveragePct=100.0, protectionExpiry="never")
+        self.assertIn("保护: 完全保护 100%", out)
+
+    def test_trigger_price_type_is_disclosed(self):
+        """第一百六十七刀：按什么价触发要如实说（mark 抗插针，last 易被插针打掉）。"""
+        self.assertIn("止损按标记价触发", self._line(
+            protectionStatus="fully_protected", protectionCoveragePct=100.0,
+            protectionSlTriggerPxType="mark"))
+        self.assertIn("止损按最新成交价触发", self._line(
+            protectionStatus="fully_protected", protectionCoveragePct=100.0,
+            protectionSlTriggerPxType="last"))
+
+    def test_unreported_trigger_type_says_so_never_guesses(self):
+        """腿在但类型未上报 ⇒ 明说"未上报"，**不得**默认成标记价。"""
+        out = self._line(protectionStatus="fully_protected", protectionCoveragePct=100.0,
+                         protectionSlTriggerPxType="unknown")
+        self.assertIn("止损触发价类型未上报", out)
+        self.assertNotIn("止损按标记价触发", out)
+
+    def test_missing_trigger_type_field_adds_nothing(self):
+        """字段缺（旧数据/无该类腿）⇒ 不提这一段，不编。"""
+        out = self._line(protectionStatus="fully_protected", protectionCoveragePct=100.0)
+        self.assertNotIn("触发", out)
+
+    def test_unprotected_is_shouted_not_softened(self):
+        out = self._line(protectionStatus="unprotected", protectionCoveragePct=0.0)
+        self.assertIn("保护: ⚠️ 无活止损腿", out)
+
+    def test_unknown_is_not_dressed_up_as_safe(self):
+        out = self._line(protectionStatus="unknown")
+        self.assertIn("保护状态不可判定", out)
+        self.assertNotIn("完全保护", out)
+
+    def test_expired_leg_is_marked(self):
+        out = self._line(protectionStatus="partially_protected",
+                         protectionCoveragePct=50.0, protectionExpiry="expired")
+        self.assertIn("腿已过期", out)
+
+    def test_full_size_stop_without_tp_is_not_called_insufficient(self):
+        """⭐ 第一百二十一刀：修我自己上一刀造出的**自相矛盾文案**。
+
+        OKX 判据里 `partially_protected` 含"只有满量止损、没有止盈"这一档
+        （下行已全覆盖）⇒ 旧文案渲染成「部分保护（覆盖不足） 100%」，自相矛盾。
+        """
+        out = self._line(protectionStatus="partially_protected",
+                         protectionCoveragePct=100.0)
+        self.assertIn("止损满量但缺止盈腿", out)
+        self.assertNotIn("覆盖不足", out)
+        self.assertNotIn("100%", out, "覆盖率已由文字表达，不重复自相矛盾的百分比")
+
+    def test_partial_without_coverage_number_claims_nothing_extra(self):
+        """没有覆盖率数字时不得宣称"覆盖不足"（无证据不下结论）。"""
+        out = self._line(protectionStatus="partially_protected")
+        self.assertIn("部分保护（覆盖量未知）", out)
+        self.assertNotIn("覆盖不足", out)
+
+    def test_partial_coverage_states_the_real_percentage(self):
+        out = self._line(protectionStatus="partially_protected",
+                         protectionCoveragePct=40.0)
+        self.assertIn("止损仅覆盖 40%", out)
+        self.assertNotIn("覆盖不足", out)
+
+    def test_no_verdict_no_segment(self):
+        """没有判据就不写这一段（不假装）。"""
+        self.assertNotIn("保护:", self._line())
+
+
 if __name__ == "__main__":
     unittest.main()
+
+# WRITE-PROBE
+
+class OrphanLegsPromptTest(unittest.TestCase):
+    """第一百七十六刀：把"该所有会减新仓的遗留腿"如实告诉模型（**只报告**）。"""
+
+    _ORPH = {"readable": True, "attributed": [{"symbol": "XRP"}, {"symbol": "ARB"}],
+             "unattributed": [{"symbol": "SOL"}], "ledgerRows": "ok"}
+
+    def _line(self, rows):
+        return build_position_lines(rows, safe_float=_sf)
+
+    def _row(self, **over):
+        row = {"venue": "binance", "name": "XRP", "side": "short", "avgPx": "1.3",
+               "markPx": "1.32", "upl": "1", "uplRatio": "0.01",
+               "protectionStatus": "fully_protected", "protectionCoveragePct": 100.0}
+        row.update(over)
+        return row
+
+    def test_clause_states_candidates_and_the_reduce_risk(self):
+        out = self._line([self._row(protectionOrphans=self._ORPH)])
+        self.assertIn("该所孤儿腿: 可归因 2 条", out)
+        self.assertIn("ARB", out)
+        self.assertIn("可能按旧触发价减仓", out, "必须点明孤儿腿会减新仓")
+        self.assertIn("归属不可判定 1 条（一律不碰）", out)
+
+    def test_clause_appears_once_per_venue(self):
+        out = self._line([self._row(protectionOrphans=self._ORPH),
+                          self._row(name="ETH", protectionOrphans=self._ORPH)])
+        self.assertEqual(out.count("该所孤儿腿"), 1, "场所级事实不得每行刷一遍")
+
+    def test_unreadable_legs_say_undecidable(self):
+        out = self._line([self._row(protectionOrphans={"readable": False, "attributed": [],
+                                                       "unattributed": [], "ledgerRows": "unknown"})])
+        self.assertIn("该所孤儿腿: **不可判定**", out, "读不到不得含糊成'没有孤儿腿'")
+
+    def test_missing_ledger_is_disclosed(self):
+        orph = dict(self._ORPH, ledgerRows="unavailable")
+        out = self._line([self._row(protectionOrphans=orph)])
+        self.assertIn("台账未读到", out, "台账读不到 ⇒ 可归因数可能偏少，必须披露")
+
+    def test_no_clause_when_no_orphans_or_no_field(self):
+        clean = {"readable": True, "attributed": [], "unattributed": [], "ledgerRows": "ok"}
+        self.assertNotIn("该所孤儿腿", self._line([self._row(protectionOrphans=clean)]))
+        self.assertNotIn("该所孤儿腿", self._line([self._row()]), "旧数据无该字段 ⇒ 不提，不编")
+
+    def test_prompt_never_promises_cancellation(self):
+        out = self._line([self._row(protectionOrphans=self._ORPH)])
+        for forbidden in ("自动撤销", "已撤销", "系统会撤"):
+            self.assertNotIn(forbidden, out, f"提示词不得暗示会自动撤（出现 {forbidden}）")
+
+class OrphanMismatchPromptTest(unittest.TestCase):
+    """第一百八十一刀：提示词里两种 mismatch 的语义必须分开（同面板/指标口径）。"""
+
+    def _line(self, orph):
+        row = {"venue": "binance", "name": "SOL", "side": "long", "avgPx": "100", "markPx": "101",
+               "upl": "1", "uplRatio": "0.01", "protectionStatus": "fully_protected",
+               "protectionCoveragePct": 100.0, "protectionOrphans": orph}
+        return build_position_lines([row], safe_float=_sf)
+
+    def test_side_mismatch_says_not_counted(self):
+        out = self._line({"readable": True, "attributed": [], "unattributed": [],
+                          "sideMismatch": [{"symbol": "SOL"}], "sizeMismatch": [],
+                          "ledgerRows": "ok"})
+        self.assertIn("方向与本仓不符 1 条", out)
+        self.assertIn("不计入覆盖", out, "反向腿必须明说不计覆盖")
+
+    def test_size_mismatch_says_still_counted(self):
+        out = self._line({"readable": True, "attributed": [], "unattributed": [],
+                          "sideMismatch": [], "sizeMismatch": [{"symbol": "XRP"}],
+                          "ledgerRows": "ok"})
+        self.assertIn("量与任何持仓都不符 1 条", out)
+        self.assertIn("仍被计入覆盖", out, "量不符的腿必须明说仍计覆盖但归属存疑")
+
+    def test_no_mismatch_no_noise(self):
+        out = self._line({"readable": True, "attributed": [], "unattributed": [],
+                          "sideMismatch": [], "sizeMismatch": [], "ledgerRows": "ok"})
+        self.assertNotIn("该所孤儿腿", out)
+
+class UnclassifiedLegsPromptTest(unittest.TestCase):
+    """第一百八十二刀：提示词要说清"认不出的腿不计入覆盖"（覆盖可能被低估）。"""
+
+    def _line(self, **over):
+        orph = {"readable": True, "attributed": [], "unattributed": [], "sideMismatch": [],
+                "sizeMismatch": [], "foreignCount": 0, "unparsedCount": 0, "ledgerRows": "ok"}
+        orph.update(over)
+        row = {"venue": "binance", "name": "XRP", "side": "long", "avgPx": "1", "markPx": "1",
+               "upl": "0", "uplRatio": "0", "protectionStatus": "fully_protected",
+               "protectionCoveragePct": 100.0, "protectionOrphans": orph}
+        return build_position_lines([row], safe_float=_sf)
+
+    def test_foreign_legs_are_disclosed_with_the_underestimate_risk(self):
+        out = self._line(foreignCount=3)
+        self.assertIn("认不出类型 3 条", out)
+        self.assertIn("不计入覆盖", out)
+        self.assertIn("覆盖被低估", out, "必须点明'覆盖可能被低估'（否则模型以为保护是满的）")
+
+    def test_unparsed_legs_are_disclosed(self):
+        self.assertIn("行解析不了 2 条", self._line(unparsedCount=2))
+
+    def test_zero_means_no_noise(self):
+        self.assertNotIn("该所孤儿腿", self._line())

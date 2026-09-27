@@ -30,11 +30,11 @@ export interface VenueAccount {
   available: number | null
   positions_count: number | null
   open_orders_count: number | null
-  last_sync_ts: number | null
+  last_sync_ms: number | null   // 第一百六十九刀正名：值一直是毫秒
   reason: string
 }
 
-const ENV_KEY = 'r20.venueAccounts.environment'
+const ENV_KEY = 'astra.venueAccounts.environment'
 
 export const useVenueAccountsStore = defineStore('venueAccounts', () => {
   const environment = ref<VenueEnv>(localStorage.getItem(ENV_KEY) === 'live' ? 'live' : 'demo')

@@ -109,7 +109,7 @@ def fetch_other_venue_positions(environment: str,
             # 审计 C3：档位轴必须经 ADAPTER_ENV 唯一映射（execution_router/manual
             # close 同源）——无档 get_adapter 走 legacy 布尔→未钉死域，generic LIVE
             # 键被打进错误沙盒域正是「跨所封顶每周期 INVALID_KEY 禁开仓」的根因。
-            from r20_backend.close_intent import adapter_environment as _adapter_env
+            from astra_backend.close_intent import adapter_environment as _adapter_env
             ad = venue_registry.get_adapter(name, environment=_adapter_env(name, environment or ""))
             rows = ad.positions() or []
             live = [p for p in rows if abs(float(p.get("size_signed") or 0)) > 1e-12]
@@ -156,7 +156,7 @@ def close_position_confirmed(inst_id: str, pos_side: str, before_size: float, ve
     target_venue = str(venue or "okx").lower()
     if target_venue != "okx":
         try:
-            from r20_backend import execution_router
+            from astra_backend import execution_router
             # 审计 C2：周期内冻结环境（okx_rest 按 current_environment 签名，读
             # selected 会在 demo↔live 中途切换时产生跨环境混合决策）
             env = current_environment()
@@ -216,7 +216,12 @@ def close_position_confirmed(inst_id: str, pos_side: str, before_size: float, ve
         saw_successful_query = True
         remaining = 0.0
         for position in positions:
-            if position.get("instId") == inst_id and str(position.get("posSide", "net")).lower() == pos_side:
+            # 第一百八十六刀：净持仓账户的仓位 `posSide` 是 `"net"`，精确相等匹配不上
+            # ⇒ `remaining` 保持 0.0 ⇒ **在仓位仍然开着的时候宣称"已平仓"**（假成功；
+            # 这是"读不到当成没有"里最危险的一档：调用方会以为已经空仓）。
+            # 与 `scale_out`/`cloud_protection` 同一 convention：`in {pos_side, "net"}`。
+            if (position.get("instId") == inst_id
+                    and str(position.get("posSide", "net")).lower() in {pos_side, "net"}):
                 remaining = abs(float(position.get("pos", 0) or 0))
                 break
         if remaining < max(1e-12, abs(before_size) * 0.001):

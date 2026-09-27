@@ -1,10 +1,10 @@
-# R20 本地改动记录
+# AstraQuant 本地改动记录
 
 ## 2026-09-26（下半场之二）
 
 ### Jev 执行档位：从「读了不生效」改为真正可配置
 
-问题：`enforcement_mode` 被硬编码成 `"shadow"`，`R20_JEV_ENFORCEMENT` 只被记进
+问题：`enforcement_mode` 被硬编码成 `"shadow"`，`ASTRA_JEV_ENFORCEMENT` 只被记进
 `configured_enforcement` —— 环境变量**读了却不生效**，而切换档位恰恰必须改代码，
 与方案 §6「`shadow`、`review`、`soft_veto` 必须可配置回滚，不得通过修改代码切换」
 正好相反。**已确认为漏实现**（原注释写的是防环境变量笔误的安全意图，但代价是档位
@@ -12,7 +12,7 @@
 
 修复：
 
-- 新增 `_jev_resolve_enforcement`：解析 `R20_JEV_ENFORCEMENT`，接受
+- 新增 `_jev_resolve_enforcement`：解析 `ASTRA_JEV_ENFORCEMENT`，接受
   `shadow` / `review` / `soft_veto` / `hard_veto`（大小写与空白容忍）。
   **非法值 fail-closed 回 `shadow`** —— 那是唯一在结构上不可能改变主脑执行的档位，
   因此「防笔误把观察者变成门禁」这个原始安全意图被完整保留，同时档位可配置。
@@ -27,7 +27,7 @@
   - 必须与主脑反向**或**明确 WAIT（`no_edge`），否则 `no_veto_grounds`；
   - `INSUFFICIENT_DATA` 不得当反向信号（§6 规则 5）。
 - 代码硬门禁失败 ⇒ `HARD_VETO`，由代码产生、不需要 Jev 证明（§6 规则 1）。
-- 新增 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`（默认 1）：置 1 时 Jev 自身最高只能
+- 新增 `ASTRA_JEV_HARD_VETO_ONLY_CODE_GATES`（默认 1）：置 1 时 Jev 自身最高只能
   到软否决，硬否决只允许来自代码门禁。放开时需显式设为 0。
 - **硬不变量**：持仓通道恒为 `SHADOW`、恒不影响执行，理由是
   `protection_always_code_controlled` —— 即使有人把档位设成 `soft_veto` 或
@@ -82,7 +82,7 @@
 - 摘要表新增 `baseline` 列，来自源台账中的 baseline 行数；`matured`、`baseline`、
   `measured` 三者分开展示，避免将无入场基线误读为收益测量失败。
 - 修复评估器 `--since/--until` 的时区契约：无 offset 文本现在通过
-  `r20_backend.time_utils.parse_beijing` 按北京时间解释，epoch 和显式 offset 保持原瞬间；
+  `astra_backend.time_utils.parse_beijing` 按北京时间解释，epoch 和显式 offset 保持原瞬间；
   JSON 报告的 `generated_at/since/until` 统一回显 `+08:00`，避免静默偏移 8 小时。
 - 补齐评估器边界契约：epoch 毫秒会先归一化为秒；`no_entry_baseline` 仅接受显式 `0`，
   缺值或非零值标为无效且不能生成配对收益；同一时间戳的多标的收益先聚合再计算序列回撤，
@@ -109,12 +109,12 @@
 - `not_ready` 与 `low_confidence` / `ambiguous` 统一归为 `ABSTAIN`，避免关系字段
   声称 `WAIT_VS_ENTRY`、执行档位却判定 `NONE` 的内部矛盾。
 - 将方向门槛与明确 WAIT/no_edge 门槛拆开：方向维持 `0.70`，no_edge 使用独立的
-  `R20_JEV_NO_EDGE_MIN_CONFIDENCE=0.54`，避免提高方向门槛后 no_edge 标签归零。
+  `ASTRA_JEV_NO_EDGE_MIN_CONFIDENCE=0.54`，避免提高方向门槛后 no_edge 标签归零。
 - 进一步拆开 no_edge **分类门槛**与 WAIT **否决门槛**：`0.54` 仅用于保留
   “市场平淡”标签；形成软否决候选必须另过
-  `R20_JEV_VETO_WAIT_MIN_CONFIDENCE=0.70` 和 `R20_JEV_VETO_MIN_ACTION_MARGIN=0.15`。
+  `ASTRA_JEV_VETO_WAIT_MIN_CONFIDENCE=0.70` 和 `ASTRA_JEV_VETO_MIN_ACTION_MARGIN=0.15`。
   因此 `0.60` 的明确 WAIT 会记录为 `no_edge`，但不再获得否决资格。
-- 修复 `R20_JEV_VETO_MIN_ACTION_MARGIN` 只约束 WAIT、未约束反向方向的问题。现在
+- 修复 `ASTRA_JEV_VETO_MIN_ACTION_MARGIN` 只约束 WAIT、未约束反向方向的问题。现在
   反向和明确 WAIT 两条否决路径都必须重新通过通用 veto margin；例如分类 margin
   `0.20` 虽已超过 `0.15`，当 veto margin 配为 `0.30` 时仍不得形成候选。
 - 记录当前 WAIT 否决路径的休止状态：截至 2026-09-26，双通道 WAIT 观测最大值
@@ -153,7 +153,7 @@
 - 移除 `cycle_data_valid`：实测该答案**从不参与任何判定**，只被记进
   `aggregate_answers` —— 一道既名不副实又白付一次推理成本的问题。整轮质量改由
   代码汇总记录在 `code_cycle_quality`。
-- 移除 `R20_JEV_DATA_VALID_MIN_PROBABILITY`：拆分后不再读取。留一个「读了却不
+- 移除 `ASTRA_JEV_DATA_VALID_MIN_PROBABILITY`：拆分后不再读取。留一个「读了却不
   生效」的环境变量比删掉它更危险（它会让人以为改得动）。
 - 新增 `question_semantics_version=2` 标记语义版本：1 = 拆分前（模型答
   `*_data_valid`，低分记 `invalid_data`），2 = 拆分后。**新旧样本不可混统计。**
@@ -234,7 +234,7 @@
 **仍未解决 / 已知局限**
 
 - 本次标定仅基于 9 轮 / 90 个候选，属**临时标定**，必须按已结算结果复标；
-  `R20_JEV_*` 环境变量可回滚，不得靠改代码切换。
+  `ASTRA_JEV_*` 环境变量可回滚，不得靠改代码切换。
 - 证据显示 `data_valid` 实际在测量**方向倾向**而非数据健康（与
   `price_position_in_range` 的标的内中心化相关 r=−0.55，与 `entry_15m.direction`
   r=−0.55），而代码侧 `data_quality` 恒为 `valid`。「数据是否有效」究竟归代码
@@ -257,11 +257,11 @@
 - 将 Jev 影子复核拆为两个隔离请求：独立市场/持仓判断与主脑提案审计。独立 state 使用白名单组装，不包含主脑动作、理由、置信度、入场、止盈或止损字段。
 - 在 `ai_brain_trader.py` 内增加纯策略合并逻辑，在本地合并 `AGREE`、`WAIT_VS_ENTRY`、`OPPOSITE_DIRECTION`、`MAIN_WAIT_JEV_ENTRY`、`ABSTAIN`、`AUDIT_REJECT` 等关系；第一阶段有效执行模式固定为 `SHADOW`，不改变主脑下单、平仓或撤单。
 - 记录 `schema_version=3`、独立/审计 state hash、双通道 request id、耗时、重试、审计旗标和通道状态；审计通道失败明确标记为 `audit_unavailable`，不伪装为批准。
-- 增加 `R20_JEV_INDEPENDENT_ENABLED`、`R20_JEV_ENFORCEMENT`、独立置信度/动作边际和审计置信度配置。
+- 增加 `ASTRA_JEV_INDEPENDENT_ENABLED`、`ASTRA_JEV_ENFORCEMENT`、独立置信度/动作边际和审计置信度配置。
 
 ## 2026-09-24
 
-本日改动均属于 `r20-account-isolation` 工作区的本地修复与隔离适配。下一次同步原作者代码时，必须逐项对照上游实现：
+本日改动均属于 `astra-account-isolation` 工作区的本地修复与隔离适配。下一次同步原作者代码时，必须逐项对照上游实现：
 
 - 上游已覆盖且行为一致的改动：删除本地重复实现；
 - 上游未覆盖但仍是本项目部署或账户隔离所必需的改动：保留并重新验证；
@@ -270,9 +270,9 @@
 ### 账户隔离与运行环境
 
 - 增加账户命名空间与台账筛选逻辑，避免未命名预留混入账户数据。
-- 统一遵守 `R20_DATA_DIR` 沙箱/独立实例重定向契约，覆盖台账、自进化和运行时 scope 校验路径。
+- 统一遵守 `ASTRA_DATA_DIR` 沙箱/独立实例重定向契约，覆盖台账、自进化和运行时 scope 校验路径。
 - 将环境校验从纯解析路径中剥离，避免显式传值时产生生产磁盘读取副作用。
-- 本地 systemd、启动脚本和调度入口统一使用 `r20-account-isolation` 的虚拟环境与工作目录。
+- 本地 systemd、启动脚本和调度入口统一使用 `astra-account-isolation` 的虚拟环境与工作目录。
 
 ### 交易观测与快照
 
@@ -285,7 +285,7 @@
 
 - 增加有界的 AI KEEP 挂单租约：KEEP 只延长有限窗口，CANCEL 成功后清理租约，避免挂单无限期保留。
 - 增加新孤儿挂单宽限、部分成交剩余单时限和最长挂单时限，撤单失败保持 fail-closed。
-- 修正执行层杠杆对齐逻辑，使决策、下单和风险配置共同遵守当前 `R20_MAX_LEVERAGE`，目标配置为 10x 时不再被旧 3x/4x 档位覆盖。
+- 修正执行层杠杆对齐逻辑，使决策、下单和风险配置共同遵守当前 `ASTRA_MAX_LEVERAGE`，目标配置为 10x 时不再被旧 3x/4x 档位覆盖。
 
 ### 可观测性与任务记录
 
@@ -294,12 +294,12 @@
 - 调度器 trader 槽位不再依赖过窄的 10 秒窗口，降低错过周期的概率。
 - 接入 Jev TypeSafe 影子复核：主脑完成决策后只读复核，结果写入
   `data/jev_shadow_reviews.jsonl`，不修改 `ai_brain_decisions.json`，不参与放行、拦截或撤单。
-- 增加 Typesafe 直连适配：配置 `R20_JEV_TYPESAFE_API_KEY` 或 `TYPESAFE_API_KEY` 后自动使用
+- 增加 Typesafe 直连适配：配置 `ASTRA_JEV_TYPESAFE_API_KEY` 或 `TYPESAFE_API_KEY` 后自动使用
   `https://api.typesafe.ai/v1/systemone` 与 `jev-latest`，将 `boolean/probability` 内部协议转换为
   Typesafe 的 `noul/noul` 协议；未配置直连 Key 时继续使用 Vercel Gateway，避免现有 Key 失效。
-  API Key 仅从 `R20_JEV_API_KEY` / `AI_GATEWAY_API_KEY` 环境变量读取。
+  API Key 仅从 `ASTRA_JEV_API_KEY` / `AI_GATEWAY_API_KEY` 环境变量读取。
 - 影子记录默认只保留最近 7 天，并以 1000 条为硬上限；清理与追加在同一文件锁内原子完成，
-  可通过 `R20_JEV_SHADOW_RETENTION_DAYS` / `R20_JEV_SHADOW_MAX_RECORDS` 调整。
+  可通过 `ASTRA_JEV_SHADOW_RETENTION_DAYS` / `ASTRA_JEV_SHADOW_MAX_RECORDS` 调整。
 - 为每轮主脑决策增加 `cycle_id` / `decision_id`，并把标识传入方向观测、tracker 和入场信号日记，
   让影子复核可以按合约与决策轮次回溯。
 - Jev 增加完整审查上下文：在保留独立盲审输入的同时，传入主脑提案、账户可用余额、挂单、杠杆、保证金、名义价值、强平价、开仓时间、资金费/已实现盈亏字段及来源标记；
@@ -317,7 +317,7 @@
   `UPDATE_SL` 指令、Jev 的独立动作票和保护价一致性，不再只覆盖开仓候选。
 - 新增 `data/jev_shadow_position_outcomes.jsonl`：记录 Jev 复核时的假设立即平仓净收益，
   并在后续周期补齐下一轮收益、4 小时收益、实际平仓收益、最大有利/不利波动；手续费、滑点、
-  周期和保留天数均显式留痕并可通过 `R20_JEV_SHADOW_*` 环境变量调整。
+  周期和保留天数均显式留痕并可通过 `ASTRA_JEV_SHADOW_*` 环境变量调整。
 - 新增 `data/jev_shadow_entry_outcomes.jsonl`：记录主脑与 Jev 的开仓分歧、WAIT 基线、
   API 不可用/数据无效/置信度不足样本，以及真实主脑成交与影子方向收益的关联结果。
 - Jev 开仓评估改为盲测输入，隐藏主脑动作、置信度和目标价格；复核返回后刷新盘口，
@@ -353,7 +353,7 @@
 
 下次更新原作者代码后，优先复核以下本地补丁是否仍需要：
 
-1. `scripts/account_scope.py` 与 `R20_DATA_DIR` 相关改动；
+1. `scripts/account_scope.py` 与 `ASTRA_DATA_DIR` 相关改动；
 2. `scripts/direction_observation.py`、4H 收盘 K 线和 `observe_cycle` 顺序；
 3. `scripts/trader/order_lease.py` 与挂单超时/KEEP 规则；
 4. 10x 杠杆配置及执行层对齐；

@@ -31,9 +31,9 @@ for _p in (str(ROOT), str(ROOT / "scripts")):
         sys.path.insert(0, _p)
 
 import scripts.okx_rest as okx_rest  # noqa: E402
-from r20_backend.exchanges.okx import OKXAdapter  # noqa: E402
-from r20_backend.exchanges.binance import BinanceAdapter  # noqa: E402
-from r20_backend.exchanges.gate import GateAdapter  # noqa: E402
+from astra_backend.exchanges.okx import OKXAdapter  # noqa: E402
+from astra_backend.exchanges.binance import BinanceAdapter  # noqa: E402
+from astra_backend.exchanges.gate import GateAdapter  # noqa: E402
 
 
 class _Recorder:
@@ -161,6 +161,37 @@ class TestOkxWrapperSignatureBinding(unittest.TestCase):
             self.ad.place_order("BTC", "buy", 3.5, price=70000, **kw)
         return rec.calls[-1][1]
 
+    # ---- 单型推断（2026-09）------------------------------------------------
+    #
+    # `execution_router` 的市价路径形如
+    #   `ad.place_order(asset, side, contracts, price=None)`
+    # —— 只传价、**不传单型**。旧默认把它写死成 `"limit"`，于是发出
+    # `ordType=limit` 且无 `px` 的非法请求，被 OKX 拒。现按有无价格推断，
+    # 与 Binance/Gate 适配器口径一致。
+
+    def _place_price(self, price, **kw):
+        rec = _Recorder(okx_rest.place_order)
+        with patch.object(okx_rest, "place_order", rec):
+            self.ad.place_order("BTC", "buy", 3.5, price=price, **kw)
+        return rec.calls[-1][1]
+
+    def test_missing_price_infers_market_order(self):
+        """无价 ⇒ 市价单（router 的市价路径正是这个调用形态）。"""
+        kwargs = self._place_price(None)
+        self.assertEqual(kwargs["ord_type"], "market",
+                         "只传 price=None 时必须推成市价，否则 ordType=limit 无 px 被拒")
+        self.assertIsNone(kwargs["px"], "市价单不得带 px")
+
+    def test_present_price_infers_limit_order(self):
+        kwargs = self._place_price(70000)
+        self.assertEqual(kwargs["ord_type"], "limit")
+        self.assertEqual(kwargs["px"], "70000")
+
+    def test_explicit_order_type_wins_over_inference(self):
+        """显式单型优先 —— OKX 直下路径恒显式传，行为不得被推断改动。"""
+        self.assertEqual(self._place_price(None, order_type="limit")["ord_type"], "limit")
+        self.assertEqual(self._place_price(70000, order_type="market")["ord_type"], "market")
+
     def test_size_kwarg_not_sz(self):
         rec = _Recorder(okx_rest.place_order)
         kwargs = self._place(rec)
@@ -210,10 +241,10 @@ class TestCancelIdFamilies(unittest.TestCase):
             return {"status": "CANCELED"}
         with patch.object(ad, "signed_request", fake_signed):
             ad.cancel_order("BTC", order_id="123456789")
-            ad.cancel_order("BTC", order_id="t-r20e1712345")
+            ad.cancel_order("BTC", order_id="t-astrae1712345")
         self.assertEqual(str(seen[0].get("orderId")), "123456789")
         self.assertNotIn("origClientOrderId", seen[0])
-        self.assertEqual(seen[1].get("origClientOrderId"), "t-r20e1712345")
+        self.assertEqual(seen[1].get("origClientOrderId"), "t-astrae1712345")
         self.assertNotIn("orderId", seen[1])
 
 
@@ -262,7 +293,7 @@ class TestNoPhantomModuleAttributes(unittest.TestCase):
     """把「调了不存在的函数」整族变测试期红：全仓 X.y( 调用点 hasattr(X) 核对。"""
 
     def _iter_py(self):
-        for d in ("r20_backend", "scripts", "r20_gateway"):
+        for d in ("astra_backend", "scripts", "astra_gateway"):
             for f in sorted((ROOT / d).rglob("*.py")):
                 if "test" in f.name.lower():
                     continue
@@ -285,6 +316,65 @@ class TestNoPhantomModuleAttributes(unittest.TestCase):
                     missing.append(f"{f}:{line} {mod}.{attr}(")
         self.assertEqual(missing, [], "幻影属性调用（D4 族）:\n" + "\n".join(missing))
 
+
+class TestCloseCannotOpenOppositeTest(unittest.TestCase):
+    """平仓路径**结构上不可能反向开仓**（第一百三十三刀审计的契约化）。
+
+    三所三种机制，各自钉住 —— 任一处被"顺手改统一"都会出事：
+
+    | 场所/路径 | 机制 | 后果若有误 |
+    |---|---|---|
+    | OKX 整仓平 | 专用端点 `/api/v5/trade/close-position`（语义即平仓，**不经** place_order）| 若改走 place_order 且漏 `reduceOnly` ⇒ 反手开新仓 |
+    | Binance 对冲模式平 | 只发 `positionSide`、**绝不发** `reduceOnly` | 发了会被交易所 -1106 拒单（平不掉） |
+    | Binance 单仓模式平 | `reduceOnly=true` 且**不带** positionSide | 漏了 ⇒ 反手开新仓 |
+    | 两者同时传 | 参数构建器**前置抛 ValueError** | 把矛盾参数发给交易所 = 语义不清 |
+    """
+
+    def test_okx_whole_close_uses_dedicated_endpoint(self):
+        from scripts import okx_rest
+        seen = []
+
+        def _rec(method, path, body=None, **kw):
+            seen.append((method, path, dict(body or {})))
+            return []
+
+        with patch.object(okx_rest, "request", _rec), \
+                patch.object(okx_rest, "place_order",
+                             lambda *a, **k: (_ for _ in ()).throw(
+                                 AssertionError("整仓平不得走 place_order"))):
+            okx_rest.close_position("BTC-USDT-SWAP", "long", td_mode="cross")
+
+        self.assertEqual(len(seen), 1)
+        _m, _p, _body = seen[0]
+        self.assertEqual(_p, "/api/v5/trade/close-position", "整仓平必须走专用平仓端点")
+        self.assertEqual((_body.get("instId"), _body.get("posSide")),
+                         ("BTC-USDT-SWAP", "long"))
+
+    def _spec(self):
+        import types
+        return types.SimpleNamespace(step_size=0.1, tick_size=0.1)
+
+    def _params(self, **over):
+        from astra_backend.exchanges.binance_orders import build_order_params
+        kw = dict(inst="BTCUSDT", position_side=None, price=None, qty=1.0,
+                  reduce_only=False, s="SELL", spec=self._spec(), text="", tif="gtc")
+        kw.update(over)
+        return build_order_params(**kw)
+
+    def test_binance_hedge_close_never_sends_reduce_only(self):
+        p = self._params(position_side="LONG", reduce_only=False)
+        self.assertEqual(p.get("positionSide"), "LONG")
+        self.assertNotIn("reduceOnly", p,
+                         "对冲模式发 reduceOnly 会被交易所 -1106 拒单（平不掉仓）")
+
+    def test_binance_one_way_close_sets_reduce_only(self):
+        p = self._params(reduce_only=True)
+        self.assertEqual(p.get("reduceOnly"), "true")
+        self.assertNotIn("positionSide", p)
+
+    def test_binance_contradictory_combination_fails_fast(self):
+        with self.assertRaises(ValueError):
+            self._params(position_side="LONG", reduce_only=True)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

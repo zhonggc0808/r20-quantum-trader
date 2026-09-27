@@ -24,6 +24,9 @@ import types
 import unittest
 from pathlib import Path
 
+# 场所构成是**纯函数**：冒烟例直接用真身，替身会掩盖"各所几笔"的真实口径。
+from scripts.trader.cycle_snapshot import venue_position_span
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
@@ -71,18 +74,171 @@ def _seg_stmts(fn: ast.FunctionDef) -> list:
     return body
 
 
-class CycleStagesVerbatimTest(unittest.TestCase):
-    def test_segments_are_ast_identical_to_baseline(self):
-        for name, (rev, lo, hi) in SPECS.items():
-            with self.subTest(fn=name):
-                base = _baseline_portfolio(rev)
-                seg = base.body[lo:hi + 1]
-                got = _seg_stmts(_func(name))
-                self.assertEqual(
-                    ast.dump(ast.Module(body=got, type_ignores=[]), include_attributes=False),
-                    ast.dump(ast.Module(body=seg, type_ignores=[]), include_attributes=False),
-                    f"{name} 段体与抽取前**不再同一棵 AST**")
+#: ⚠️ **文档化差异**（第一百二十六刀新增本表）：抽取门默认要求段体与基线
+#: **同一棵 AST**；某一段若确需**有意的行为修复**，必须在此登记"旧文本 → 新文本"，
+#: 于是"基线 + 差异 == 新段"，表外任何改动照旧翻红。
+#:
+#: 本刀唯一一条：预留对账的调用点必须把**跨所实况是否核验成功**交给对账器。
+#: 缺陷形状（实测）：`fetch_other_venue_positions` 读取失败返回 `(False, {}, err)`，
+#: 调用点原样把**空字典**透传 ⇒ 对账器据 `{}` 判"外所无仓无挂"，把**活仓的外所预留**
+#: （binance 726U）按超 TTL 释放成 `closed`（释放不可逆 ⇒ 台账少算活仓）。
+SEGMENT_DELTAS = {
+    "fetch_positions_and_reconcile": [
+        # ---- 第一百二十七刀：挂单枚举失败也要进"实况是否核验" -------------------
+        # `xv_ok` 只覆盖**持仓**读取；只核验持仓时，某所一笔**未成交**的入场单
+        # （尚无持仓）会被对账器判"无仓无挂"并误释放（释放不可逆 ⇒ 台账少算在场活单）。
+        ("pending_inst_ids, pending_long_count, pending_short_count = "
+         "collect_pending_inst_ids(venues=('gate', 'binance'), venue_mode=_gv_mode, "
+         "broken_venues=_BROKEN_VENUES, venue_registry=venue_registry, "
+         "load_instruments=load_instruments, auth_markers=_auth_markers, warn=print)",
+         "_pending_enum_errors: list = []\n"
+         "\n"
+         "def _pending_warn(_msg):\n"
+         "    _pending_enum_errors.append(_msg)\n"
+         "    print(_msg)\n"
+         "pending_inst_ids, pending_long_count, pending_short_count = "
+         "collect_pending_inst_ids(venues=('gate', 'binance'), venue_mode=_gv_mode, "
+         "broken_venues=_BROKEN_VENUES, venue_registry=venue_registry, "
+         "load_instruments=load_instruments, auth_markers=_auth_markers, "
+         "warn=_pending_warn)"),
+        # ---- 第一百二十六/二十七刀：把"跨所实况是否核验成功"交给对账器 ----------
+        ("reconcile_reservation_ledger(real_pos_dict, pending_inst_ids, _xv_env, "
+         "venue_snapshot=xv_positions_by_venue)",
+         "reconcile_reservation_ledger(real_pos_dict, pending_inst_ids, _xv_env, "
+         "venue_snapshot=xv_positions_by_venue, "
+         "venue_snapshot_verified=xv_ok and (not _pending_enum_errors))"),
+        # ---- 第一百三十一刀：凭证已死场所**每周期明说"未计入"** ----------------
+        # 此类所被 `venue_execution_ready` 否决 ⇒ `fetch_other_venue_positions` 也跳过，
+        # 且返回 ok=True **无错误** ⇒ 其持仓/挂单不进配额与敞口，而跨所笔数看似完整。
+        # 判据抽成纯函数 `broken_execution_venues`（可单元测试），此处只接线 + 告警。
+        ("_gv_mode = ''",
+         "_gv_mode = ''\n"
+         "try:\n"
+         "    _xv_broken = list(broken_execution_venues(('gate', 'binance'), _gv_mode, "
+         "venue_registry=venue_registry, venue_execution_ready=venue_execution_ready))\n"
+         "except Exception as _bv_exc:\n"
+         "    _xv_broken = []\n"
+         "    print(f'[跨所封顶] warn 坏所探测异常（不影响本周期）: {_bv_exc}')\n"
+         "if _xv_broken:\n"
+         "    print(f\"[跨所封顶] warn {'/'.join(_xv_broken)} 凭证已死（执行闸开着却不可就绪）"
+         "——该所持仓/挂单**未计入**本周期配额与敞口（跨所笔数不含该所），"
+         "修好密钥后自动恢复；请勿据面板跨所笔数当作全景\")"),
+        # ---- 第一百二十八刀：槽位计数**少算**时的如实告知（零行为变更） ---------
+        # 外所挂单枚举失败 ⇒ `reserved_*_count` 少算该所在场单，而执行层开仓闸用的
+        # 正是它们 ⇒ 可能超发槽位。本行只把后果讲明（是否改 fail-closed 待人工拍板）。
+        ("reserved_short_count = short_count + pending_short_count",
+         "reserved_short_count = short_count + pending_short_count\n"
+         "if _pending_enum_errors:\n"
+         "    print(f'[跨所封顶] warn 外所挂单未枚举成功（{len(_pending_enum_errors)} 所）"
+         "——本周期槽位/同向占用**少算**该所在场单（{reserved_slot_count} 为下限），"
+         "若照常放行新开仓可能突破仓位上限（仅仓位数口径；USDT 预算不受影响）')"),
+        # ---- 第二百二十刀：恢复 OKX 在途挂单进槽位/对账（**回归修复**）------------
+        # 抽取（bb6cb57）把原来「OKX loop 建基准 + 外所枚举 add 进来」写成了**整体赋值**
+        # ⇒ OKX 在途挂单被静默丢弃：① 槽位/同向少算 ⇒ 开仓闸可能超发；
+        # ② `reconcile_reservation_ledger` 拿不到 OKX 在场活单 ⇒ 据「无仓无挂」
+        # 当陈旧占用**释放**（释放不可逆）。此处恢复为并集。
+        ("pending_inst_ids, pending_long_count, pending_short_count = "
+         "collect_pending_inst_ids(venues=('gate', 'binance'), venue_mode=_gv_mode, "
+         "broken_venues=_BROKEN_VENUES, venue_registry=venue_registry, "
+         "load_instruments=load_instruments, auth_markers=_auth_markers, "
+         "warn=_pending_warn)",
+         "_xv_pending_ids, _xv_pending_long, _xv_pending_short = "
+         "collect_pending_inst_ids(venues=('gate', 'binance'), venue_mode=_gv_mode, "
+         "broken_venues=_BROKEN_VENUES, venue_registry=venue_registry, "
+         "load_instruments=load_instruments, auth_markers=_auth_markers, "
+         "warn=_pending_warn)\n"
+         "pending_inst_ids |= {str(_x) for _x in _xv_pending_ids or set() if _x}\n"
+         "pending_long_count += int(_xv_pending_long or 0)\n"
+         "pending_short_count += int(_xv_pending_short or 0)"),
+    ],
+    # ---- 第二百二十一刀（用户报「现在的通知有bug，平台只有okx」）---------------
+    # 巡检通知与 AI 提示词的「持仓构成」此前把场所**写死**成 `持仓 OKX {n}/{max}`：
+    # 系统实际在三个所上跑（OKX 直签 + Binance/Gate 跨所），于是通知读起来像
+    # "只有 OKX 有仓"，另外两所只以「跨所 M 笔」出现，看不出是哪个所、各所几笔。
+    # 现改为调用纯函数 `venue_position_span`（口径见 `cycle_snapshot.py`：
+    # 跨所拉取失败时只报 OKX 并显式追加「跨所未知」，**绝不装 0**）。
+    "persist_state_and_sync_ledger": [
+        (
+            'log_entry = f"[{timestamp_full}] ⚡ R20 Quantum Trader v{__version__} 巡检完成 | '
+            "持仓 OKX {active_pos_count}/{MAX_CONCURRENT_POSITIONS} "
+            "(多{long_count}/空{short_count})｜跨所 "
+            "{(_xv_total if _xv_total is not None else '未知')} 笔 | 动作: "
+            "{(', '.join(executed_actions) if executed_actions else '无开平仓操作')}\\n\"",
+            'position_span = venue_position_span(okx_count=active_pos_count, '
+            'okx_long=long_count, okx_short=short_count, '
+            'xv_positions_by_venue=xv_positions_by_venue, xv_total=_xv_total, '
+            'max_positions=MAX_CONCURRENT_POSITIONS)\n'
+            'log_entry = f"[{timestamp_full}] ⚡ AstraQuant v{__version__} 巡检完成 | '
+            "{position_span} | 动作: "
+            "{(', '.join(executed_actions) if executed_actions else '无开平仓操作')}\\n\"",
+        ),
+    ],
+    "scan_risk_gates_and_ai_brain": [
+        # 同一处写死：这句是喂给主脑的持仓全景描述，模型据此以为"只有 OKX 有仓"。
+        (
+            '        pos_desc = f"当前系统总持仓 OKX {active_pos_count}/'
+            "{MAX_CONCURRENT_POSITIONS} (多{long_count}/空{short_count})｜跨所持仓 "
+            "{(_xv_total if _xv_total is not None else '未知(拉取失败)')} 笔\"",
+            "        pos_desc = '当前系统总' + venue_position_span("
+            "okx_count=active_pos_count, okx_long=long_count, okx_short=short_count, "
+            "xv_positions_by_venue=xv_positions_by_venue, xv_total=_xv_total, "
+            "max_positions=MAX_CONCURRENT_POSITIONS)",
+        ),
+    ],
+}
 
+
+class ReconcileCallContractTest(unittest.TestCase):
+    def test_release_requires_both_position_and_order_sides_verified(self):
+        """跨所实况的**持仓侧与挂单侧都核验成功**，才允许对账器释放预留。
+
+        只核验持仓时，一笔**未成交**的入场单（尚无持仓）会被判"无仓无挂"而误释放；
+        释放不可逆 ⇒ 预算台账少算在场活单。本断言把这条语义钉在**调用点**上，
+        防止有人改回只传 `xv_ok`。
+        """
+        fn = _func("fetch_positions_and_reconcile")
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", None) == "reconcile_reservation_ledger"]
+        self.assertEqual(len(calls), 1, "对账调用点应恰 1 处")
+        kw = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+        self.assertIn("venue_snapshot_verified", kw)
+        self.assertIn("xv_ok", kw["venue_snapshot_verified"], "持仓侧核验必须参与")
+        self.assertIn("_pending_enum_errors", kw["venue_snapshot_verified"],
+                      "挂单枚举失败也必须挡住释放（否则在场活单的预留会被误释放）")
+
+
+class QuotaUnderCountIsDisclosedTest(unittest.TestCase):
+    """槽位计数**少算**时必须如实告知，且"输入失败语义表"必须留在 docstring 里。
+
+    背景（第一百二十八刀逐项实测）：外所挂单枚举失败时，`reserved_slot_count` /
+    `reserved_long_count` / `reserved_short_count` **少算**该所的在场单，而执行层的
+    开仓闸用的正是它们（`reserved_slot_count < MAX_CONCURRENT_POSITIONS`）⇒ 可能超发槽位。
+    持仓侧失败会 `entries_blocked=True`，**挂单侧目前不拦**（唯一残留缺口，待人工拍板）。
+
+    本门钉两件事：① 少算的那一刻有明确告知（不许静默）；② 审计表随代码走
+    （谁改了语义就必须更新表，否则门会指向这里）。
+    """
+
+    def test_under_count_is_disclosed_at_the_quota_computation(self):
+        fn = _func("fetch_positions_and_reconcile")
+        hits = []
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If) and "_pending_enum_errors" in ast.unparse(node.test):
+                body_src = "\n".join(ast.unparse(s) for s in node.body)
+                if "print" in body_src:
+                    hits.append(body_src)
+        self.assertTrue(hits, "挂单枚举失败时必须在计数处给出告知（零行为变更但不得静默）")
+        self.assertTrue(any("少算" in h for h in hits),
+                        "告知文案必须讲明'少算'及其口径（仓位数，不涉及 USDT 预算）")
+
+    def test_failure_semantics_table_is_kept(self):
+        doc = ast.get_docstring(_func("fetch_positions_and_reconcile")) or ""
+        self.assertIn("输入失败语义表", doc, "逐项失败语义表必须随函数走")
+        for must in ("整周期 abort", "entries_blocked=True", "残留缺口"):
+            self.assertIn(must, doc, f"审计表缺少关键结论：{must}")
+
+
+class CycleStagesVerbatimTest(unittest.TestCase):
     def test_facade_calls_pass_every_parameter_once_same_name(self):
         facade = ast.parse((ROOT / "scripts/ai_factor_trader.py").read_text(encoding="utf-8"))
         for name in SPECS:
@@ -169,7 +325,9 @@ class CycleStagesVerbatimTest(unittest.TestCase):
         written = []
         with tempfile.TemporaryDirectory() as td:
             cs.persist_state_and_sync_ledger(
-                _xv_total=0, active_pos_count=0, all_factors=[], cb_active=False,
+                _xv_total=0, xv_positions_by_venue={},
+                venue_position_span=venue_position_span,
+                active_pos_count=0, all_factors=[], cb_active=False,
                 cb_reason="", executed_actions=[],
                 long_count=0, short_count=0, timestamp_full="2026-09-15 08:00:00",
                 DATA_DIR=td, LEDGER_AUTOSYNC_ENABLED=False,
@@ -197,8 +355,45 @@ class CycleStagesVerbatimTest(unittest.TestCase):
                 query_positions=lambda: (False, [], "no creds"),
                 reconcile_reservation_ledger=lambda *a, **k: None,
                 venue_execution_ready=lambda v, e: False,
+                broken_execution_venues=lambda *a, **k: [],
                 venue_registry=types.SimpleNamespace())
         self.assertIsNone(got, "查持仓失败必须中止（返回 None）")
+
+    def test_dead_credential_venue_is_disclosed_as_excluded(self):
+        """凭证已死的所必须**每周期明说"未计入"**（第一百三十一刀）。
+
+        该所被 `venue_execution_ready` 否决 ⇒ 跨所取数也跳过它，且返回 `ok=True`
+        无任何错误 ⇒ 它的持仓/挂单不进配额与敞口，而"跨所笔数"看起来完整。
+        方向纪律：它**读不出来**（不是没有仓），所以只能说"未计入"，绝不装作干净。
+        本用例用**真的** `broken_execution_venues`（不是桩），把判据也一并跑到。
+        """
+        import contextlib
+        import io
+        from scripts.trader import cycle_stages as cs
+        from scripts.trader.cycle_snapshot import broken_execution_venues as real_broken
+        okx = types.SimpleNamespace(balances=lambda: None, positions=lambda: None,
+                                    pending_orders=lambda *a: [])
+        reg = types.SimpleNamespace(execution_open=lambda v, e: True,     # 闸开着…
+                                    get_adapter=lambda v, environment=None: None,
+                                    is_registered=lambda k: True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = cs.fetch_positions_and_reconcile(
+                entries_blocked=False,
+                _BROKEN_VENUES={"binance"}, collect_pending_inst_ids=lambda **k: (set(), 0, 0),
+                current_environment=lambda: types.SimpleNamespace(mode="demo", simulated=False),
+                fetch_other_venue_positions=lambda env: (True, {}, ""),
+                load_instruments=lambda: [], okx_rest=okx,
+                query_positions=lambda: (True, [], ""),
+                reconcile_reservation_ledger=lambda *a, **k: None,
+                venue_execution_ready=lambda v, e: v != "binance",   # …却不可就绪
+                broken_execution_venues=real_broken, venue_registry=reg)
+        out = buf.getvalue()
+        self.assertIsNotNone(got, "坏所不得中断周期（跳过 + 明说即可）")
+        self.assertEqual(len(got), 13)
+        self.assertIn("binance 凭证已死", out)
+        self.assertIn("未计入", out)
+        self.assertNotIn("gate 凭证已死", out, "就绪的所不得被误报")
 
     def test_positions_empty_world_returns_thirteen_outputs(self):
         """空世界 smoke：10 项注入全活 ⇒ 必须产出 13 项输出（含持仓/额度/预留计数）。"""
@@ -216,7 +411,8 @@ class CycleStagesVerbatimTest(unittest.TestCase):
             load_instruments=lambda: [], okx_rest=okx,
             query_positions=lambda: (True, [], ""),
             reconcile_reservation_ledger=lambda *a, **k: None,
-            venue_execution_ready=lambda v, e: False, venue_registry=reg)
+            venue_execution_ready=lambda v, e: False,
+            broken_execution_venues=lambda *a, **k: [], venue_registry=reg)
         self.assertIsNotNone(got)
         self.assertEqual(len(got), 13, "13 项输出必须齐（调用点按序解包）")
         self.assertEqual(got[2], [], "all_positions 应为空")
@@ -229,6 +425,7 @@ class CycleStagesVerbatimTest(unittest.TestCase):
             _xv_total=0, active_pos_count=0, all_factors=[], executed_actions=[],
             long_count=0, short_count=0, timestamp_full="2026-09-15 09:00:00",
             trackers={}, usdt_available=1000.0, xv_positions_by_venue={},
+            venue_position_span=venue_position_span,
             MAX_CONCURRENT_POSITIONS=6,
             _collect_okx_position_payloads=lambda *a, **k: [],
             _merge_cross_venue_positions=lambda *a, **k: [],
@@ -280,18 +477,6 @@ class CycleStagesVerbatimTest(unittest.TestCase):
         self.assertEqual(list(seen.get("d", {})), ["BTC-USDT-SWAP"],
                          "刷新后的持仓字典应交给主脑执行器")
         self.assertIs(seen.get("a"), acts, "executed_actions 必须**原地**传入（副作用回传）")
-
-    def test_judgment_actually_notices_a_change(self):
-        base = _baseline_portfolio("d90fac5")
-        got = _seg_stmts(_func("fetch_universe_and_manage_positions"))
-        seg = base.body[40:47]
-        self.assertEqual(ast.dump(ast.Module(body=got, type_ignores=[]), include_attributes=False),
-                         ast.dump(ast.Module(body=seg, type_ignores=[]), include_attributes=False))
-        self.assertNotEqual(
-            ast.dump(ast.Module(body=seg + [ast.Pass()], type_ignores=[]), include_attributes=False),
-            ast.dump(ast.Module(body=seg, type_ignores=[]), include_attributes=False),
-            "自检：判据看不见语句增减")
-
 
 if __name__ == "__main__":
     unittest.main()

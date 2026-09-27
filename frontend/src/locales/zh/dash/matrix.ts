@@ -9,6 +9,8 @@ export const zhMatrix = {
     venuesConnected: '{n} 所接入',
     comboEquity: '组合总权益 (U)',
     comboEquityTip: '多所聚合权益',
+    // 所选档位一所都读不到时（例：切到实盘但只配了模拟盘 key）不显示别档的钱
+    comboEquityEmpty: '当前档位没有可读账户，不计入任何其他档位的余额',
     todayPnl: '今日已实现',
     floatPnl: '持仓浮动盈亏',
     ls: '多空持仓比',
@@ -35,7 +37,7 @@ export const zhMatrix = {
     col: {
       symbol: '标的',
       dir: '方向',
-      qty: '张数',
+      qty: '保证金',
       entry: '开仓均价',
       mark: '标记价',
       liq: '强平价',
@@ -48,8 +50,34 @@ export const zhMatrix = {
       oco: '云端防线',
     },
     ocoOk: '已挂',
+    triggerMark: '标记价触发',
+    triggerLast: '最新成交价触发',
+    triggerIndex: '指数价触发',
+    triggerUnknown: '触发价类型未上报',
+    triggerMarkPrice: '标记价触发',
+    triggerContractPrice: '最新价触发',
+    triggerRawCodeHint: '交易所上报的原始码；本仓未核实其官方映射，故不解释含义（点开交易所核对）',
+    triggerMarkHint: '该保护腿按标记价触发（抗插针）',
+    triggerLastHint: '该保护腿按最新成交价触发：一根插针即可提前打掉保护',
+    triggerIndexHint: '该保护腿按指数价触发',
+    triggerUnknownHint: '交易所未上报该保护腿的触发价类型：按什么价触发不可判定',
     ocoMiss: '未挂',
     ocoMissHint: '交易所侧无止盈止损保护',
+    orphanPill: '遗留保护单',
+    orphanHint: '该所存在已平仓但未撤销的历史保护单（证据：本方标签或台账同向同量已平记录）。'
+      + '这些单会在同币再开仓时**减掉新仓**，应由运营核对后显式撤销（系统绝不自动撤）。',
+    unclassifiedPill: '未知保护单',
+    unclassifiedHint: '该所存在**读到了但认不出**的保护单（无本方标签、类型名也不认识，'
+      + '或行本身解析不了）。它们**不计入覆盖** ⇒ 若其实是保护腿，覆盖会被**低估**'
+      + '（可能触发重复挂腿），须人工核对。',
+    mismatchPill: '保护单不符',
+    mismatchHint: '该所存在方向或量与任何持仓都对不上的保护单：方向不符的**不计入覆盖**'
+      + '（反向腿保护不了本仓）；量不符的**仍被计入覆盖**但需核实，可能是旧仓遗留'
+      + '（价格触及仍会减仓），须人工核对。',
+    orphanUnknownPill: '未判定挂单',
+    orphanUnknownHint: '该所存在**归属不可判定**的保护单（无标签、台账也无同向同量记录）——'
+      + '可能是用户手单，按纪律一律不碰。',
+    orphanReadFailHint: '保护腿读取失败 ⇒ 孤儿腿情况**不可判定**（读不到 ≠ 没有）',
     aiManaged: '持仓由 AI 管理',
     scaleOutPill: '半仓保本',
     scaleOutTitle: '已分批止盈50%，余仓保本奔跑中',
@@ -65,7 +93,7 @@ export const zhMatrix = {
       dir: '方向',
       type: '委托',
       price: '委托价',
-      qty: '张数',
+      qty: '保证金',
       sl: '预设止损',
       tp: '预设止盈',
       placed: '挂单时间',
@@ -73,6 +101,7 @@ export const zhMatrix = {
     },
     decisionTime: '推理时间',
     cancel: '撤销',
+    contractsUnit: '张',
     aiManaged: '挂单由 AI 动态管理',
     cancelTitle: '撤销挂单',
     cancelDesc: '{sym} {dir} 限价单 @ {price} 将被撤销。',
@@ -127,9 +156,9 @@ export const zhMatrix = {
       sl: '最大风险',
       reset: '复位',
       copy: '复制风控参数',
-      /* 批 77：剪贴板文案此前硬编码中文（`【R20 风控测算】` / `入场:` / `SL:` / `TP:`），
+      /* 批 77：剪贴板文案此前硬编码中文（`【ASTRA 风控测算】` / `入场:` / `SL:` / `TP:`），
          英文界面下用户复制出来是一段中英混排。 */
-      copySummary: '【R20 风控测算】{sym} 入场:{entry} SL:{sl} TP:{tp} R:R={rr}:1',
+      copySummary: '【AstraQuant 风控测算】{sym} 入场:{entry} SL:{sl} TP:{tp} R:R={rr}:1',
     },
   },
 

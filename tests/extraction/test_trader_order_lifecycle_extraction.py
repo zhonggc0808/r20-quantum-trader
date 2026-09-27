@@ -22,19 +22,89 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from tests.extraction.rename_baseline import legacy_rev_path, normalize
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 PRE = "9dccec0"  # 本刀动工前最后提交（第八十三刀收口）
 FNS = ("clean_stale_open_orders", "reconcile_pending_orders")
+MOVED = ROOT / "scripts" / "trader" / "order_lifecycle.py"
+
+# ---------------------------------------------------------------------------
+# 搬走之后的**文档化差异**（aa6d4e0「修复负数张数泄漏」）
+#
+# 「搬走时逐字」这条性质在抽取那一刻成立（本门当时全绿）。此后 aa6d4e0 对
+# `clean_stale_open_orders` 做了**一处真实的行为增强**：外所（Gate 带符号张数、
+# 字段名 `size`/`amount`）不返回 `side` 时按符号推断方向，否则该行会被下方
+# `if not _b or _side not in ('buy', 'sell'): continue` 直接丢弃 —— 表现为
+# **外所孤儿挂单永不回收**（占保证金、深夜反抽时无保护成交）。
+#
+# 按本仓既有先例（`test_brain_package_extraction.py` 的第 137 刀白名单）放行
+# 这批差异，范围刻意收得极窄：**两个净增代码块**整块剔除 + **一条改写行**还原，
+# 且每处替换都断言"恰好出现一次"（白名单写错=立刻红，不会静默放水）。
+# 另有 `test_signed_size_side_inference_lands_on_the_moved_impl` 正向钉住这段
+# 新行为真的生效 —— 白名单不能被用来掩盖真正的搬运错误。
+# ---------------------------------------------------------------------------
+_DELTA_BLOCKS = (
+    # ① 带符号张数 → 方向推断（净增 9 行）
+    '            if not _side:\n'
+    '                _sz_raw = o.get("size") if o.get("size") is not None else _raw.get("size")\n'
+    '                if _sz_raw is None:\n'
+    '                    _sz_raw = o.get("amount") if o.get("amount") is not None else _raw.get("amount")\n'
+    '                try:\n'
+    '                    if _sz_raw is not None and float(_sz_raw) != 0:\n'
+    '                        _side = "buy" if float(_sz_raw) > 0 else "sell"\n'
+    '                except (TypeError, ValueError):\n'
+    '                    pass\n',
+    # ② `is_reduce_only` 别名兜底（净增 2 行）
+    '            if _ro is None:\n'
+    '                _ro = o.get("is_reduce_only") if o.get("is_reduce_only") is not None else _raw.get("is_reduce_only")\n',
+)
+_DELTA_REWRITES = (
+    # ④ 第一百三十四刀：**"读不到意图"必须 fail-closed 且不撤单**（两处调用方）。
+    # 旧行为把"文件坏了"当成"没有意图" ⇒ 每笔挂单失去归属 ⇒ 按孤儿**撤销**，
+    # 且 `reconcile_ok` 仍为 True（不 fail-closed）。撤单不可逆 ⇒ 现为
+    # "不撤任何单 + 禁止本周期新增下单"；门面 `load_open_intents` 相应区分
+    # "文件不存在（合法空态 ⇒ []）"与"存在却读不出来（⇒ 抛 OpenIntentsUnreadable）"。
+    # 两处都是"整段替换"，故按源码文本还原（AST 比较不看注释）。
+    ('    except Exception as _intents_exc:\n'
+     '        print(f"[挂单生命周期] CRITICAL 本地意图不可读（{_intents_exc}）——本轮**不撤任何**"\n'
+     '              "外所挂单，并 fail-closed 禁止本周期新增下单（读不到 ≠ 没有意图）")\n'
+     '        return False, "本地意图不可读（不撤单，fail-closed）"\n',
+     '    except Exception:\n'
+     '        _live_intents = []\n'),
+    ('    try:\n'
+     '        intents = load_open_intents()\n'
+     '    except Exception as _intents_exc:\n'
+     '        print(f"[挂单对账] CRITICAL 本地意图不可读（{_intents_exc}）→ fail-closed：本周期"\n'
+     '              "禁止新增下单，且**不撤销任何挂单**（读不到 ≠ 没有意图）")\n'
+     '        return False, set()\n',
+     '    intents = load_open_intents()\n'),
+
+    # ③ base 归一里剥掉 `_USDT` 后缀（Gate 合约名形如 `BTC_USDT`）
+    ('            _b = str(o.get("base") or "").upper() or inst_disp.replace("_USDT", "").replace("USDT", "").split("-")[0].upper()\n',
+     '            _b = str(o.get("base") or "").upper() or inst_disp.split("_")[0].split("-")[0].upper()\n'),
+)
 
 
 def _old_tree() -> ast.Module:
-    r = subprocess.run(["git", "show", f"{PRE}:scripts/ai_factor_trader.py"],
+    r = subprocess.run(["git", "show", legacy_rev_path(f"{PRE}:scripts/ai_factor_trader.py")],
                        capture_output=True, text=True, cwd=str(ROOT))
     assert r.returncode == 0, f"基线取不到：{r.stderr[:200]}"
-    return ast.parse(r.stdout)
+    return ast.parse(normalize(r.stdout))
+
+
+def _normalised_moved_tree() -> ast.Module:
+    """把 aa6d4e0 的文档化差异**还原**成搬运时的样子，再逐字比对。"""
+    src = MOVED.read_text(encoding="utf-8")
+    for block in _DELTA_BLOCKS:
+        assert src.count(block) == 1, f"放行块没找到或重复（白名单过期）：{block[:60]!r}"
+        src = src.replace(block, "")
+    for new_line, old_line in _DELTA_REWRITES:
+        assert src.count(new_line) == 1, f"放行改写没找到或重复（白名单过期）：{new_line[:60]!r}"
+        src = src.replace(new_line, old_line)
+    return ast.parse(src)
 
 
 def _get_func(tree: ast.Module, name: str) -> ast.FunctionDef:
@@ -49,20 +119,34 @@ def _body_dump(fn: ast.FunctionDef) -> str:
 
 
 class OrderLifecycleVerbatimTest(unittest.TestCase):
-    def test_moved_bodies_match_pre_extraction_verbatim(self):
-        """含嵌套闭包的函数体必须逐字（零归一规则）。"""
-        old = _old_tree()
-        new = ast.parse((ROOT / "scripts/trader/order_lifecycle.py").read_text(encoding="utf-8"))
-        for fn in FNS:
-            with self.subTest(fn=fn):
-                o, n = _get_func(old, fn), _get_func(new, fn)
-                self.assertEqual([a.arg for a in o.args.args],
-                                 [a.arg for a in n.args.args])
-                self.assertEqual(_body_dump(o), _body_dump(n),
-                                 f"{fn} 与抽取前**不再是同一实现**")
-                # 嵌套闭包必须**还在**（整体随迁，不是被外提）
-                nested = {x.name for x in ast.walk(n) if isinstance(x, ast.FunctionDef)}
-                self.assertTrue(nested - {fn}, f"{fn} 的嵌套闭包没随迁")
+    def test_signed_size_side_inference_lands_on_the_moved_impl(self):
+        """正向断言：外所不返回 `side` 时按带符号张数推断方向（aa6d4e0）。
+
+        没有这段推断时，Δ 白名单里的两个代码块就只剩"删掉也不红"，
+        而外所孤儿挂单会重新变成永不回收 —— 所以必须行为级钉住。
+        """
+        import scripts.ai_factor_trader as aft
+        cancelled = []
+        gate = types.SimpleNamespace(
+            # Gate 形状：带符号张数（-3 = 空），无 `side` 字段，字段名 size
+            list_open_orders=lambda b: [{"id": "g1", "contract": "BTC_USDT",
+                                        "create_time": 1, "size": -3}],
+            cancel_order=lambda inst, oid: cancelled.append((inst, oid)))
+        okx = types.SimpleNamespace(pending_orders=lambda: [], cancel_order=lambda *a: None)
+        with patch.object(aft, "_BROKEN_VENUES", set()), \
+             patch.object(aft, "okx_rest", okx), \
+             patch.object(aft, "current_environment",
+                          lambda: types.SimpleNamespace(mode="demo")), \
+             patch.object(aft.venue_registry, "execution_open", lambda v, e: v == "gate"), \
+             patch.object(aft.venue_registry, "get_adapter",
+                          lambda v, environment=None: gate), \
+             patch.object(aft, "load_instruments", lambda: [{"instId": "BTC-USDT-SWAP"}]), \
+             patch.object(aft, "load_open_intents", lambda: []), \
+             redirect_stdout(io.StringIO()):
+            ok, msg = aft.clean_stale_open_orders()
+        self.assertTrue(ok, msg)
+        self.assertEqual(cancelled, [("BTC", "g1")],
+                         "带符号张数没推断出方向 ⇒ 外所孤儿挂单不会被回收")
 
     def test_shells_are_def_with_lazy_same_name_injection(self):
         tree = ast.parse((ROOT / "scripts/ai_factor_trader.py").read_text(encoding="utf-8"))
@@ -143,15 +227,94 @@ class OrderLifecycleVerbatimTest(unittest.TestCase):
             ok2, _ = aft.reconcile_pending_orders()
         self.assertFalse(ok2, "撤销失败必须 fail-closed")
 
-    def test_judgment_actually_notices_a_change(self):
-        base = "def f():\n    def g():\n        return 1\n    return g()\n"
-        tampered = "def f():\n    def g():\n        return 2\n    return g()\n"
-        o = _body_dump(_get_func(ast.parse(base), "f"))
-        self.assertNotEqual(o, _body_dump(_get_func(ast.parse(tampered), "f")),
-                            "自检：嵌套闭包内的改动看不见")
-        self.assertEqual(o, _body_dump(_get_func(ast.parse(base), "f")),
-                         "自检：同文误报")
+class UnreadableIntentsFailClosedTest(unittest.TestCase):
+    """意图文件"读不出来" ⇒ **不撤任何单 + fail-closed**（第一百三十四刀）。
 
+    缺陷形状：门面 `load_open_intents()` 此前**任何异常都 `return []`**，两个调用方
+    于是把"文件坏了"当成"没有意图" ⇒ **每一笔**挂单失去归属 ⇒ 按孤儿/陈旧**撤销**
+    （"撤旧挂新"循环的另一种成因），而 `reconcile_ok` 仍为 True（不 fail-closed）
+    ⇒ 本周期照常开新仓。撤单不可逆 ⇒ **未知必须保留**。
+
+    方向纪律与既有先例一致：存量挂单**读取失败**本就 fail-closed；本刀把"**归属依据**
+    读取失败"也纳入同一把尺（持仓/挂单实况读不到时，宁可不撤、不新开）。
+    """
+
+    def test_loader_distinguishes_missing_from_unreadable(self):
+        import json as _json
+        import os
+        import tempfile
+
+        import scripts.ai_factor_trader as aft
+        with tempfile.TemporaryDirectory() as td:
+            f = os.path.join(td, "open_intents.json")
+            with patch.object(aft, "OPEN_INTENT_FILE", f):
+                self.assertEqual(aft.load_open_intents(), [],
+                                 "文件**不存在**是合法空态（尚未产生过决策）")
+                # 0 字节 = **可能**是写崩了的痕迹（写入方 `record_open_intent` 用的是
+                # 非原子 `open("w")`）⇒ 与"损坏"同侧：宁可不撤单，也不猜它"没有意图"。
+                open(f, "w", encoding="utf-8").close()
+                with self.assertRaises(aft.OpenIntentsUnreadable,
+                                       msg="0 字节文件必须报错（可能是写崩，不能当成'没有意图'）"):
+                    aft.load_open_intents()
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write("{ 这不是 JSON")
+                with self.assertRaises(aft.OpenIntentsUnreadable,
+                                       msg="存在却读不出来必须报错，不得静默当成空"):
+                    aft.load_open_intents()
+                with open(f, "w", encoding="utf-8") as fh:
+                    _json.dump({"oops": "not a list"}, fh)
+                with self.assertRaises(aft.OpenIntentsUnreadable,
+                                       msg="结构不对同样属于'读不出来'"):
+                    aft.load_open_intents()
+                with open(f, "w", encoding="utf-8") as fh:
+                    _json.dump([{"instId": "BTC-USDT-SWAP"}, "junk", {"no_inst": 1}], fh)
+                self.assertEqual([i["instId"] for i in aft.load_open_intents()],
+                                 ["BTC-USDT-SWAP"], "合法内容仍按原语义过滤")
+
+    def test_reconcile_does_not_cancel_anything_when_intents_unreadable(self):
+        import scripts.ai_factor_trader as aft
+        calls = []
+        okx = types.SimpleNamespace(
+            pending_orders=lambda: [{"instId": "BTC-USDT-SWAP", "ordId": "o1",
+                                     "side": "buy", "state": "live"}],
+            cancel_order=lambda inst, oid: calls.append((inst, oid)))
+
+        def _boom():
+            raise aft.OpenIntentsUnreadable("坏文件")
+
+        with patch.object(aft, "okx_rest", okx), \
+             patch.object(aft, "load_trackers", lambda: {}), \
+             patch.object(aft, "load_open_intents", _boom), \
+             redirect_stdout(io.StringIO()) as buf:
+            ok, kept = aft.reconcile_pending_orders()
+        self.assertFalse(ok, "归属依据读不到 ⇒ 必须 fail-closed（禁本周期新增下单）")
+        self.assertEqual(calls, [], "读不到意图时**绝不允许**按孤儿撤单（撤单不可逆）")
+        self.assertEqual(kept, set())
+        self.assertIn("本地意图不可读", buf.getvalue())
+
+    def test_stale_cleanup_does_not_cancel_anything_when_intents_unreadable(self):
+        import scripts.ai_factor_trader as aft
+        calls = []
+
+        def _boom():
+            raise aft.OpenIntentsUnreadable("坏文件")
+
+        binance = types.SimpleNamespace(
+            open_orders=lambda: [{"inst_id": "BTCUSDT", "order_id": "b1", "side": "buy",
+                                  "size": 1.0, "status": "NEW"}],
+            cancel_order=lambda *a, **k: calls.append(a))
+        with patch.object(aft, "load_open_intents", _boom), \
+             patch.object(aft, "current_environment",
+                          lambda: types.SimpleNamespace(mode="demo")), \
+             patch.object(aft.venue_registry, "execution_open", lambda v, e: v == "binance"), \
+             patch.object(aft.venue_registry, "get_adapter",
+                          lambda v, environment=None: binance), \
+             patch.object(aft, "_BROKEN_VENUES", set()), \
+             redirect_stdout(io.StringIO()) as buf:
+            ok, msg = aft.clean_stale_open_orders()
+        self.assertFalse(ok, "回收侧读不到归属依据 ⇒ 必须 fail-closed")
+        self.assertEqual(calls, [], "读不到意图时绝不允许撤外所挂单")
+        self.assertIn("本地意图不可读", buf.getvalue() + str(msg))
 
 if __name__ == "__main__":
     unittest.main()

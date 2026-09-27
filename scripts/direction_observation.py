@@ -168,6 +168,8 @@ def observe_cycle(factors: list[dict], brain_cache: Any) -> None:
     cache = brain_cache if isinstance(brain_cache, dict) else {}
     alerts = []
     for f in factors:
+        if not isinstance(f, dict):
+            continue
         brain_row = cache.get(f.get("instId"))
         obs = compare_directions(f, brain_row)
         if isinstance(brain_row, dict):

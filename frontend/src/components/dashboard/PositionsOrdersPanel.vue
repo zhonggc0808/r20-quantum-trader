@@ -78,6 +78,70 @@ function posRoi(p: any): number {
 function ocoOk(p: any): boolean {
   return p.cloud_oco_verified !== false && p.protectionStatus !== 'unprotected';
 }
+/** 孤儿腿候选数（可归因：本方标签或台账同向同量已平记录）——**只报告**，撤销是显式运营动作。 */
+function orphanCandidates(p: any): number {
+  const o = p?.protectionOrphans;
+  const sym = String(p?.name || p?.base || '').toUpperCase();
+  const list = o && o.readable ? (o.attributed || []) : [];
+  return (sym ? list.filter((x: any) => String(x.symbol || '').toUpperCase() === sym) : (o && o.readable ? o.attributed || [] : [])).length;
+}
+/** 归属不可判定的孤儿腿数（按纪律一律不碰）。 */
+function orphanUnattributed(p: any): number {
+  const o = p?.protectionOrphans;
+  const sym = String(p?.name || p?.base || '').toUpperCase();
+  const list = o && o.readable ? (o.unattributed || []) : [];
+  return (sym ? list.filter((x: any) => String(x.symbol || '').toUpperCase() === sym) : (o && o.readable ? o.unattributed || [] : [])).length;
+}
+/** 方向或量与任何持仓都对不上的腿数（方向不符的不计覆盖；量不符的仍计覆盖）。 */
+function orphanMismatch(p: any): number {
+  const o = p?.protectionOrphans;
+  if (!o || !o.readable) return 0;
+  const sym = String(p?.name || p?.base || '').toUpperCase();
+  const filterList = (arr: any[]) => sym ? arr.filter((x: any) => String(x.symbol || '').toUpperCase() === sym) : arr;
+  return filterList(o.sideMismatch || []).length + filterList(o.sizeMismatch || []).length;
+}
+/** 读到了但认不出的腿数（认不出类型 + 行解析不了）：**不计入覆盖** ⇒ 覆盖可能被低估。 */
+function orphanUnclassified(p: any): number {
+  const o = p?.protectionOrphans;
+  if (!o || !o.readable) return 0;
+  return (o.foreignCount || 0) + (o.unparsedCount || 0);
+}
+/** 读腿失败 ⇒ 不可判定（**不是**没有孤儿腿）。 */
+function orphanReadFailed(p: any): boolean {
+  return !!p?.protectionOrphans && p.protectionOrphans.readable === false;
+}
+/** 保护腿触发价类型 → 短标签（`''` = 没有该类腿/后端未给 ⇒ **不显示**，不编）。 */
+function slTriggerType(p: any): string {
+  const v = String(p?.protectionSlTriggerPxType ?? '').toLowerCase();
+  if (v === 'mark') return t('dash.matrix.positions.triggerMark');
+  if (v === 'last') return t('dash.matrix.positions.triggerLast');
+  if (v === 'index') return t('dash.matrix.positions.triggerIndex');
+  // Binance 的自描述字面量（MARK_PRICE / CONTRACT_PRICE）
+  if (v === 'mark_price') return t('dash.matrix.positions.triggerMarkPrice');
+  if (v === 'contract_price') return t('dash.matrix.positions.triggerContractPrice');
+  // Gate 的数字码翻译（0=最新成交价，1=标记价，2=指数价）
+  if (v === 'price_type:0' || v === '0') return t('dash.matrix.positions.triggerLast');
+  if (v === 'price_type:1' || v === '1') return t('dash.matrix.positions.triggerMark');
+  if (v === 'price_type:2' || v === '2') return t('dash.matrix.positions.triggerIndex');
+  if (v.startsWith('price_type:')) return v;
+  if (v === 'unknown') return t('dash.matrix.positions.triggerUnknown');
+  return '';
+}
+/** 悬停说明：为什么这件事重要（`last` 一根插针就能提前打掉保护）。 */
+function slTriggerTypeHint(p: any): string {
+  const v = String(p?.protectionSlTriggerPxType ?? '').toLowerCase();
+  if (v === 'mark') return t('dash.matrix.positions.triggerMarkHint');
+  if (v === 'last') return t('dash.matrix.positions.triggerLastHint');
+  if (v === 'index') return t('dash.matrix.positions.triggerIndexHint');
+  if (v === 'mark_price') return t('dash.matrix.positions.triggerMarkHint');
+  if (v === 'contract_price') return t('dash.matrix.positions.triggerLastHint');
+  if (v === 'price_type:0' || v === '0') return t('dash.matrix.positions.triggerLastHint');
+  if (v === 'price_type:1' || v === '1') return t('dash.matrix.positions.triggerMarkHint');
+  if (v === 'price_type:2' || v === '2') return t('dash.matrix.positions.triggerIndexHint');
+  if (v.startsWith('price_type:')) return t('dash.matrix.positions.triggerRawCodeHint');
+  if (v === 'unknown') return t('dash.matrix.positions.triggerUnknownHint');
+  return '';
+}
 function orderDir(o: any): 'long' | 'short' {
   return String(o.posSide || (o.side === 'buy' ? 'long' : 'short')).toLowerCase() as any;
 }
@@ -102,9 +166,39 @@ function orderQtyText(o: any): string {
   return fmtNum(n, 0);
 }
 
-function orderUnitText(o: any): string {
+function orderNativeUnit(o: any): string {
   const v = getVenueOf(o);
-  return v === 'binance' ? symOf(o) : t('dash.matrix.orders.col.qty');
+  return v === 'binance' ? symOf(o) : t('dash.matrix.orders.contractsUnit');
+}
+
+/**
+ * 挂单保证金（USDT）——**唯一权威是后端**。
+ *
+ * 后端按各所合约面值（`instrument_pool.ctVal`）与杠杆算好后放进 `margin_usdt`
+ * （见 `dashboard_payload/order_view.py` 与 `multi_venue.py`）。前端**绝不**自己
+ * 维护面值表：那种表一旦与池子漂移，屏幕上就会显示一个凭空捏造的保证金数字，
+ * 而保证金正是交易员判断仓位大小的依据 —— 宁可显示原生张数，也不给假数字。
+ *
+ * 返回 0 表示"后端没给"（旧数据/字段缺失）→ 调用方回落到原生张数展示。
+ */
+function orderMargin(o: any): number {
+  const m = Number(o?.margin_usdt);
+  return Number.isFinite(m) && m > 0 ? m : 0;
+}
+
+function orderMarginText(o: any): string {
+  const m = orderMargin(o);
+  if (m > 0) {
+    return `${fmtNum(m, 2)}U`;
+  }
+  const raw = orderQtyText(o);
+  return raw !== '--' ? `${raw} ${orderNativeUnit(o)}` : '--';
+}
+
+function orderTooltipText(o: any): string {
+  const m = orderMargin(o);
+  const native = `${orderQtyText(o)} ${orderNativeUnit(o)}`;
+  return m > 0 ? `${t('dash.matrix.orders.col.qty')} ${fmtNum(m, 2)}U (${native})` : native;
 }
 </script>
 
@@ -148,7 +242,101 @@ function orderUnitText(o: any): string {
     <!-- 持仓列表 -->
     <div v-if="tab === 'positions'" class="scroll-y flex-1 min-h-0 overflow-x-auto">
       <BaseEmpty v-if="!filteredPositions.length" :text="t('dash.matrix.positions.empty')" />
-      <table v-else class="table pop-table w-full" :aria-label="t('dash.matrix.positions.title')">
+      <div v-else>
+        <!-- 窄容器流式卡片（容器 <660px 时启用；永不横向切边，信息层级分明） -->
+        <div class="pop-narrow space-y-2 p-2">
+          <div
+            v-for="p in filteredPositions"
+            :key="'m-' + p.instId + p.side"
+            class="clickable rounded-lg border border-[var(--line-2)] bg-[var(--surface-1)] p-3 transition-colors hover:bg-[var(--surface-2)] hover:border-[var(--line-1)] flex flex-col gap-2"
+            :title="t('dash.matrix.chart.pickHint')"
+            tabindex="0"
+            @click="emit('pick-symbol', p.instId)"
+            @keydown.enter="emit('pick-symbol', p.instId)"
+            @keydown.space.prevent="emit('pick-symbol', p.instId)"
+          >
+            <!-- 头部：标的名称、Logo、方向、杠杆、交易所与模式、保护盾牌 -->
+            <div class="flex items-center justify-between gap-1.5">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <CryptoLogo :symbol="symOf(p)" :size="18" />
+                <span class="num font-mono font-bold text-sm text-[var(--ink-strong)]">{{ symOf(p) }}</span>
+                <DirTag :dir="p.side" />
+                <span class="font-mono text-xs font-bold text-[var(--ink-strong)]">{{ p.lever }}x</span>
+                <span
+                  class="rounded-full px-1.5 py-0.5 text-3xs font-mono font-semibold uppercase border"
+                  :class="venueToneCls(getVenueOf(p))"
+                >
+                  {{ getVenueOf(p).toUpperCase() }}
+                </span>
+                <span
+                  class="rounded-full px-1.5 py-0.5 text-3xs font-mono font-medium border"
+                  :class="getModeOf(p) === 'LIVE' ? 'text-[var(--up)] border-[var(--up-line)] bg-[var(--up-bg)]' : 'text-[var(--warn)] border-[var(--warn-line)] bg-[var(--warn-bg)]'"
+                >
+                  {{ getModeOf(p) }}
+                </span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                <span
+                  v-if="(p.scaleOutPhase ?? 0) >= 1"
+                  class="rounded-full px-1.5 py-0.5 text-3xs font-mono font-semibold border text-[var(--up)] border-[var(--up-line)] bg-[var(--up-bg)]"
+                  :title="t('dash.matrix.positions.scaleOutTitle')"
+                >
+                  🎯 {{ t('dash.matrix.positions.scaleOutPill') }}
+                </span>
+                <span
+                  v-if="ocoOk(p)"
+                  class="inline-flex items-center text-[var(--up)]"
+                  :title="t('dash.matrix.positions.ocoOk')"
+                >
+                  <ShieldCheck class="h-4 w-4" />
+                </span>
+                <span
+                  v-else
+                  class="inline-flex items-center text-[var(--warn)]"
+                  :title="t('dash.matrix.positions.ocoMissHint')"
+                >
+                  <ShieldAlert class="h-4 w-4" />
+                </span>
+              </div>
+            </div>
+
+            <!-- 数据栏：盈亏、ROI、保证金、均价与现价 -->
+            <div class="grid grid-cols-2 gap-2 pt-1 border-t border-[var(--line-2)]">
+              <div>
+                <span class="text-4xs text-[var(--ink-3)] block">{{ t('dash.matrix.positions.col.pnl') }}</span>
+                <span class="text-sm font-bold font-mono" :class="posPnl(p) >= 0 ? 'text-[var(--up)]' : 'text-[var(--down)]'">
+                  {{ arrow(posPnl(p)) }} {{ fmtSigned(posPnl(p)) }}
+                  <span class="text-3xs font-medium ml-1">({{ fmtPct(posRoi(p)) }})</span>
+                </span>
+              </div>
+              <div class="text-right">
+                <span class="text-4xs text-[var(--ink-3)] block">{{ t('dash.matrix.positions.col.margin') }} / {{ t('dash.matrix.positions.col.entry') }}</span>
+                <span class="text-xs font-mono text-[var(--ink-strong)] font-semibold">
+                  {{ p.margin_usdt ? `${fmtNum(p.margin_usdt, 2)}U` : '--' }}
+                  <span class="text-3xs font-normal text-[var(--ink-3)] ml-1">@ {{ fmtPrice(p.avgPx) }}</span>
+                </span>
+              </div>
+            </div>
+
+            <!-- 底栏：止损与止盈阶梯（TP1/TP2 左右分布） -->
+            <div class="flex items-center justify-between text-3xs font-mono pt-1 border-t border-[var(--line-2)] text-[var(--ink-2)]">
+              <div class="flex items-center gap-1">
+                <span class="text-[var(--down)] font-medium">SL {{ fmtPrice(p.exchangeSl ?? p.displayStop) }}</span>
+                <span v-if="slTriggerType(p)" class="text-4xs text-[var(--ink-3)]">({{ slTriggerType(p) }})</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span v-if="getTp1(p)" class="text-[var(--up)] font-medium">TP1 {{ fmtPrice(getTp1(p)) }}</span>
+                <span class="text-[var(--up)] font-medium">
+                  {{ getTp1(p) ? 'TP2' : 'TP' }} {{ fmtPrice(p.exchangeTp ?? p.displayTakeProfit) }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 宽容器表格（面板 >=660px 时才出；独立外层容器杜绝 .table 优先级冲突） -->
+        <div class="pop-wide">
+          <table class="table pop-table w-full" :aria-label="t('dash.matrix.positions.title')">
         <thead>
           <tr>
             <th scope="col" class="min-w-[140px]">{{ t('dash.matrix.positions.col.symbol') }}</th>
@@ -215,7 +403,14 @@ function orderUnitText(o: any): string {
               <span class="text-3xs block" :class="posPnl(p) >= 0 ? 'text-[var(--up)]' : 'text-[var(--down)]'">{{ fmtPct(posRoi(p)) }}</span>
             </td>
             <td class="col-num font-mono text-3xs">
-              <span class="down block">SL {{ fmtPrice(p.exchangeSl ?? p.displayStop) }}</span>
+              <span class="down block">
+                SL {{ fmtPrice(p.exchangeSl ?? p.displayStop) }}
+                <span
+                  v-if="slTriggerType(p)"
+                  class="text-3xs text-[var(--ink-2)]"
+                  :title="slTriggerTypeHint(p)"
+                >· {{ slTriggerType(p) }}</span>
+              </span>
               <span v-if="getTp1(p)" class="up block font-medium" :title="p.stageDesc || t('dash.matrix.positions.scaleOutTitle')">
                 TP1 {{ fmtPrice(getTp1(p)) }}
               </span>
@@ -224,6 +419,28 @@ function orderUnitText(o: any): string {
               </span>
             </td>
             <td class="text-center">
+              <span
+                v-if="orphanCandidates(p) > 0"
+                class="inline-flex items-center gap-1 text-3xs text-[var(--warn,#f59e0b)]"
+                :title="t('dash.matrix.positions.orphanHint')"
+              >⚠ {{ t('dash.matrix.positions.orphanPill') }} {{ orphanCandidates(p) }}</span>
+              <span
+                v-else-if="orphanUnattributed(p) > 0 || orphanReadFailed(p)"
+                class="inline-flex items-center gap-1 text-3xs text-[var(--ink-2)]"
+                :title="orphanReadFailed(p)
+                  ? t('dash.matrix.positions.orphanReadFailHint')
+                  : t('dash.matrix.positions.orphanUnknownHint')"
+              >{{ t('dash.matrix.positions.orphanUnknownPill') }}</span>
+              <span
+                v-if="orphanUnclassified(p) > 0"
+                class="inline-flex items-center gap-1 text-3xs text-[var(--ink-2)]"
+                :title="t('dash.matrix.positions.unclassifiedHint')"
+              >{{ t('dash.matrix.positions.unclassifiedPill') }} {{ orphanUnclassified(p) }}</span>
+              <span
+                v-if="orphanMismatch(p) > 0"
+                class="inline-flex items-center gap-1 text-3xs text-[var(--ink-2)]"
+                :title="t('dash.matrix.positions.mismatchHint')"
+              >{{ t('dash.matrix.positions.mismatchPill') }} {{ orphanMismatch(p) }}</span>
               <span
                 v-if="ocoOk(p)"
                 class="inline-flex items-center gap-1 text-3xs text-[var(--up)]"
@@ -244,12 +461,75 @@ function orderUnitText(o: any): string {
           </tr>
         </tbody>
       </table>
+        </div>
+      </div>
     </div>
 
     <!-- 挂单列表 -->
     <div v-else class="scroll-y flex-1 min-h-0 overflow-x-auto">
       <BaseEmpty v-if="!filteredOrders.length" :text="t('dash.matrix.orders.empty')" />
-      <table v-else class="table pop-table w-full" :aria-label="t('dash.matrix.orders.title')">
+      <div v-else>
+        <!-- 窄容器流式挂单卡片（容器 <660px 时启用） -->
+        <div class="pop-narrow space-y-2 p-2">
+          <div
+            v-for="o in filteredOrders"
+            :key="'mo-' + o.ordId"
+            class="clickable rounded-lg border border-[var(--line-2)] bg-[var(--surface-1)] p-3 transition-colors hover:bg-[var(--surface-2)] hover:border-[var(--line-1)] flex flex-col gap-2"
+            :title="t('dash.matrix.chart.pickHint')"
+            tabindex="0"
+            @click="emit('pick-symbol', o.instId)"
+            @keydown.enter="emit('pick-symbol', o.instId)"
+            @keydown.space.prevent="emit('pick-symbol', o.instId)"
+          >
+            <div class="flex items-center justify-between gap-1.5">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <CryptoLogo :symbol="symOf(o)" :size="18" />
+                <span class="num font-mono font-bold text-sm text-[var(--ink-strong)]">{{ symOf(o) }}</span>
+                <DirTag :dir="orderDir(o)" />
+                <span class="font-mono text-xs font-bold text-[var(--ink-strong)]">{{ o.lever || '3x' }}</span>
+                <span
+                  class="rounded-full px-1.5 py-0.5 text-3xs font-mono font-semibold uppercase border"
+                  :class="venueToneCls(getVenueOf(o))"
+                >
+                  {{ getVenueOf(o).toUpperCase() }}
+                </span>
+                <span
+                  class="rounded-full px-1.5 py-0.5 text-3xs font-mono font-medium border"
+                  :class="getModeOf(o) === 'LIVE' ? 'text-[var(--up)] border-[var(--up-line)] bg-[var(--up-bg)]' : 'text-[var(--warn)] border-[var(--warn-line)] bg-[var(--warn-bg)]'"
+                >
+                  {{ getModeOf(o) }}
+                </span>
+              </div>
+              <span class="inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-3xs border border-[var(--line-1)] bg-[var(--surface-2)] text-[var(--ink-2)]">
+                {{ o.state === 'live' ? t('status.waiting') : o.state }}
+              </span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 pt-1 border-t border-[var(--line-2)]">
+              <div>
+                <span class="text-4xs text-[var(--ink-3)] block">{{ t('dash.matrix.orders.col.price') }}</span>
+                <span class="text-sm font-bold font-mono text-[var(--ink-strong)]">{{ fmtPrice(o.px) }}</span>
+              </div>
+              <div class="text-right">
+                <span class="text-4xs text-[var(--ink-3)] block">{{ t('dash.matrix.orders.col.qty') }}</span>
+                <span class="text-xs font-mono text-[var(--ink-strong)] font-semibold">{{ orderMarginText(o) }}</span>
+              </div>
+            </div>
+
+            <div class="flex items-center justify-between text-3xs font-mono pt-1 border-t border-[var(--line-2)] text-[var(--ink-2)]">
+              <div class="flex items-center gap-2">
+                <span class="text-[var(--down)] font-medium">SL {{ o.slTriggerPx ? fmtPrice(o.slTriggerPx) : (o.sl_px && String(o.sl_px) !== '--' ? fmtPrice(o.sl_px) : '--') }}</span>
+                <span class="text-[var(--up)] font-medium">TP {{ o.tpTriggerPx ? fmtPrice(o.tpTriggerPx) : (o.tp_px && String(o.tp_px) !== '--' ? fmtPrice(o.tp_px) : '--') }}</span>
+              </div>
+              <span class="pop-col-time text-3xs text-[var(--ink-3)]">
+                <TimeAgo :time="Number(o.cTime) || o.cTime" />
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pop-wide">
+          <table class="table pop-table w-full" :aria-label="t('dash.matrix.orders.title')">
         <thead>
           <tr>
             <th scope="col" class="min-w-[140px]">{{ t('dash.matrix.orders.col.symbol') }}</th>
@@ -294,8 +574,8 @@ function orderUnitText(o: any): string {
               {{ fmtPrice(o.px) }}
             </td>
             <td class="col-num font-mono">
-              <span class="block text-xs font-medium text-[var(--ink-strong)]" :title="`${orderQtyText(o)} ${orderUnitText(o)}`">
-                {{ orderQtyText(o) }}<span class="text-4xs text-[var(--ink-3)] ml-0.5">{{ orderUnitText(o) }}</span>
+              <span class="block text-xs font-medium text-[var(--ink-strong)]" :title="orderTooltipText(o)">
+                {{ orderMarginText(o) }}
               </span>
               <span class="block text-3xs text-[var(--ink-2)]">{{ o.lever || '3x' }}</span>
             </td>
@@ -314,6 +594,8 @@ function orderUnitText(o: any): string {
           </tr>
         </tbody>
       </table>
+        </div>
+      </div>
       <p v-if="filteredOrders.length" class="text-3xs text-[var(--ink-3)] border-t px-3.5 py-2" style="border-color: var(--line-1)">
         {{ t('dash.matrix.orders.aiManaged') }}
       </p>
@@ -344,6 +626,40 @@ function orderUnitText(o: any): string {
   .pop-table td {
     padding-left: var(--sp-2);
     padding-right: var(--sp-2);
+  }
+}
+
+/* =========================================================================
+   窄/宽两套呈现，按**容器宽度**切换（不是视口宽度）
+   -------------------------------------------------------------------------
+   症状（本次修复）：本面板恒为 xl 栅格的 4/12 栏 —— 1600px 视口下只有
+   436px 宽，2560px 视口下也仅约 664px。而六列持仓表按 `table-layout: auto`
+   自然宽约 630px，于是**表格恒宽于容器**：`.overflow-x-auto` 把它变成横向
+   滚动条，最右侧的「未实现盈亏」「止损/止盈」「云端防线」三列落在可视区之外
+   —— 首屏看不到盈亏与保护价，这是主工位上的功能性缺陷，不只是观感问题。
+
+   根因不是列宽不够，是**切换判据选错了维度**：原实现用视口断点
+   （`sm:hidden` / `hidden sm:block`，640px 视口）。视口 ≥640px 就出表格，
+   可面板宽度由**栅格**决定、与视口并不同步 —— 1600px 视口照样只有 436px。
+   本组件早已声明 `container-type: inline-size`，容器查询才是正确判据。
+
+   阈值 660px：六列（min-width 合计 520 + 左右各 12px 内边距 ×6 = 664）刚好容纳。
+   ========================================================================= */
+.pop-narrow {
+  display: none;
+}
+.pop-wide {
+  display: none;
+}
+
+@container (max-width: 659px) {
+  .pop-narrow {
+    display: block;
+  }
+}
+@container (min-width: 660px) {
+  .pop-wide {
+    display: block;
   }
 }
 </style>

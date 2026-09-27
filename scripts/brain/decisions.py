@@ -44,10 +44,10 @@ def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], acti
         "active_position_sides": active_position_sides,
     }
     try:
-        from r20_backend.interceptor_manager import run_interceptor_pipeline
+        from astra_backend.interceptor_manager import run_interceptor_pipeline
         result = run_interceptor_pipeline(p, d_item, context)
         trace = context.get("_decision_trace")
-        if isinstance(trace, dict):
+        if isinstance(trace, dict) and isinstance(d_item, dict):
             d_item["_decision_trace"] = dict(trace)
         return result
     except Exception as exc:
@@ -63,12 +63,13 @@ def validate_and_filter_decision(p: Dict[str, Any], d_item: Dict[str, Any], acti
             rr = (take_profit - entry) / (entry - stop_loss)
         elif raw_action == "SELL_SHORT" and stop_loss > entry > take_profit > 0:
             rr = (entry - take_profit) / (stop_loss - entry)
-        d_item["_decision_trace"] = {
-            "raw_action": raw_action,
-            "final_action": "WAIT",
-            "outcome_source": "interceptor_error",
-            "rejection_code": "interceptor_manager_exception",
-        }
+        if isinstance(d_item, dict):
+            d_item["_decision_trace"] = {
+                "raw_action": raw_action,
+                "final_action": "WAIT",
+                "outcome_source": "interceptor_error",
+                "rejection_code": "interceptor_manager_exception",
+            }
         return "WAIT", f"拦截插件管线调用异常: {exc}，安全降级为 WAIT", rr
 
 

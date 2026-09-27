@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-R20 High-Alpha Quantitative Multi-Factor Trading Matrix & Execution Engine (R20 Quantum Trader v6.8.1)
+ASTRA High-Alpha Quantitative Multi-Factor Trading Matrix & Execution Engine (AstraQuant v6.8.1)
 Architecture:
 1. Multi-Dimensional Quant Factor Sub-Engine:
    - Trend Momentum: EMA Slope (9/21/55), Multi-Timeframe Alignment (15M, 1H, 4H)
@@ -31,11 +31,11 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 try:
-    from r20_backend.version import __version__
+    from astra_backend.version import __version__
 except Exception:
     __version__ = "7.6.0"
 
-from r20_backend.time_utils import beijing_day
+from astra_backend.time_utils import beijing_day
 
 # 结构优化阶段4·B3：纯信号逻辑已搬入 scripts/trader/signals.py，re-export 保持门面表面不变
 from scripts.trader.signals import clamp, evaluate_asset_signal as _evaluate_asset_signal  # noqa: F401
@@ -53,11 +53,21 @@ from scripts.trader.venue_evidence import (
     persist_venue_decision as _venue_evidence_persist,
 )
 from scripts.trader.cycle_stages import (
+    cycle_disclosure_payload,
+    cycle_disclosure_summary,
+    write_cycle_disclosure_snapshot,
+    data_shape_preflight_stage,
     fetch_positions_and_reconcile,
     scan_risk_gates_and_ai_brain,
     fetch_universe_and_manage_positions,
     persist_state_and_sync_ledger,
     preflight_reconcile_and_housekeeping,
+    venue_protection_watchdog_stage,
+)
+from scripts.trader.venue_protection import (
+    read_ledger_rows,
+    audit_cross_venue_protection,
+    watchdog_debounce_step,
 )
 from scripts.direction_observation import (
     LEGACY_CALCULUS_VERSION,
@@ -112,9 +122,13 @@ from scripts.trader.circuit_guard import (
     check_black_swan_sentinel as _circuit_guard_sentinel,
     is_circuit_breaker_active as _circuit_guard_breaker,
 )
+from scripts.trader.data_shape import (validate_intents_file,
+                                       validate_trackers_file)
 from scripts.trader.cycle_snapshot import (
+    broken_execution_venues,
     build_state_payload,
     collect_pending_inst_ids,
+    venue_position_span,
 )
 from scripts.trader.notifications import (
     entry_action_message,
@@ -151,11 +165,11 @@ from scripts.trader.protection import (
 
 # US-003 决策面接线：选所路由（US-002）与预算原子预留（US-001）以模块绑定名引用，
 # 接线级测试 patch 模块属性即可完全离线（零出网/零凭证/零真实预留库）。
-from r20_backend import risk_reservation
-from r20_backend import venue_router
-from r20_backend.exchanges import canonical_base
-from r20_backend.exchanges import registry as venue_registry
-from r20_backend.exchanges import routing_policy
+from astra_backend import risk_reservation
+from astra_backend import venue_router
+from astra_backend.exchanges import canonical_base
+from astra_backend.exchanges import registry as venue_registry
+from astra_backend.exchanges import routing_policy
 
 # 必须用 scripts.okx_runtime 包形式：okx_rest 读的是同一模块实例的冻结环境，
 # 裸 okx_runtime 是另一份 _FROZEN_ENVIRONMENT 全局，freeze 周期对其无效（US-002 命门）。
@@ -177,6 +191,8 @@ import fcntl
 from typing import Tuple, Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 from market_data_service import fetch_candles, fetch_ticker
+# 行情取数健康快照的写盘入口（读侧在后端 /metrics，见 MARKET_DATA_HEALTH_FILE 注释）。
+from market_data_health import write_snapshot as write_market_data_health_snapshot
 import scripts.okx_rest as okx_rest
 
 # 执行层风控参数单一事实源（后台「风控管理页」写入 .env，本进程 import 时读取生效）
@@ -208,8 +224,27 @@ LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
 # 批E(2026-09-13)：周期收尾的台账/DB spawn 总闸（模块导入时快照——测试用
-# patch.dict(clear=True) 清空环境也抹不掉）。生产不设 R20_LEDGER_SYNC_DISABLED。
-LEDGER_AUTOSYNC_ENABLED = str(os.environ.get("R20_LEDGER_SYNC_DISABLED", "")).strip().lower() not in ("1", "true", "yes")
+# patch.dict(clear=True) 清空环境也抹不掉）。生产不设 ASTRA_LEDGER_SYNC_DISABLED。
+LEDGER_AUTOSYNC_ENABLED = str(os.environ.get("ASTRA_LEDGER_SYNC_DISABLED", "")).strip().lower() not in ("1", "true", "yes")
+# roadmap G8：跨所（Gate/Binance）云端保护单巡检总闸。**默认关闭** —— 置于模块导入时
+# 快照（与 LEDGER_AUTOSYNC_ENABLED 同法）。开闸 = 每周期对外所仓位核验保护腿并在临期
+# 前续期（先挂新后撤旧；绝不猜价位、绝不撤人工腿）。开闸是运营决定，需人工拍板。
+ASTRA_VENUE_PROTECTION_WATCHDOG = str(os.environ.get("ASTRA_VENUE_PROTECTION_WATCHDOG", "0")).strip().lower() in ("1", "true", "yes")
+# 第一百二十九刀：**预演模式**（G8 开闸前的第一步）。置 1 时巡检每周期照常判定，
+# 但**绝不下单/撤单**——只报"如果开闸这一轮会做什么"（审计层的 `dry_run`/`would`）。
+# 与总闸同法：默认关，且总闸未开时本标志无意义（整个巡检不跑）。
+ASTRA_VENUE_PROTECTION_WATCHDOG_DRY_RUN = str(os.environ.get("ASTRA_VENUE_PROTECTION_WATCHDOG_DRY_RUN", "0")).strip().lower() in ("1", "true", "yes")
+# 第一百三十刀：**防抖窗口**（分钟，默认 30）：缺口必须持续这么久才允许真实写单。
+# 续期窗口是 24h，30 分钟远小于它 —— 防的是"瞬时口径波动被当成缺口"。
+# 置 0 = 显式关闭防抖（立即动手）。
+try:
+    ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S = float(
+        os.environ.get("ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_MIN", "30")) * 60.0
+except (TypeError, ValueError):
+    ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S = 30 * 60.0
+# 防抖状态（跨周期记忆"这缺口从什么时候开始"）：只记时刻，不记凭证/不记仓位细节
+VENUE_PROTECTION_WATCHDOG_STATE_FILE = os.path.join(
+    DATA_DIR, "venue_protection_watchdog_state.json")
 LOG_FILE = os.path.join(LOGS_DIR, "ai_factor_trader.log")
 POSITION_TRACKER_FILE = os.path.join(DATA_DIR, "position_trackers.json")
 # 2026-09-16：`SIGNAL_JOURNAL_FILE` 常量已删——它把路径**钉死在导入期**，
@@ -275,18 +310,19 @@ ASSET_CLASS_PROFILES = {
     }
 }
 
-# 并发/同向持仓上限：后台风控管理页可配 (R20_MAX_CONCURRENT_POSITIONS=0 表示自动跟随标的池容量)
+# 并发/同向持仓上限：后台风控管理页可配 (ASTRA_MAX_CONCURRENT_POSITIONS=0 表示自动跟随标的池容量)
 MAX_CONCURRENT_POSITIONS, MAX_SAME_DIRECTION_POSITIONS = effective_max_positions(len(TARGET_INSTRUMENTS))
 TAKER_FEE_RATE = 0.0005
 MAKER_FEE_RATE = 0.0002 # Limit Order Maker Fee (60% Lower Than Market Taker)
 # 单笔 1R 风险额 / 数量量化 / 可用余额硬顶：**不再本地孪生**（审计批6）。
-# 曾与 r20_backend/execution/sizing.py 逐字重复两份，是「改一处漏一处」的漂移源。
-from r20_backend.execution import (
+# 曾与 astra_backend/execution/sizing.py 逐字重复两份，是「改一处漏一处」的漂移源。
+from astra_backend.execution import (
     effective_risk_per_trade,
     max_size_within_margin,
     quantize_size,
 )
-from r20_backend.execution.cooldowns import (
+from astra_backend.execution.cooldowns import (
+    add_stop_cooldown as _cooldowns_add,
     is_in_stop_cooldown as _cooldowns_is_in,
     load_stop_cooldowns as _cooldowns_load,
     read_stop_cooldowns_state as _cooldowns_read_state,
@@ -328,19 +364,47 @@ def fetch_candles_direct(inst_id: str, bar: str = "15m", limit: int = 45):
     """Direct fetch from OKX Official Market REST API with Keep-Alive connection pooling."""
     return fetch_candles(inst_id, bar=bar, limit=limit)
 
+class UnreadableTrackers(dict):
+    """**读不出来**的持仓追踪状态（与"文件不存在/真的是空"区分，第一百三十七刀）。
+
+    它就是个 `dict`（调用方语义不变），只多一个身份标记，供 `save_trackers` 判定：
+    **本轮状态不可信 ⇒ 拒绝落盘**。为什么必须有这个标记——
+
+    读失败时返回 `{}` 会被下游当成"没有任何在管持仓"，于是：
+    - `pyramiding_gate` 的「每仓最多加仓 N 次」判据 `scale_count < max` 拿到
+      `scale_count=0` ⇒ **上限被静默绕过**（可反复加仓，过度集中）；
+    - 一旦某笔加仓成功，调用方会 `tracker["scale_count"] = 1` 再 `save_trackers(trackers)`
+      ⇒ 用这个**近乎空的字典覆盖整个文件** ⇒ 其它持仓的移动止损水位与挂单归属依据
+      **被永久抹掉**（后者会让在场挂单失去 tracker 归属，只能靠意图文件兜底）。
+
+    本刀先堵**破坏性**那一半（拒绝覆盖）；"上限无法核验"那一半如实告警，
+    是否改成 fail-closed（禁本轮加仓）见 `load_trackers` 的 docstring。
+    """
+
+
 def load_trackers():
+    """读持仓追踪。**文件不存在 ⇒ `{}`**（合法空态）；**存在却读不出来 ⇒ `UnreadableTrackers()`**。
+
+    ⚠️ 第一百三十七刀：此前两种"空"都被压成 `{}`（只加了一条 RuntimeWarning）。
+    警告≠安全——返回空字典的**后果**是实打实的：加仓次数上限被静默绕过、
+    且下一笔加仓会把文件覆盖成近乎空 ⇒ 其它持仓水位/归属依据永久丢失
+    （见 `UnreadableTrackers`）。现在把"读不出来"标记出来，由写入侧拒绝覆盖。
+
+    ⚠️ 残留（待拍板）：加仓上限的"无法核验"这一半本刀**只告警不改行为** ——
+    `entry_execution` 的入场循环被 `test_trader_entry_execution_extraction` 以
+    **零归一 AST 逐字**冻结，改它需要先给那道门加"文档化差异"机制（独立一刀）。
+    """
     if os.path.exists(POSITION_TRACKER_FILE):
         try:
             with open(POSITION_TRACKER_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as _load_err:
-            # 2026-09-16：原先静默 pass —— 读失败会返回 {}，等于**忘掉全部在管持仓**
-            # （移动止损/高点水位全丢），却看不出任何异常。仍然返回 {}（保持调用方
-            # 语义），但必须吼出来：这是"数据缺失被当成没有持仓"的高危静默面。
             warnings.warn(
                 f"[trader] 持仓追踪文件读取失败，本轮按「无在管持仓」继续"
-                f"（高风险：移动止损/水位丢失）: {_load_err!r}",
+                f"（高风险：移动止损/水位丢失；**加仓次数上限无法核验**；"
+                f"且本轮拒绝覆盖该文件）: {_load_err!r}",
                 RuntimeWarning)
+            return UnreadableTrackers()
     return {}
 
 def save_trackers(trackers):
@@ -350,6 +414,14 @@ def save_trackers(trackers):
     可能读到半截 JSON，与本文件 `_atomic_write_json` 的既有审计结论相悖；
     ② 写失败原先静默 pass —— 追踪状态悄悄丢失。现改为原子写 + 失败告警。
     """
+    # ⚠️ 第一百三十七刀：状态**读不出来**时拒绝覆盖 —— 否则会把其它持仓的
+    # 移动止损水位与挂单归属依据永久抹掉（只为一笔记一笔加仓计数）。
+    if isinstance(trackers, UnreadableTrackers):
+        warnings.warn(
+            "[trader] 本轮持仓追踪状态不可读 ⇒ **拒绝落盘**（防止把其它持仓的水位/"
+            "加仓计数覆盖成空）；请检查 " + os.path.basename(POSITION_TRACKER_FILE),
+            RuntimeWarning)
+        return
     try:
         _atomic_write_json(POSITION_TRACKER_FILE, trackers)
     except Exception as _save_err:
@@ -490,7 +562,7 @@ def backfill_tracker_entry_identities(all_positions: List[Dict[str, Any]],
 
 def _atomic_write_json(path, payload):
     """审计③(2026-09-13)：常驻写者统一原子路数（mkstemp+fsync+os.replace，对齐
-    sync_full_ledger / r20_gateway.secrets）。此前台账/状态/冷却直 open("w") 覆写，
+    sync_full_ledger / astra_gateway.secrets）。此前台账/状态/冷却直 open("w") 覆写，
     并发读者（熔断/日报/备份/面板）可读到半截 JSON：误停开仓、推「0胜0负」假研报、
     止损冷却静默解除。失败时旧文件原样保全（绝不撕裂）。"""
     _dir = os.path.dirname(os.path.abspath(path))
@@ -514,9 +586,9 @@ def _read_stop_cooldowns_state():
     """薄壳：转调单一事实源，并在**调用时**解析本模块的 `STOP_COOLDOWN_FILE`。
 
     结构优化阶段 4·B3 第五十刀：本函数与
-    `r20_backend/execution/circuit_breaker.py` 的同名函数原为等价重复
+    `astra_backend/execution/circuit_breaker.py` 的同名函数原为等价重复
     （差在 `os.path.exists` vs `Path.exists`）。已收敛到
-    `r20_backend.execution.cooldowns.read_stop_cooldowns_state`。
+    `astra_backend.execution.cooldowns.read_stop_cooldowns_state`。
 
     ⚠️ 文件路径**必须**在调用时从本模块全局解析：测试会
     `patch.object(aft, "STOP_COOLDOWN_FILE", f)`（见
@@ -534,22 +606,14 @@ def load_stop_cooldowns():
     return _cooldowns_load(STOP_COOLDOWN_FILE)
 
 def add_stop_cooldown(inst_id: str, side: str, reason: str = "止损冷却"):
-    cooldowns, corrupt = _read_stop_cooldowns_state()
-    if corrupt:
-        print(f"[止损冷却] CRITICAL 状态文件损坏，拒绝合并写回以保全现场"
-              f"（期间所有标的按『仍在冷却』fail-closed）: {STOP_COOLDOWN_FILE}")
-        return
-    key = f"{inst_id}_{side}"
-    cooldowns[key] = {
-        "instId": inst_id,
-        "side": side,
-        "ts": int(time.time()),
-        "reason": reason
-    }
-    try:
-        _atomic_write_json(STOP_COOLDOWN_FILE, cooldowns)
-    except Exception as e:
-        print(f"[止损冷却] warn 落盘失败（本笔冷却丢失，依赖云端SL兜底）: {e}")
+    """薄壳：转调单一事实源（`cooldowns.add_stop_cooldown`，第一百四十八刀）。
+
+    写入规则（损坏拒绝写回以保全现场 / 落盘失败只告警）只有一处实现；
+    本壳只负责在**调用时**提供本模块的 `STOP_COOLDOWN_FILE` 与 `_atomic_write_json`
+    （测试会 patch 本模块全局；`position_exit` 等抽取模块也把本名字当注入面）。
+    """
+    return _cooldowns_add(inst_id, side, STOP_COOLDOWN_FILE, reason=reason,
+                          atomic_write_json=_atomic_write_json)
 
 def is_in_stop_cooldown(inst_id: str, side: str) -> bool:
     """薄壳：转调单一事实源（结构优化阶段 4·B3 第五十刀）。
@@ -586,9 +650,9 @@ def load_adaptive_config():
     return {}
 
 def _run_captured(script, label=None, timeout=15):
-    """审计(2026-09-13)：同解释器子进程 + 非零必吼（旧裸 python3 shell 串=静默死亡）。"""
-    from r20_backend.spawn import run_script
-    return run_script(script, timeout=timeout, label=label)
+    from astra_backend.spawn import run_script
+    t = 60 if timeout == 15 and "sync_full_ledger" in str(script) else timeout
+    return run_script(script, timeout=t, label=label)
 
 
 # 本进程内被回收枚举实证「凭证已死」的外所集合（审计 2026-09-13：坏键所自动摘除
@@ -625,19 +689,39 @@ def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None
     """壳（第八十三刀搬至 `scripts/trader/ledger_writer.py`，调用期同名注入）。"""
     return _ledger_writer_intent(inst_id, side, ts_ms, metadata,
                                  OPEN_INTENT_FILE=OPEN_INTENT_FILE,
-                                 OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS)
+                                 OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS,
+                                 # 第一百三十五刀：落盘改**原子替换**（消灭"写崩留
+                                 # 0 字节/半截 JSON ⇒ 读取侧按孤儿撤单"这一状态）
+                                 _atomic_write_json=_atomic_write_json)
+
+class OpenIntentsUnreadable(RuntimeError):
+    """本地开仓意图**存在却读不出来**（与"文件不存在/合法为空"区分，第一百三十四刀）。"""
+
 
 def load_open_intents() -> List[Dict[str, Any]]:
-    """读取原始本地开仓意图（不做 TTL 过滤，过期判定交给对账语义分层）。"""
+    """读取原始本地开仓意图（不做 TTL 过滤，过期判定交给对账语义分层）。
+
+    ⚠️ 第一百三十四刀：**"读不到"与"没有"必须分开**。此前任何异常都 `return []`，
+    而两个调用方（挂单对账 `reconcile_pending_orders` / 存量挂单回收
+    `clean_stale_open_orders`）拿 `[]` 会让**每一笔**挂单失去归属 ⇒ 按孤儿**撤销**
+    （"撤旧挂新"循环的另一种成因），且 `reconcile_ok` 仍为 True（不 fail-closed）。
+    撤单不可逆 ⇒ 现约定：文件**不存在** ⇒ `[]`（合法空态）；文件存在却
+    **读不出来/结构不对** ⇒ 抛 `OpenIntentsUnreadable`，调用方据此 fail-closed
+    （**不撤任何单** + 禁止本周期新增下单）。
+
+    ⚠️ 残留边界（如实记录）：文件**被删**而此时仍有在场挂单，仍按"没有意图"处理；
+    该场景留给"挂单在场 + 意图文件缺失"的独立判定，本刀不动。
+    """
+    if not os.path.exists(OPEN_INTENT_FILE):
+        return []
     try:
-        if os.path.exists(OPEN_INTENT_FILE):
-            with open(OPEN_INTENT_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, list):
-                return [i for i in raw if isinstance(i, dict) and i.get("instId")]
+        with open(OPEN_INTENT_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
     except Exception as e:
-        print(f"[挂单对账] 读取本地意图失败: {e}")
-    return []
+        raise OpenIntentsUnreadable(f"读取本地意图失败: {e!r}") from e
+    if not isinstance(raw, list):
+        raise OpenIntentsUnreadable(f"意图文件结构应为 list，实为 {type(raw).__name__}")
+    return [i for i in raw if isinstance(i, dict) and i.get("instId")]
 
 
 def _order_pos_side(side: str) -> str:
@@ -725,8 +809,13 @@ def prune_trackers(trackers: Dict[str, Any], real_pos_dict: Dict[str, Any]) -> i
 
 AI_DECISION_CACHE_FILE = os.path.join(DATA_DIR, "ai_brain_decisions.json")
 VENUE_HEALTH_FILE = os.path.join(DATA_DIR, "venue_health.json")
+#: 行情取数健康快照（worker 每周期写、后端 `/metrics` 读）。
+#: 跨进程原因：取数在 worker（15 分钟 respawn），`/metrics` 在后端进程 ——
+#: 进程内计数器看不到对方（与 venue_health.json 同一套手法）。
+MARKET_DATA_HEALTH_FILE = os.path.join(DATA_DIR, "market_data_health.json")
+CYCLE_DISCLOSURE_FILE = os.path.join(DATA_DIR, "cycle_disclosure.json")
 #: 组合风险预算总上限（US-001 预留层封顶口径；0/未配置 = 只累计台账不封顶）
-PORTFOLIO_RISK_BUDGET_ENV = "R20_PORTFOLIO_RISK_BUDGET_USDT"
+PORTFOLIO_RISK_BUDGET_ENV = "ASTRA_PORTFOLIO_RISK_BUDGET_USDT"
 #: 场所取数健康度可容忍年龄（brain 15min 周期写盘，给 2 个周期 + 余量）
 VENUE_HEALTH_MAX_AGE_S = 1900.0
 
@@ -887,10 +976,12 @@ def reconcile_reservation_ledger(real_pos_dict: Dict[str, Any],
                                  pending_inst_ids: set,
                                  environment: str,
                                  ttl_s: float = None,
-                                 venue_snapshot: Optional[Dict[str, list]] = None) -> int:
+                                 venue_snapshot: Optional[Dict[str, list]] = None,
+                                 venue_snapshot_verified: bool = True) -> int:
     """薄壳：转调 `scripts/trader/reservation_reconcile.py`（第五十八刀）。
 
-    ⚠️ **签名对外一字未变**（`tests/core/test_reservation_reconcile.py` 用位置参数调用）。
+    ⚠️ 位置参数与既有调用**一字未变**（`tests/core/test_reservation_reconcile.py` 用位置参数调用）；
+    第一百二十六刀新增 `venue_snapshot_verified`（默认 True ⇒ 老调用方行为不变）。
     四个依赖全部在**调用时**注入 —— 尤其 `reservation_manager` 与
     `fetch_other_venue_positions` 是本模块的模块级名字，测试用
     `patch.object(trader, …)` 替换它们；若子模块 import 期绑一份，
@@ -906,6 +997,9 @@ def reconcile_reservation_ledger(real_pos_dict: Dict[str, Any],
         default_ttl_s=RESERVATION_RECONCILE_TTL_S,
         ttl_s=ttl_s,
         venue_snapshot=venue_snapshot,
+        # 第一百二十六刀：跨所实况**是否核验成功**必须一路传到对账器 ——
+        # 读取失败时 `venue_snapshot` 是空字典，对账器据此会误判"外所无仓无挂"。
+        venue_snapshot_verified=venue_snapshot_verified,
     )
 
 
@@ -960,6 +1054,8 @@ def build_signal_snapshot(f: dict) -> dict:
 def finalize_pending_tracker_signal_snapshots(all_factors, trackers):
     """在本轮方向观测完成后，补齐新 tracker 的入场快照并写入 journal。"""
     for f in all_factors:
+        if not isinstance(f, dict):
+            continue
         position = f.get("position")
         if not position:
             continue
@@ -1069,7 +1165,7 @@ def record_trade(trade_data):
 # =============================================================================
 # 🧮 Enhanced Quantitative Technical Indicators Math Engine
 # =============================================================================
-from r20_backend.execution import (
+from astra_backend.execution import (
     calc_ema,
     calc_rsi,
     calc_atr,
@@ -1159,7 +1255,7 @@ def execute_ai_position_management(real_pos_dict, trackers, timestamp_full, exec
     )
 
 # =============================================================================
-# 🧠 R20 Quantum Trader v6.8.1 Multi-Factor Scoring & Strategy Setup Classifier
+# 🧠 AstraQuant v6.8.1 Multi-Factor Scoring & Strategy Setup Classifier
 # =============================================================================
 def evaluate_asset_signal(f):
     """连续多因子量化评分（-5.0 ~ +5.0）。实现见 scripts/trader/signals.py。
@@ -1176,6 +1272,39 @@ def evaluate_asset_signal(f):
         load_adaptive_config=load_adaptive_config,
     )
 
+def _slot_guard_should_skip(now_slot: int) -> bool:
+    """同槽重复触发守卫：**判定 + 记录**（第一百三十六刀从装饰器内联抽出）。
+
+    为什么抽出来：它原先内联在 `single_trader_cycle` 的装饰器里，本会话发现它
+    有两处该钉的语义却**无法单独测试**：
+
+    1. **写必须是原子的**：旧写法 `open(TRADER_SLOT_FILE, "w")` 先截断再写 —— 写崩/
+       断电会留下 0 字节或半截 JSON，而读取分支把它吞进 `except: pass`
+       ⇒ **同槽去重静默失效**（同一 15 分钟槽可能跑两轮，重复处理同一批信号）。
+       现改走本模块既有的 `_atomic_write_json`（失败时旧文件原样保全）。
+    2. **读不到 ≠ 没有状态**：仍**放行**（不因一个状态文件把实盘交易停掉），
+       但必须**吼出来**——旧写法静默 `pass`，损坏时外面看不出任何异常。
+
+    返回 True = 判为同槽重复触发（调用方应 Skip 本周期）。
+    """
+    if os.path.exists(TRADER_SLOT_FILE):
+        try:
+            with open(TRADER_SLOT_FILE, "r", encoding="utf-8") as f:
+                slot_state = json.load(f)
+            same_slot = int(slot_state.get("slot", -1)) == now_slot
+            recently_started = int(time.time()) - int(slot_state.get("started_at", 0) or 0) < 120
+            if same_slot and recently_started:
+                print("[Trader] Skip: duplicate trigger detected in this 15-minute slot")
+                return True
+        except Exception as _slot_exc:
+            print(f"[Trader] warn 同槽去重状态不可读（{_slot_exc!r}）——本轮**无法判定**是否"
+                  f"同槽重复触发，仍按正常流程执行（请检查 "
+                  f"{os.path.basename(TRADER_SLOT_FILE)}）")
+    _atomic_write_json(TRADER_SLOT_FILE,
+                       {"slot": now_slot, "started_at": int(time.time()), "pid": os.getpid()})
+    return False
+
+
 def single_trader_cycle(func):
     """Prevent cron/manual overlap across the complete order-management cycle."""
     def wrapped(*args, **kwargs):
@@ -1189,19 +1318,9 @@ def single_trader_cycle(func):
             return None
         try:
             now_slot = int(time.time()) // 900
-            if os.path.exists(TRADER_SLOT_FILE):
-                try:
-                    with open(TRADER_SLOT_FILE, "r", encoding="utf-8") as f:
-                        slot_state = json.load(f)
-                    same_slot = int(slot_state.get("slot", -1)) == now_slot
-                    recently_started = int(time.time()) - int(slot_state.get("started_at", 0) or 0) < 120
-                    if same_slot and recently_started:
-                        print("[Trader] Skip: duplicate trigger detected in this 15-minute slot")
-                        return None
-                except Exception:
-                    pass
-            with open(TRADER_SLOT_FILE, "w", encoding="utf-8") as f:
-                json.dump({"slot": now_slot, "started_at": int(time.time()), "pid": os.getpid()}, f)
+            # 判定 + 记录走助手（原子写 + 读失败告警；见其 docstring）
+            if _slot_guard_should_skip(now_slot):
+                return None
             lock_handle.seek(0)
             lock_handle.truncate()
             lock_handle.write(str(os.getpid()))
@@ -1239,6 +1358,14 @@ def execute_portfolio():
         return None
     entries_blocked, timestamp_full = _preflight
 
+    # 0.5 只读形状预检：把"读得到但会被静默忽略"的形状问题**尽早指名道姓**
+    #     （只警告、不阻断 —— 行为判定在加载侧：意图 fail-closed、追踪器拒绝覆盖）
+    _shape_violations = data_shape_preflight_stage(
+        intents_path=OPEN_INTENT_FILE,
+        trackers_path=POSITION_TRACKER_FILE,
+        validate_intents_file=validate_intents_file,
+        validate_trackers_file=validate_trackers_file)
+
     # 1. Fetch Real Positions. A failed account query aborts the complete cycle.
     _phase1 = fetch_positions_and_reconcile(
         entries_blocked=entries_blocked,
@@ -1251,6 +1378,7 @@ def execute_portfolio():
         query_positions=query_positions,
         reconcile_reservation_ledger=reconcile_reservation_ledger,
         venue_execution_ready=venue_execution_ready,
+        broken_execution_venues=broken_execution_venues,
         venue_registry=venue_registry    )
     if _phase1 is None:
         return None
@@ -1281,6 +1409,7 @@ def execute_portfolio():
     # 4. Check Circuit Breaker & Batch AI Brain Scan (Including Active Positions Detail)
     ASSET_MARGIN_CAP, brain_cache, cb_active, cb_reason = scan_risk_gates_and_ai_brain(
         _xv_total=_xv_total,
+        venue_position_span=venue_position_span,
         active_pos_count=active_pos_count,
         all_factors=all_factors,
         executed_actions=executed_actions,
@@ -1352,9 +1481,38 @@ def execute_portfolio():
             trade_open_kwargs=trade_open_kwargs,
         )
 
+    # 4b. 跨所云端保护单巡检（roadmap G8）：Gate/Binance 的触发单带 expiration，
+    # 到期后仓位裸奔，而主链的 OKX 保护核验够不到跨所仓位（合成 id 匹配不上）。
+    # **默认关闭**（ASTRA_VENUE_PROTECTION_WATCHDOG=1 才跑）：本刀只接线，线上行为零变化。
+    # 开闸前先用 `ASTRA_VENUE_PROTECTION_WATCHDOG_DRY_RUN=1` 预演一轮：照常判定但不写单，
+    # 日志逐条给出"本来会做"的动作（见该函数 docstring）。
+    _wd_report = venue_protection_watchdog_stage(
+        xv_positions_by_venue=xv_positions_by_venue,
+        executed_actions=executed_actions,
+        venue_registry=venue_registry,
+        current_environment=current_environment,
+        ASTRA_VENUE_PROTECTION_WATCHDOG=ASTRA_VENUE_PROTECTION_WATCHDOG,
+        # 第一百二十九刀：预演模式（总闸未开时无意义）——开闸前先看"会做什么"。
+        dry_run=ASTRA_VENUE_PROTECTION_WATCHDOG_DRY_RUN,
+        # 第一百三十刀：防抖 —— 缺口必须持续够久才允许真实写单（状态不可读写则不写单）。
+        state_path=VENUE_PROTECTION_WATCHDOG_STATE_FILE,
+        debounce_s=ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S,
+        debounce_step=watchdog_debounce_step,
+        audit_cross_venue_protection=audit_cross_venue_protection,
+        # 第一百七十四刀：台账行（只读；读不到 ⇒ None ⇒ 不产生 ledger 证据）
+        ledger_rows=read_ledger_rows(LEDGER_JSON_FILE),
+    )
+
+    # 4c. 行情取数健康快照（第 137 刀事故的可观测性闭环）：把本轮的取数
+    # 失败计数/耗时/最近成功时刻落盘，供后端 `/metrics` 跨进程读取。
+    # 只写一个 JSON、失败只返回 False（绝不抛异常、绝不改变交易行为）。
+    write_market_data_health_snapshot(path=MARKET_DATA_HEALTH_FILE)
+
     # 5. Persist Latest State for Web Monitoring Dashboard
     persist_state_and_sync_ledger(
         _xv_total=_xv_total,
+        xv_positions_by_venue=xv_positions_by_venue,
+        venue_position_span=venue_position_span,
         active_pos_count=active_pos_count,
         all_factors=all_factors,
         cb_active=cb_active,
@@ -1374,6 +1532,19 @@ def execute_portfolio():
         build_state_payload=build_state_payload,
         evaluate_asset_signal=evaluate_asset_signal,
         os=os    )
+
+    # 6. 周期披露汇总（第 50/51 刀）：每轮必须留下**一条可检索**的"跳过/未核验"行，
+    #    并把同一份载荷原子落盘给后端 /metrics（跨进程可观测：读不到 ≠ 没有）
+    _disc = cycle_disclosure_payload(
+        broken_venues=_BROKEN_VENUES,
+        entries_blocked=entries_blocked,
+        shape_violations=_shape_violations,
+        watchdog_report=_wd_report,
+        watchdog_enabled=ASTRA_VENUE_PROTECTION_WATCHDOG)
+    print(cycle_disclosure_summary(_disc))
+    write_cycle_disclosure_snapshot(
+        path=CYCLE_DISCLOSURE_FILE, payload=_disc,
+        _atomic_write_json=_atomic_write_json)
 
 if __name__ == "__main__":
     if not selected_environment().configured:

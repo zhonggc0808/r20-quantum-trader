@@ -1,17 +1,17 @@
 # `scripts/` 导航
 
-本目录是 R20 的**运行时代码**：实盘 worker、后台守护进程、以及它们共用的库。
+本目录是 ASTRA 的**运行时代码**：实盘 worker、后台守护进程、以及它们共用的库。
 它**不是**一个 Python 包（没有 `__init__.py`），模块之间以
 `sys.path` 上的顶层名互相 `import`，同时也支持 `scripts.xxx` 双拼写
 （见本文末「双拼写」一节）。
 
-> ⚠️ **为什么要有这份文档**：本目录根层有 **36 个 `.py`**，
+> ⚠️ **为什么要这份文档**：本目录根层有 **41 个 `.py`**，
 > 此前**没有任何 README**，其中 23 个在全仓文档里连一次都没被提到。
 > 新人（或下一个 Agent）只能靠逐个打开文件猜哪个是入口、哪个是库。
 >
 > 第六十六刀补上这份导航后，`tests/audit/test_directory_docs_current.py`
 > 会把「磁盘上的根层模块」与「本文档提到的模块」**双向对照**，
-> 漏登记或指向不存在的文件都会翻红 —— 与前几刀给 `r20_backend/` 加的是同一道闸。
+> 漏登记或指向不存在的文件都会翻红 —— 与前几刀给 `astra_backend/` 加的是同一道闸。
 
 ## 入口 / 调度（由外部按周期拉起）
 
@@ -24,6 +24,7 @@
 | `nightly_backup_and_clean.py` | 86 | 每日 02:00 | 跑配置好的备份作业 + 清理 |
 | `cleanup_disk.py` | 125 | 按需/定时 | 磁盘与日志清理 |
 | `generate_snapshots.py` | 102 | 定时 | 生成 `snapshots.json` 供前端曲线 |
+| `gateway_liveness.py` | 121 | 由 `astra_watchdog.sh gateway` 每 30s 调用 | 网关存活判据（**退出码即语义**：0 健康 / 1 进程不存在 / 2 心跳停更 / 3 心跳缺失）。判据是 worker 每轮循环写的存活心跳，而不是周期产物够不够新 —— 用户**可以合法关停交易**，那时周期产物本就不更新，用它当判据会造成误杀循环 |
 | `sync_web_data.py` | 346 | 由 `daemon_web_sync.py` 每轮调用 | 生成前端 `trading_data.json` 缓存（凭证未配则 **fail-closed**，绝不用 0 覆盖好缓存） |
 
 ## 交易核心
@@ -31,11 +32,13 @@
 | 模块 | 行数 | 说明 |
 |---|---|---|
 | `direction_observation.py` | 176 | 多周期方向一致性观测与版本化快照字段 |
+| `jev_shadow_evaluator.py` | 327 | JEV 影子决策与独立决策结果的只读分组评估器 |
 | `ai_brain_trader.py` | 1117 | AI 主脑全标的池决策引擎（与主脚本共用风控常量） |
 | `factor_library.py` | 298 | 多因子库：`compute_instrument_factors()` 逐标的装配因子 |
 | `instrument_pool.py` | 409 | 交易宇宙（标的池）的**校验后**单一来源 |
-| `market_data_service.py` | 525 | 零进程直连公共行情服务 |
-| `market_data_health.py` | 89 | 行情取数失败的**计数 + 每类一次性告警**（可观测性；第 137 刀因"静默 `except` 吞掉取数失败导致 30 小时无信号"而补） |
+| `market_data_service.py` | 562 | 零进程直连公共行情服务；`_public_get/_public_post` 带**耗时/成败埋点**（调用期 `note_call`/`note_failure`，取值行为一字不变） |
+| `market_data_health.py` | 266 | 行情取数可观测性：失败**计数 + 每类一次性告警**（第 137 刀）+ 调用**耗时/成功率/百分位**与跨进程快照 `data/market_data_health.json`（第 138 刀；worker 每周期写、后端 `/metrics` 读） |
+| `market_stream.py` | 481 | 公共行情 **WebSocket 只读层**（帧解析三所归一 / 有界 tick 缓冲 / 健康账本与陈旧度 / `--probe` 探测 CLI）。**不常驻、不接决策与下单路径**；REST 取数一字未动。快照 `data/market_stream_health.json` 经 `/metrics` 暴露（可选源 `required="0"`）。三条实测坑写在模块 docstring：Gate 期货专用域、Binance 路径式订阅、Gate 订阅应答不是 tick |
 | `calculus_engine.py` | 71 | 因果微积分 / 定积分 / 概率论引擎 |
 | `order_risk.py` | 60 | 报价与风控的**确定性**安全检查（共享） |
 | `backtest_engine.py` | 382 | 多资产回测与统计验证引擎（门面，部件在 `backtest/`） |
@@ -72,7 +75,7 @@
 
 | 模块 | 行数 | 说明 |
 |---|---|---|
-| `prompt_library.py` | 1028 | 版本化提示词库（Python 交易侧直接使用） |
+| `prompt_library.py` | 1233 | 版本化提示词库（Python 交易侧直接使用）；**双文件**：出厂基线 `data/prompt_library.json`（跟踪、只读）⊕ 用户改动 `data/prompt_library.local.json`（忽略、唯一写目标） |
 | `prompt_templates.py` | 193 | 提示词模板编译：文本 ⇄ 模块 ⇄ 管线布局 |
 | `llm_credentials.py` | 93 | LLM 客户端凭据解析单一事实源 |
 
@@ -85,10 +88,12 @@
 | `backup_upload.py` | 282 | 备份上传目标：S3 / OSS / WebDAV / 百度网盘 |
 | `self_improvement_engine.py` | 782 | LLM 原生自省与策略演化引擎 |
 | `local_lock.py` | 114 | `file_lock` 的**本地兜底**实现（跨主机锁的降级路径） |
-| `qq_notifier.py` | 157 | 通知发布器，桥接 R20 网关 |
+| `qq_notifier.py` | 157 | 通知发布器，桥接 AstraQuant 网关 |
 | `db_manager.py` | 282 | SQLite 连接/建表管理 |
 | `debug_aggregate_orders.py` | 54 | **调试脚本**：聚合挂单排查 |
 | `debug_audit_bills.py` | 48 | **调试脚本**：账单审计排查 |
+| `tag_markers.py` | 71 | 交易所挂单的**归属标记**（新标记 + 改名前的旧标记归一）。改标记前必读：旧标记仍在交易所上，只认新标记会让云端棘轮静默失效 |
+| `migrate_r20_to_astra.py` | 292 | **一次性迁移工具**（`r20` → `astra`）：运行态文件原子改名 + 密文库键重映射。默认 dry-run，`--check` 供启动脚本做 fail-closed 前置检查 |
 
 ## ⚠️ 双拼写（改动 import 前必读）
 
@@ -111,10 +116,10 @@ from scripts.okx_rest import …  # 包路径名（仓库根在 sys.path 上）
 ## 判绿命令
 
 ```bash
-# 全量套件（当前基线见 r20_backend/README.md §6）
+# 全量套件（当前基线见 astra_backend/README.md §6）
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
 > 注意 `python -m tests.offline_suite` 会主动拦截未白名单的外部子进程
 > （`git` / `python` / `node` 等），那是守卫自身的产物，**不是回归**。
-> 详见 `r20_backend/README.md` §6。
+> 详见 `astra_backend/README.md` §6。

@@ -26,10 +26,10 @@ class AccountScopeTests(unittest.TestCase):
 
     def test_environment_change_and_removal_rejected(self):
         assert_environment(self.data,'live')
-        for vals in ({'R20_OKX_ENV':'demo'},{'OKX_IS_SIMULATED':True}):
+        for vals in ({'ASTRA_OKX_ENV':'demo'},{'OKX_IS_SIMULATED':True}):
             with self.assertRaises(ValueError): validate_environment_update(self.data,vals)
-        with self.assertRaises(ValueError): validate_environment_update(self.data,{'R20_OKX_ENV':None},removing=True)
-        validate_environment_update(self.data,{'R20_OKX_ENV':'live','LLM_MODEL':'other'})
+        with self.assertRaises(ValueError): validate_environment_update(self.data,{'ASTRA_OKX_ENV':None},removing=True)
+        validate_environment_update(self.data,{'ASTRA_OKX_ENV':'live','LLM_MODEL':'other'})
 
     def test_bad_scope_fails_closed(self):
         (self.data/'account_scope.json').write_text('{bad')
@@ -46,12 +46,12 @@ class AccountScopeTests(unittest.TestCase):
         from scripts import okx_runtime
         with patch.object(okx_runtime, 'ROOT', self.root), \
              patch.object(okx_runtime, '_load_dotenv',
-                          return_value={'R20_OKX_ENV': 'demo'}):
+                          return_value={'ASTRA_OKX_ENV': 'demo'}):
             with self.assertRaises(ValueError):
                 okx_runtime.selected_environment()
         with patch.object(okx_runtime, 'ROOT', self.root), \
              patch.object(okx_runtime, '_load_dotenv',
-                          return_value={'R20_OKX_ENV': 'live'}):
+                          return_value={'ASTRA_OKX_ENV': 'live'}):
             self.assertEqual(okx_runtime.selected_environment().mode, 'live')
 
     def test_explicit_values_are_a_pure_call_and_never_touch_the_scope_file(self):
@@ -65,11 +65,11 @@ class AccountScopeTests(unittest.TestCase):
         with patch.object(okx_runtime, 'ROOT', self.root):
             for mode in ('demo', 'live'):
                 self.assertEqual(
-                    okx_runtime.selected_environment({'R20_OKX_ENV': mode}).mode, mode,
+                    okx_runtime.selected_environment({'ASTRA_OKX_ENV': mode}).mode, mode,
                     f'显式 {mode} 不应被本机 scope(live) 拦住')
 
     def test_sandbox_redirect_via_env_var_is_honoured(self):
-        """`R20_DATA_DIR` 是全仓契约，围栏必须走同一个解析口径。
+        """`ASTRA_DATA_DIR` 是全仓契约，围栏必须走同一个解析口径。
 
         该变量由 `tests/config_sandbox.isolate_config` 设置，也被独立部署用来
         迁移 data 目录；factor_library / sync_full_ledger / self_improvement_engine /
@@ -78,7 +78,7 @@ class AccountScopeTests(unittest.TestCase):
         生产 scope —— 这是那 65 个用例的真正死因。
         """
         import os
-        with patch.dict(os.environ, {'R20_DATA_DIR': str(self.data)}):
+        with patch.dict(os.environ, {'ASTRA_DATA_DIR': str(self.data)}):
             self.assertEqual(runtime_data_dir(self.root / 'elsewhere'), self.data)
 
     def test_sandbox_without_scope_file_is_not_fenced_by_production(self):
@@ -87,16 +87,16 @@ class AccountScopeTests(unittest.TestCase):
         empty = self.root / 'sandbox'
         empty.mkdir()
         from scripts import okx_runtime
-        with patch.dict(os.environ, {'R20_DATA_DIR': str(empty)}), \
+        with patch.dict(os.environ, {'ASTRA_DATA_DIR': str(empty)}), \
              patch.object(okx_runtime, 'ROOT', self.root), \
              patch.object(okx_runtime, '_load_dotenv',
-                          return_value={'R20_OKX_ENV': 'demo'}):
+                          return_value={'ASTRA_OKX_ENV': 'demo'}):
             self.assertEqual(okx_runtime.selected_environment().mode, 'demo')
 
     def test_runtime_data_dir_defaults_when_env_var_absent(self):
         import os
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('R20_DATA_DIR', None)
+            os.environ.pop('ASTRA_DATA_DIR', None)
             self.assertEqual(runtime_data_dir(self.root / 'data'), self.root / 'data')
 
     def test_unscoped_checkout_retains_legacy_behavior(self):

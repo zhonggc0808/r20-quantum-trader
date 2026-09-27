@@ -1,6 +1,6 @@
 """US-002 venue_router 单测（全 mock，封闭三律：零网络/零凭证/零临时文件）。
 
-patch 模块绑定名：r20_backend.exchanges.listing.ensure_contract_listed
+patch 模块绑定名：astra_backend.exchanges.listing.ensure_contract_listed
 （venue_router 通过 `from .exchanges import listing` 绑定模块对象，
 patch 模块属性即可生效）。
 """
@@ -14,10 +14,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from r20_backend.venue_router import (  # noqa: E402
+from astra_backend.venue_router import (  # noqa: E402
     RouteDecision, route_signal, split_allocation, RouterConfig,
 )
-from r20_backend.exchanges import listing as listing_mod  # noqa: E402
+from astra_backend.exchanges import listing as listing_mod  # noqa: E402
 
 NOW = datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc)
 NOW_ISO = "2026-09-11T12:00:00Z"
@@ -201,7 +201,7 @@ class TestVenuePoolGate(unittest.TestCase):
     """
 
     def test_pool_mismatch_rejected_as_venue_pool_and_falls_back(self):
-        from r20_backend.venue_routing import selection as sel
+        from astra_backend.venue_routing import selection as sel
         pool = {"binance": ["BTC"], "gate": ["BTC"], "okx": None}
         with patch.object(listing_mod, "ensure_contract_listed", _ok_listing), \
              patch.object(sel, "_venue_pool_assets", lambda v: pool.get(v)):
@@ -217,7 +217,7 @@ class TestVenuePoolGate(unittest.TestCase):
                 self.assertIn("准入币种清单", r["reason"])
 
     def test_asset_in_pool_passes(self):
-        from r20_backend.venue_routing import selection as sel
+        from astra_backend.venue_routing import selection as sel
         with patch.object(listing_mod, "ensure_contract_listed", _ok_listing), \
              patch.object(sel, "_venue_pool_assets", lambda v: ["BTC"]):
             d = route_signal(_signal(), [_cand("okx")], config=_cfg())
@@ -227,7 +227,7 @@ class TestVenuePoolGate(unittest.TestCase):
     def test_empty_or_absent_pool_does_not_restrict(self):
         """空清单/未配置 ≠ 新造一条拒绝理由（执行层才有「空池=停发」语义，
         OKX 直下路径更是没有池概念）。"""
-        from r20_backend.venue_routing import selection as sel
+        from astra_backend.venue_routing import selection as sel
         with patch.object(listing_mod, "ensure_contract_listed", _ok_listing), \
              patch.object(sel, "_venue_pool_assets", lambda v: None):
             d = route_signal(
@@ -241,8 +241,8 @@ class TestVenuePoolGate(unittest.TestCase):
         import json
         import tempfile
         from pathlib import Path
-        from r20_backend.exchanges import routing_policy as rp
-        from r20_backend.venue_routing import selection as sel
+        from astra_backend.exchanges import routing_policy as rp
+        from astra_backend.venue_routing import selection as sel
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "venue_routing.json"
             f.write_text(json.dumps({"okx": {"assets": ["BTC", "eth", "btc"]}}),
@@ -369,6 +369,56 @@ class TestMisc(unittest.TestCase):
         self.assertIsInstance(d, RouteDecision)
         self.assertTrue(d.reasons)  # 可解释：至少有评分分项
 
+
+class HealthWindowVsRefreshCadenceTest(unittest.TestCase):
+    """健康新鲜度窗口必须**明显大于**刷新周期，否则外所会"闪进闪出"候选集。
+
+    为什么值得单独钉：`health_updated_utc` 的新鲜度闸门是 **fail-closed** 的
+    （无记录/不可解析/过期 ⇒ 淘汰，已有 `test_missing_health_rejected` /
+    `test_stale_health_rejected` 覆盖）。方向安全，但**阈值太紧会变成可用性事故**：
+    刷新发生在 trader 周期里（`scheduler.JOBS["trader"]`），窗口若 ≤ 周期，
+    外所会在"刚刷新⇒合格 / 隔一会⇒过期"之间反复闪动，与"三所平权"的路由目标相悖。
+    两个数字分布在两个文件里（改任一个都容易忘记另一个）⇒ 用本门把它们绑在一起。
+    """
+
+    def _const(self, path, name):
+        import ast
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        return self._fold(node.value)
+        raise AssertionError(f"{path.name} 里找不到 {name}")
+
+    def _fold(self, node):
+        """只做字面量四则折叠（`15 * 60` 这种写法很常见，literal_eval 读不了）。"""
+        import ast
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BinOp):
+            l, r = self._fold(node.left), self._fold(node.right)
+            if isinstance(node.op, ast.Mult):
+                return l * r
+            if isinstance(node.op, ast.Add):
+                return l + r
+        raise AssertionError(f"不支持的表达式：{ast.dump(node)[:80]}")
+
+    def test_window_is_at_least_twice_the_trader_interval(self):
+        root = Path(__file__).resolve().parents[2]
+        max_age = self._const(root / "scripts" / "ai_factor_trader.py",
+                              "VENUE_HEALTH_MAX_AGE_S")
+        schedule = (root / "astra_backend" / "scheduler.py").read_text(encoding="utf-8")
+        import ast
+        jobs = next(n for n in ast.parse(schedule).body if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", None) == "JOBS" for t in n.targets))
+        trader = next(v for k, v in zip(jobs.value.keys, jobs.value.values)
+                      if getattr(k, "value", None) == "trader")
+        interval = self._fold(trader.elts[1])
+        self.assertGreaterEqual(
+            float(max_age), 2 * float(interval),
+            f"健康新鲜度窗口 {max_age}s 未达 trader 周期 {interval}s 的两倍 —— "
+            "外所会在合格/过期之间闪动（阈值太紧＝可用性事故）")
 
 if __name__ == "__main__":
     unittest.main()

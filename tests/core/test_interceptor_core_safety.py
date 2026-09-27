@@ -14,7 +14,7 @@ from unittest.mock import patch
 from scripts.order_risk import (
     validate_quote_geometry_and_rr, validate_quote_geometry_and_rr_detailed,
 )
-import r20_backend.interceptor_manager as im
+import astra_backend.interceptor_manager as im
 
 
 class CoreRiskAndInterceptorTests(unittest.TestCase):

@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { chartStyles } from './chartStyles'
 import { computeRiskReward, symbolPrecision } from './chartMath'
-import { deriveLiveEntry, deriveLiveSide, deriveLiveStopLoss, deriveLiveTakeProfit } from './chartLiveLevels'
-import { planPriceLines } from './chartOverlays'
+import { deriveLiveEntry, deriveLiveSide, deriveLiveStopLoss, deriveLiveTakeProfit, deriveLiveTakeProfits } from './chartLiveLevels'
+import { planPriceLines, expandRangeToLevels } from './chartOverlays'
 import { countdownLabel } from './chartCountdown'
 import { fetchCandles } from './chartCandles'
 import { mainIndicators, subIndicators, DEFAULT_ACTIVE_INDICATORS } from './chartIndicators'
@@ -21,6 +21,7 @@ import {
   registerOverlay,
   type Chart as KLineChartType,
   type KLineData,
+  type AxisCreateRangeParams,
 } from 'klinecharts'
 import {
   Sliders,
@@ -344,14 +345,18 @@ const currentAtr = computed(() => {
   return 0
 })
 // 涨跌幅：当前蜡烛价格相比其开盘价的实时变化百分比
-const liveChangePct = computed(() => {
+// 涨跌幅：当前蜡烛价格相比其开盘价的实时变化百分比。
+// ⚠️ 第一百九十八刀：**读不到就是读不到**。原先没有蜡烛时 `return Number(factorItem.value?.c_1h_ret || 0) * 100`
+// —— 而 `c_1h_ret` 后端**从未发过**（全仓无生产者）⇒ 兜底恒为 0，界面会把"没有行情"渲染成
+// 精确的 "+0.00%"（doctrine：读不到 ≠ 没有）。现改为返回 null，模板据此显示占位。
+const liveChangePct = computed<number | null>(() => {
   if (candles.value.length > 0) {
     const last = candles.value[candles.value.length - 1]
     if (last && last.open > 0) {
       return ((currentPrice.value - last.open) / last.open) * 100
     }
   }
-  return Number(factorItem.value?.c_1h_ret || 0) * 100
+  return null
 })
 
 // 实盘在手持仓与在途委托
@@ -392,6 +397,16 @@ const liveTakeProfit = computed(() => deriveLiveTakeProfit({
   position: activePosition.value, order: activeOrder.value,
 }))
 
+// 分批止盈：同一条仓位的**全部**档位（首批 TP1 + 终点 TP2）。
+// 上面那个单值 computed 仍保留 —— 它喂 `computeRiskReward`（R:R 只按终点算），
+// 也是终点线价位的既有事实源，本改动不移动任何既有线。
+const liveTakeProfits = computed(() => deriveLiveTakeProfits({
+  position: activePosition.value,
+  order: activeOrder.value,
+  entry: liveEntry.value,
+  side: liveSide.value,
+}))
+
 // ==========================================
 // 3. 调价试算控制器 (Sim Mode)
 // ==========================================
@@ -404,6 +419,18 @@ const copied = ref<boolean>(false)
 const effectiveEntry = computed(() => simMode.value ? simEntryPrice.value : liveEntry.value)
 const effectiveSL = computed(() => simMode.value ? simSL.value : liveStopLoss.value)
 const effectiveTP = computed(() => simMode.value ? simTP.value : liveTakeProfit.value)
+
+// 要画的止盈档位。试算模式只有一个目标价（试算面板只让输入一条 TP，无分批），
+// 实盘则把分批档位全画出来。`pct` 与 R:R 面板同口径 —— 试算档直接复用
+// `rewardPct`（`computeRiskReward` 就是用 `effectiveTP` 算的），实盘档已由
+// `deriveLiveTakeProfits` 逐档算好。
+const effectiveTPLevels = computed(() =>
+  simMode.value
+    ? (simTP.value > 0
+        ? [{ price: simTP.value, pct: riskRewardMetrics.value.rewardPct, label: 'TP' as const }]
+        : [])
+    : liveTakeProfits.value,
+)
 
 function initSimulation() {
   const px = currentPrice.value
@@ -450,7 +477,9 @@ const candleCountdown = ref<string>('00:00')
 // 绘制的价格线 ID 记录
 let entryOverlayId: string | null = null
 let slOverlayId: string | null = null
-let tpOverlayId: string | null = null
+// 止盈是**一档一条**（分批建仓有 TP1 / TP2），故用数组；换档或价格变动时
+// 必须把上一批全部移除，否则旧档位会留在图上叠成"幽灵止盈线"。
+let tpOverlayIds: string[] = []
 
 function getChartStyles(): any {
   // 批 13：主题已完全由 tok() 经 --chart-* 主题化色板承载，不再需要传 isDark
@@ -556,6 +585,28 @@ function initChart() {
   const rightOffset = typeof window !== 'undefined' && window.innerWidth < 640 ? 75 : 95
   klineChart.setOffsetRightDistance(rightOffset)
 
+  // 价格轴保证把自己仓位的那几条线框进可视范围。
+  //
+  // 库自带的范围只统计**可见蜡烛 + 指标**，从不看 overlay（实测 klinecharts
+  // 10.0.3 的 `createRangeImp`）⇒ 远离现价的止盈线会被裁到面板外。真机取证：
+  // TP2 = 1.6708 时轴顶只有 1.6656，换算像素 y = −9px，线建出来了但看不见，
+  // 读者"只看得到一个止盈点"。这里只**扩**不缩，无仓无单时原样返回默认范围。
+  // 只挂在 candle_pane 的价格轴上 —— 成交量面板的量纲是万计，并入价位会把量柱压平。
+  // 入参类型用库导出的 `AxisCreateRangeParams`：回调必须**原样返回 AxisRange**
+  // （`expandRangeToLevels` 是泛型，靠这里的 `defaultRange` 推断出完整类型）。
+  function priceLineRange({ defaultRange }: AxisCreateRangeParams) {
+    if (!(activePosition.value || activeOrder.value || simMode.value)) return defaultRange
+    const levels = [
+      effectiveEntry.value,
+      effectiveSL.value,
+      ...effectiveTPLevels.value.map((l: { price: number }) => l.price),
+    ]
+    return expandRangeToLevels(defaultRange, levels)
+  }
+  for (const yAxis of klineChart.getYAxes({ paneId: 'candle_pane' })) {
+    yAxis.override({ createRange: priceLineRange })
+  }
+
   // 默认 K 线根数设为之前的 3/4 (单根蜡烛宽度调整为 4/3，蜡烛更清晰平滑)
   klineChart.setBarSpace(10 * (4 / 3))
 
@@ -614,26 +665,24 @@ function updatePriceLines() {
     klineChart.removeOverlay({ id: slOverlayId })
     slOverlayId = null
   }
-  if (tpOverlayId) {
-    klineChart.removeOverlay({ id: tpOverlayId })
-    tpOverlayId = null
+  for (const id of tpOverlayIds) {
+    klineChart.removeOverlay({ id })
   }
+  tpOverlayIds = []
 
   // 2. 只有在有实盘持仓、或者有挂单、或者在试算模式下，才绘制价格线！
   const entryPx = effectiveEntry.value
   const slPx = effectiveSL.value
-  const tpPx = effectiveTP.value
   const hasPosOrOrder = activePosition.value || activeOrder.value || simMode.value
 
   // 阶段 3·F4：建线描述符抽到 chartOverlays.ts（纯函数）；此处只负责"怎么画"。
   const plan = planPriceLines({
     entryPx,
     slPx,
-    tpPx,
+    tpLevels: effectiveTPLevels.value,
     hasPosOrOrder: !!hasPosOrOrder,
     isLong: liveSide.value === 'long',
     riskPct: riskRewardMetrics.value.riskPct,
-    rewardPct: riskRewardMetrics.value.rewardPct,
     textColor: tok('--ink-1'),
     isEn: isEn.value,
     isLockProfit: riskRewardMetrics.value.isLockProfit,
@@ -650,9 +699,10 @@ function updatePriceLines() {
     slOverlayId = typeof slRes === 'string' ? slRes : null
   }
 
-  if (plan.tp) {
-    const tpRes = klineChart.createOverlay(plan.tp)
-    tpOverlayId = typeof tpRes === 'string' ? tpRes : null
+  // 分批止盈：每档一条独立价格线（TP1 / TP2）。
+  for (const tp of plan.tps) {
+    const tpRes = klineChart.createOverlay(tp)
+    if (typeof tpRes === 'string') tpOverlayIds.push(tpRes)
   }
 }
 
@@ -730,10 +780,10 @@ function selectSymbol(s: string) {
   // 1. 立即清除旧币种的价格线
   if (entryOverlayId) klineChart?.removeOverlay({ id: entryOverlayId })
   if (slOverlayId) klineChart?.removeOverlay({ id: slOverlayId })
-  if (tpOverlayId) klineChart?.removeOverlay({ id: tpOverlayId })
+  for (const id of tpOverlayIds) klineChart?.removeOverlay({ id })
   entryOverlayId = null
   slOverlayId = null
-  tpOverlayId = null
+  tpOverlayIds = []
 
   // 2. 清空旧数据防止坐标轴跨度被拉扯
   klineChart?.resetData()
@@ -915,8 +965,10 @@ onUnmounted(() => {
         <span class="num font-mono text-sm font-bold" style="color: var(--ink-strong)">
           {{ currentPrice >= 100 ? currentPrice.toFixed(1) : currentPrice.toFixed(4) }}
         </span>
-        <span class="num font-mono text-xs font-semibold" :class="liveChangePct >= 0 ? 'up' : 'down'">
-          {{ liveChangePct >= 0 ? '+' : '' }}{{ liveChangePct.toFixed(2) }}%
+        <span class="num font-mono text-xs font-semibold"
+              :class="liveChangePct === null ? '' : (liveChangePct >= 0 ? 'up' : 'down')">
+          <template v-if="liveChangePct === null">--</template>
+          <template v-else>{{ liveChangePct >= 0 ? '+' : '' }}{{ liveChangePct.toFixed(2) }}%</template>
         </span>
         <span class="dsh-pill hidden md:inline-flex">
           <span class="dsh-status-dot active" aria-hidden="true" />{{ t('dash.matrix.chart.live') }}

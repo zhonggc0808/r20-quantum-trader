@@ -8,7 +8,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from r20_backend.exchanges import (
+from astra_backend.exchanges import (
     BinanceAdapter,
     ExchangeCapabilityError,
     GateAdapter,
@@ -23,12 +23,12 @@ _AMBIENT: dict = {}
 
 def setUpModule():
     """封闭三律：排除宿主 .env 注入的 ambient 执行旗标——
-    R20_BINANCE/GATE_EXECUTION=1 会把 fail-closed 契约用例带偏（US-005 后
+    ASTRA_BINANCE/GATE_EXECUTION=1 会把 fail-closed 契约用例带偏（US-005 后
     binance 旗标已进 .env，整文件并跑时曾炸出顺序红）。旗标只由用例自设。"""
     import os
     global _AMBIENT
     _AMBIENT = {k: os.environ.pop(k, None) for k in list(os.environ)
-                if k.startswith("R20_") and ("EXECUTION" in k or "TESTNET" in k)}
+                if k.startswith("ASTRA_") and ("EXECUTION" in k or "TESTNET" in k)}
 
 
 def tearDownModule():
@@ -75,14 +75,21 @@ class TestQuantitySemantics(unittest.TestCase):
         qty = bn.quote_qty_to_native(450.0, 79650.0, spec)
         self.assertAlmostEqual(qty, 0.005, places=10)
 
-    def test_gate_contracts_round(self):
+    def test_gate_contracts_floor(self):
+        """契约变更（2026-09-20，第一百五十三刀，**用户拍板**）：张数向下取整。
+
+        原用例名 `test_gate_contracts_round`、断言 `assertIn(qty, (56.0, 57.0))`
+        （容忍四舍五入的两种结果）。改为 floor 的理由：四舍五入最坏**向上多买半张**，
+        每张 300U、目标 450U 时是 **+33%**，直接顶破按笔保证金上限；而**实盘路径**
+        `execution.sizing.quantize_size` 早已是 floor ⇒ 本函数原是不一致的那一侧。
+        """
         gt = GateAdapter()
         spec = InstrumentSpec(venue="gate", inst_id="BTC_USDT", base="BTC",
                               tick_size=0.1, step_size=0.0001, ct_val=0.0001,
                               min_size=1)
-        # 450U @79650，每张名义 7.965U → 56.5 张 → round → 56 or 57
+        # 450U @79650，每张名义 7.965U → 56.5 张 → floor → 56
         qty = gt.quote_qty_to_native(450.0, 79650.0, spec)
-        self.assertIn(qty, (56.0, 57.0))
+        self.assertEqual(qty, 56.0)
         self.assertEqual(qty % 1, 0)
 
     def test_below_minimum_rejected(self):
@@ -123,7 +130,7 @@ class TestFailClosedPrivateFacets(unittest.TestCase):
     def test_orders_rejected_on_readonly_adapters(self):
         # US-005 后只读私有面的仅剩 OKX 适配器（执行居遗留直签链）；
         # Binance/Gate 私有面已实装——契约改由「无凭证 fail-closed」用例守护
-        from r20_backend.exchanges import OKXPublicAdapter
+        from astra_backend.exchanges import OKXPublicAdapter
         okx = OKXPublicAdapter()
         for call in (lambda: okx.place_order("BTC", "buy", 1),
                      lambda: okx.attach_protective_orders("BTC", "long"),
@@ -137,7 +144,7 @@ class TestFailClosedPrivateFacets(unittest.TestCase):
         # 与 Gate 同款契约：实装 ≠ 放行——无凭证一律显式拒绝，绝不静默出网
         # 注：place_order 先 fetch_instrument_spec（出网）再 signed_request 查凭证，
         # 故 mock 掉规格拉取（None 走代码内 step/tick 兜底），让用例直达凭证闸
-        import r20_gateway.secrets as gw_secrets
+        import astra_gateway.secrets as gw_secrets
         with patch.object(gw_secrets, "load_secrets", lambda: {}):
             bn = BinanceAdapter()
             bn.fetch_instrument_spec = Mock(return_value=None)
@@ -148,7 +155,7 @@ class TestFailClosedPrivateFacets(unittest.TestCase):
 
     def test_gate_private_requires_credentials_fail_closed(self):
         # Gate 私有面已实装但仍 fail-closed：无凭证 → 显式拒绝，绝不静默
-        import r20_gateway.secrets as gw_secrets
+        import astra_gateway.secrets as gw_secrets
         with patch.object(gw_secrets, "load_secrets", lambda: {}):
             gt = GateAdapter()
             with self.assertRaises(ExchangeCapabilityError):
@@ -161,10 +168,10 @@ class TestFailClosedPrivateFacets(unittest.TestCase):
         # US-005 后 binance/gate 均声明开闸路径，拒绝文案必须指路各自的闸
         with self.assertRaises(ExchangeCapabilityError) as cm:
             registry.require_execution("binance")
-        self.assertIn("R20_BINANCE_EXECUTION", str(cm.exception))
+        self.assertIn("ASTRA_BINANCE_EXECUTION", str(cm.exception))
         with self.assertRaises(ExchangeCapabilityError) as cm2:
             registry.require_execution("gate")
-        self.assertIn("R20_GATE_EXECUTION", str(cm2.exception))
+        self.assertIn("ASTRA_GATE_EXECUTION", str(cm2.exception))
         with self.assertRaises(ExchangeCapabilityError):
             registry.require_execution("okx")   # OKX 执行在遗留链路，适配器路由结构性恒关
         with self.assertRaises(ExchangeCapabilityError):
@@ -302,5 +309,52 @@ class TestReadOnlyMarketData(unittest.TestCase):
         self.assertEqual(item["venue"], "gate")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class ContractsRoundingBoundTest(unittest.TestCase):
+    """张数换算的**方向与界**（第一百五十三刀：按用户拍板改为**向下取整**）。
+
+    历史：此处原先四舍五入（`int(round(...))`），最坏向上多买半张，而注释写"含精度截断"
+    —— 说法与实现不一致，且方向与**实盘路径**的 `execution.sizing.quantize_size`（floor）
+    相反。用户拍板统一为 floor 后，本门钉两件事：①**两条分支都永不超出目标**；
+    ②向下取整的代价（可能落到最小张数以下而被拒）也如实钉住。
+    """
+
+    @staticmethod
+    def _gate(ct_val):
+        from astra_backend.exchanges.gate import GateAdapter
+        from astra_backend.exchanges.base import InstrumentSpec
+        return GateAdapter(), InstrumentSpec(venue="gate", inst_id="X_USDT", base="X",
+                                            tick_size=0.01, step_size=0.0001,
+                                            ct_val=ct_val, min_size=1)
+
+    def test_contracts_never_exceed_the_target_notional(self):
+        for per_contract in (7.965, 50.0, 300.0, 1234.5):
+            notional = per_contract * 3.5      # 3.5 张 ⇒ floor 到 3 张
+            ad, spec = self._gate(per_contract / 100.0)   # price=100 ⇒ 每张 = 100*ct_val
+            qty = ad.quote_qty_to_native(notional, 100.0, spec)
+            with self.subTest(per_contract=per_contract):
+                self.assertEqual(qty, 3.0, "3.5 张必须 floor 到 3 张（不超买）")
+                self.assertLessEqual(qty * per_contract, notional + 1e-9,
+                                     "换算名义超出了目标（取整方向被改回四舍五入？）")
+
+    def test_large_face_value_instrument_undershoots_instead_of_overshooting(self):
+        """把幅度钉死：每张 300U、目标 450U ⇒ 1.5 张 ⇒ **1 张 = 300U（−33%，绝不超买）**。"""
+        ad, spec = self._gate(3.0)             # price=100 ⇒ 每张 300U
+        qty = ad.quote_qty_to_native(450.0, 100.0, spec)
+        self.assertEqual(qty, 1.0, "四舍五入会给出 2 张（600U，+33%）——这正是被拍板改掉的")
+        self.assertLessEqual(qty * 300.0, 450.0)
+
+    def test_exact_division_is_not_lost_to_float_noise(self):
+        """浮点噪声护栏：600/300 可能算成 1.9999999，`+1e-9` 必须保住 2 张。"""
+        ad, spec = self._gate(3.0)
+        self.assertEqual(ad.quote_qty_to_native(600.0, 100.0, spec), 2.0)
+
+    def test_base_asset_branch_never_exceeds_target(self):
+        """对照：币数分支同样向下截断（两条分支方向**一致**，都是一律不超买）。"""
+        from astra_backend.exchanges.binance import BinanceAdapter
+        from astra_backend.exchanges.base import InstrumentSpec
+        ad = BinanceAdapter()
+        spec = InstrumentSpec(venue="binance", inst_id="XUSDT", base="X",
+                              tick_size=0.01, step_size=1.0, ct_val=1.0, min_size=0.5)
+        qty = ad.quote_qty_to_native(450.0, 100.0, spec)   # 4.5 → 截断 4.0
+        self.assertEqual(qty, 4.0)
+        self.assertLessEqual(qty * 100.0, 450.0 + 1e-9)

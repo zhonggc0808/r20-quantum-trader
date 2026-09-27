@@ -30,6 +30,27 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def submitted_bracket(venue_ctx: Any, px: float, tp_px: float,
+                      sl_px: float) -> Tuple[float, float, float]:
+    """取**实际提交**给交易所的三价，用于通知（2026-09 缺陷四）。
+
+    为什么需要：市价档下 `submit_protected_limit_order` 会先把三价按现价重锚再发单，
+    而调用点手里的 `limit_px/tp_px/sl_px` 仍是**计划值**。通知若用计划值，
+    告诉用户的就是一张**并不存在**的保护网 —— 计划是回踩挂单时（多单计划 100000
+    而现价 110000），通知说"止损 95000"，真实成交价却是 110000、实收止损 104500，
+    看通知会误以为止损已被击穿。
+
+    取值口径：下单函数把实提三价回写进 `venue_ctx`（它本来就是本路径的可变上下文）。
+    字段缺失（限价档、或旧调用方未回写）时**逐位退回原值**，行为与改动前一致 ——
+    故本函数对既有调用方是**零行为变更**的。
+    """
+    if isinstance(venue_ctx, dict):
+        return (venue_ctx.get("submitted_px", px),
+                venue_ctx.get("submitted_tp", tp_px),
+                venue_ctx.get("submitted_sl", sl_px))
+    return px, tp_px, sl_px
+
+
 def execute_entry_scan(*,
         all_factors,
         brain_cache,
@@ -184,7 +205,17 @@ def execute_entry_scan(*,
                 pos_avg_px = float(curr_pos.get("avgPx", 0.0) or 0.0)
                 curr_margin = float(curr_pos.get("margin", 0.0) or 0.0)
                 tracker = trackers.get(f"{inst_id}_long", {})
-                scale_count = int(tracker.get("scale_count", 0))
+                # ⚠️ 第一百三十八刀（用户拍板 fail-closed）：**追踪器拿不到该仓 ⇒ 视同已达上限**。
+                # 读失败时 `load_trackers()` 返回标记型空字典 ⇒ 此处必然命中。
+                # 为什么必须这样：`pyramiding_gate` 的「每仓最多加仓 N 次」判据是
+                # `scale_count < max`，缺省 0 会让上限**静默失效**（可反复加仓、过度集中）。
+                # ⚠️ 诚实说明：下一条 gate 文案会显示"已达最大加仓次数 (N/N)" ——
+                # 那是**保守假设**（真实情况是"未知"），本行先把这层说清楚。
+                if not tracker:
+                    print(f"[Pyramiding] {f['name']} 追踪器缺失 ⇒ 无法核验已加仓次数，"
+                          "按 fail-closed 视同已达上限（宁可不加，不可无限加）")
+                scale_count = (int(tracker.get("scale_count", 0)) if tracker
+                               else MAX_SCALE_IN_COUNT)
                 trailing_sl = float(tracker.get("trailingStopPx", 0.0) or 0.0)
 
                 # Ironclad Pyramiding Rules:
@@ -239,6 +270,10 @@ def execute_entry_scan(*,
                     inst_id, _side, _pos_side, actual_sz, limit_px, tp_px, sl_px,
                     venue_ctx=_venue_ctx)
                 if accepted:
+                    # 通知必须说**实提交值**：市价档下三价已被按现价重锚（见
+                    # `submitted_bracket` 的 docstring）；限价档逐位不变。
+                    limit_px, tp_px, sl_px = submitted_bracket(
+                        _venue_ctx, limit_px, tp_px, sl_px)
                     if is_scale_in:
                         tracker = trackers.get(f"{inst_id}_long", {})
                         tracker["scale_count"] = tracker.get("scale_count", 0) + 1
@@ -292,7 +327,17 @@ def execute_entry_scan(*,
                 pos_avg_px = float(curr_pos.get("avgPx", 0.0) or 0.0)
                 curr_margin = float(curr_pos.get("margin", 0.0) or 0.0)
                 tracker = trackers.get(f"{inst_id}_short", {})
-                scale_count = int(tracker.get("scale_count", 0))
+                # ⚠️ 第一百三十八刀（用户拍板 fail-closed）：**追踪器拿不到该仓 ⇒ 视同已达上限**。
+                # 读失败时 `load_trackers()` 返回标记型空字典 ⇒ 此处必然命中。
+                # 为什么必须这样：`pyramiding_gate` 的「每仓最多加仓 N 次」判据是
+                # `scale_count < max`，缺省 0 会让上限**静默失效**（可反复加仓、过度集中）。
+                # ⚠️ 诚实说明：下一条 gate 文案会显示"已达最大加仓次数 (N/N)" ——
+                # 那是**保守假设**（真实情况是"未知"），本行先把这层说清楚。
+                if not tracker:
+                    print(f"[Pyramiding] {f['name']} 追踪器缺失 ⇒ 无法核验已加仓次数，"
+                          "按 fail-closed 视同已达上限（宁可不加，不可无限加）")
+                scale_count = (int(tracker.get("scale_count", 0)) if tracker
+                               else MAX_SCALE_IN_COUNT)
                 trailing_sl = float(tracker.get("trailingStopPx", 0.0) or 0.0)
 
                 c_dyn = f.get("calculus", {})
@@ -339,6 +384,10 @@ def execute_entry_scan(*,
                     inst_id, _side, _pos_side, actual_sz, limit_px, tp_px, sl_px,
                     venue_ctx=_venue_ctx)
                 if accepted:
+                    # 通知必须说**实提交值**：市价档下三价已被按现价重锚（见
+                    # `submitted_bracket` 的 docstring）；限价档逐位不变。
+                    limit_px, tp_px, sl_px = submitted_bracket(
+                        _venue_ctx, limit_px, tp_px, sl_px)
                     if is_scale_in:
                         tracker = trackers.get(f"{inst_id}_short", {})
                         tracker["scale_count"] = tracker.get("scale_count", 0) + 1

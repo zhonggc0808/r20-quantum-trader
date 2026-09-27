@@ -12,7 +12,7 @@ import scripts.ai_brain_trader as abt
 
 class ShadowOutcomeWindowTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="r20-jev-outcome-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="astra-jev-outcome-")
         self.addCleanup(self.tmp.cleanup)
         self.patch_dir = patch.object(abt, "DATA_DIR", self.tmp.name)
         self.patch_dir.start()

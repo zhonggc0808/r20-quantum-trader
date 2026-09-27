@@ -35,7 +35,6 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from scripts.trader.order_lease import (
-    AI_KEEP_LEASE_MS,
     load_leases,
     prune_leases,
     remove_lease,
@@ -103,18 +102,16 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
     def _may_retain(order_id: str, inst_id: str, age_ms: int, partial_since: int,
                     partial: bool, attributed: bool, now_ts: int) -> bool:
         """Return whether the order is still inside an explicit bounded window."""
+        if attributed:
+            return True
         if age_ms >= MAX_ORDER_AGE_MS:
             return False
         if partial and now_ts - partial_since >= PARTIAL_REMAINDER_MAX_AGE_MS:
             return False
-        if not attributed:
-            return age_ms <= ORPHAN_GRACE_MS
         if _lease_active(order_id, inst_id, now_ts):
             active_lease_ids.add(order_id)
             return True
-        # A newly attributed order gets one review window; it must then receive
-        # an explicit KEEP lease from the brain rather than living on intent TTL.
-        return age_ms <= AI_KEEP_LEASE_MS
+        return age_ms <= ORPHAN_GRACE_MS
 
     def _cancel_okx(inst_id: str, order_id: str, reason: str) -> Tuple[bool, str]:
         try:
@@ -148,7 +145,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
         if _may_retain(order_id, inst_id, age_ms, partial_since, partial,
                        order_id in keep_ord_ids, now_ts):
             continue
-        ok, error = _cancel_okx(inst_id, order_id, "超时")
+        ok, error = _cancel_okx(inst_id, order_id, "stale")
         if not ok:
             return False, error
         print(f"[挂单生命周期管理] 自动撤销挂单: {inst_id} (ordId={order_id}, state={state}, "
@@ -159,11 +156,17 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
     except Exception:
         _env_mode = ""
     # 外所接管判定用活意图集（与 OKX 对账同一把尺：新鲜意图归属 → 保留）
+    # ⚠️ 第一百三十四刀：**读不到意图 ⇒ 不撤任何单 + fail-closed**。
+    # 旧写法 `except Exception: _live_intents = []` 把"文件坏了"当成"没有意图"
+    # ⇒ 每笔挂单都失去归属 ⇒ 按孤儿/陈旧**撤销**（撤旧挂新循环的另一种成因），
+    # 而调用方还会照常开新仓。撤单不可逆 ⇒ 未知必须保留。
     try:
         _live_intents = [i for i in load_open_intents()
                          if isinstance(i, dict) and now_ts - int(i.get("ts", 0) or 0) <= OPEN_INTENT_TTL_MS]
-    except Exception:
-        _live_intents = []
+    except Exception as _intents_exc:
+        print(f"[挂单生命周期] CRITICAL 本地意图不可读（{_intents_exc}）——本轮**不撤任何**"
+              "外所挂单，并 fail-closed 禁止本周期新增下单（读不到 ≠ 没有意图）")
+        return False, "本地意图不可读（不撤单，fail-closed）"
 
     def _intent_covers(venue_base: str, dir_word: str) -> bool:
         _tgt = f"{venue_base}-USDT-SWAP"
@@ -199,7 +202,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                 # 发不出去）→ 跳过回收不拦轮（审计#4教训：拿凭证错误拦全链=交易停摆）。
                 _BROKEN_VENUES.add(_v)   # 本轮路由同步摘除其执行资格（见 venue_execution_ready）
                 print(f"[挂单生命周期] CRITICAL {_v.upper()} 凭证无效但执行闸开启——本所生命周期"
-                      f"管理跳过；请修复密钥或关闭 R20_{_v.upper()}_EXECUTION")
+                      f"管理跳过；请修复密钥或关闭 ASTRA_{_v.upper()}_EXECUTION")
                 continue
             # 其余不可核验（网络/未知）：与 OKX 同尺 fail-closed 拦本轮
             return False, f"{_v} 挂单回收不可用: {type(exc).__name__}: {_msg[:120]}"
@@ -248,6 +251,8 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
                     dupes.append(best[key])
                 best[key] = entry
         for created_ms, order_id, inst_disp in dupes:
+            if order_id in keep_ord_ids:
+                continue
             if now_ts - created_ms <= ORPHAN_GRACE_MS:
                 continue  # 宽限期内不动手
             _b0 = inst_disp.replace("_USDT", "").replace("USDT", "").split("-")[0].upper()
@@ -260,7 +265,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None,
             age_ms = now_ts - created_ms
             active_lease_ids.add(order_id)
             raw_order = next((x for x in _rows
-                              if str(x.get("order_id") or x.get("id") or
+                              if isinstance(x, dict) and str(x.get("order_id") or x.get("id") or
                                      (x.get("raw") or {}).get("id") or "") == order_id), {})
             raw = raw_order.get("raw") if isinstance(raw_order.get("raw"), dict) else {}
             state = str(raw.get("status") or raw.get("state") or "live").lower()
@@ -335,7 +340,13 @@ def reconcile_pending_orders(trackers: Dict[str, Any] = None, now_ms: int = None
         return False, set()
     if trackers is None:
         trackers = load_trackers()
-    intents = load_open_intents()
+    # ⚠️ 第一百三十四刀：读不到意图 ⇒ **fail-closed 且不撤任何单**（理由同上）。
+    try:
+        intents = load_open_intents()
+    except Exception as _intents_exc:
+        print(f"[挂单对账] CRITICAL 本地意图不可读（{_intents_exc}）→ fail-closed：本周期"
+              "禁止新增下单，且**不撤销任何挂单**（读不到 ≠ 没有意图）")
+        return False, set()
     kept: set = set()
 
     def _cancel_orphan(reason: str) -> bool:

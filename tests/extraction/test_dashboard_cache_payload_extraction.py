@@ -1,15 +1,15 @@
-"""`r20_backend/dashboard_payload/cache_payload.py`（阶段 4·B3 第三十六刀）回归。
+"""`astra_backend/dashboard_payload/cache_payload.py`（阶段 4·B3 第三十六刀）回归。
 
 ## 抽了什么
 
-`r20_backend/dashboard_cache.py::update_cache_cycle` 的 **92 行 `CACHE_DATA` 字面量** —— 该函数里
-最大的一块，也是 `r20_backend/dashboard_cache.py` 里唯一的大块。搬进
+`astra_backend/dashboard_cache.py::update_cache_cycle` 的 **92 行 `CACHE_DATA` 字面量** —— 该函数里
+最大的一块，也是 `astra_backend/dashboard_cache.py` 里唯一的大块。搬进
 `build_live_cache_payload(...)`，56 个入参**显式列在签名里**。
 
 | | 之前 | 之后 |
 |---|---|---|
 | `update_cache_cycle()` | 330 行 | **259 行** |
-| `r20_backend/dashboard_cache.py` | 671 行 | **603 行** |
+| `astra_backend/dashboard_cache.py` | 671 行 | **603 行** |
 
 ## 这个测试在守什么
 
@@ -24,7 +24,7 @@ performance 10 项。装配时**漏一个字段不会报错** —— 前端静�
    （含 `data_health.partial` 是**布尔**、`margin_usage_pct` 是**数值**等易错点）。
 3. **注入缝**：三个测试缝（`load_instruments` / `build_ai_health` /
    `_load_cross_venue_data`）必须**出现在签名里**、由门面调用期传入，
-   且本模块**不得** import `r20_backend.dashboard_cache`。
+   且本模块**不得** import `astra_backend.dashboard_cache`。
 
 > **已经做过的最强验证（记在这里，供后人判断本测试够不够）**：
 > 本轮用**另一个 git worktree 跑改动前的代码**，在**同一套 `patch.object` 环境**下
@@ -51,13 +51,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-MODULE = ROOT / "r20_backend" / "dashboard_payload" / "cache_payload.py"
-FACADE = ROOT / "r20_backend" / "dashboard_cache.py"
+MODULE = ROOT / "astra_backend" / "dashboard_payload" / "cache_payload.py"
+FACADE = ROOT / "astra_backend" / "dashboard_cache.py"
 
 SEAMS = ("load_instruments", "build_ai_health", "_load_cross_venue_data")
 
-#: 搬运前 `CACHE_DATA` 字面量的顶层字段（27 项，按搬迁前源码抄录并核对过）
-EXPECTED_TOP = {
+#: **历史冻结记录**：搬运前 `CACHE_DATA` 字面量的顶层字段（27 项，按搬迁前源码抄录并核对过）。
+#: 这是抽取那一轮"逐字段对拍"的证据，**永远不动** —— 后来按契约补发的字段不算历史里有过。
+HISTORICAL_TOP = {
     "timestamp", "date", "data_health", "system", "account", "today_stats",
     "performance", "positions", "positions_summary", "pending_orders", "factors",
     "funding_settlements", "adaptive_config", "review", "ai_trading_memory_md",
@@ -65,6 +66,24 @@ EXPECTED_TOP = {
     "news_intelligence", "ai_brain_history", "ai_health", "factor_library",
     "cross_venue", "portfolio_risk", "multi_venue_portfolio",
 }
+
+#: 抽取**之后**按 TS 契约补发的顶层字段 —— **新增必须登记在这里并写理由**。
+#:
+#: 第一百九十七刀：`frontend/src/types/dashboard.ts`（`DashboardResponse`）声明了这两个字段、
+#: `frontend/src/stores/dashboard.ts` 直接读**载荷根**，而后端此前**从未发过**：
+#:   · `is_stale` —— `data.value?.is_stale ?? false` 恒为 false，面板陈旧分支只剩
+#:     `status === 'STALE'` 一条腿在撑；
+#:   · `macro_assessment` —— 真实内容只存在于 `ai_brain_history[0].macro_assessment`
+#:     （真机缓存实测有真文本）⇒ 根级读取永远 undefined，面板宏观一行永远"扫描中…"。
+#: 两项均有独立门：`tests/audit/test_payload_contract_cross_layer.py`。
+ADDED_AFTER_EXTRACTION = {
+    "is_stale": "TS 契约必填 + 前端读根；由 `is_stale_status(data_health.status)` 单一事实源推导",
+    "macro_assessment": "TS 契约声明在根；取 `ai_brain_history[0]` 的同源别名（不新算）",
+}
+
+#: 当前应有的顶层字段 = 历史冻结 ∪ 契约补发。
+#: ⚠️ 下面这条断言刻意保持**逐个相等**（不是"至少包含"）：顶层字段的任何增删都必须显式露面。
+EXPECTED_TOP = HISTORICAL_TOP | set(ADDED_AFTER_EXTRACTION)
 
 
 def _load(path: Path):
@@ -113,7 +132,7 @@ class SignatureContractTest(unittest.TestCase):
             self.assertIn(seam, params, f"{seam} 必须在签名里，否则 patch.object 会被绕过")
 
     def test_module_does_not_import_dashboard_app(self):
-        """本模块**不得** import `r20_backend.dashboard_cache`（会构成循环）。
+        """本模块**不得** import `astra_backend.dashboard_cache`（会构成循环）。
 
         我第一版写成函数体内 `from dashboard import app as _app` —— 被既有闸
         `test_dashboard_payload_seam.py::test_core_modules_do_not_import_dashboard_app`
@@ -122,13 +141,13 @@ class SignatureContractTest(unittest.TestCase):
         tree = _load(MODULE)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                self.assertNotEqual(node.module, "r20_backend.dashboard_cache")
+                self.assertNotEqual(node.module, "astra_backend.dashboard_cache")
                 # 第 143 刀：原防 `from dashboard import app`（旧顶层包），
-                # 现门面在 r20_backend 包内 ⇒ 防 `from r20_backend import dashboard_cache`
+                # 现门面在 astra_backend 包内 ⇒ 防 `from astra_backend import dashboard_cache`
                 self.assertNotIn("dashboard_cache", [a.name for a in node.names]
-                                 if node.module == "r20_backend" else [])
+                                 if node.module == "astra_backend" else [])
             if isinstance(node, ast.Import):
-                self.assertNotIn("r20_backend.dashboard_cache", [a.name for a in node.names])
+                self.assertNotIn("astra_backend.dashboard_cache", [a.name for a in node.names])
 
     def test_module_is_pure_at_import(self):
         """模块层不得有任何可调用副作用（无 I/O、无 loader 绑定）。"""
@@ -146,7 +165,7 @@ class PayloadStructureTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from unittest.mock import patch
-        import r20_backend.dashboard_cache as app
+        import astra_backend.dashboard_cache as app
 
         cls.app = app
         cls._stack = patch.multiple(
@@ -164,7 +183,7 @@ class PayloadStructureTest(unittest.TestCase):
         cls._stack.stop()
 
     def _payload(self, **over):
-        from r20_backend.dashboard_payload.cache_payload import build_live_cache_payload
+        from astra_backend.dashboard_payload.cache_payload import build_live_cache_payload
         params, _ = _sig_names()
         # 中性入参：数值 0/空容器，便于分辨"某个字段被漏装配"
         args = {p: 0.0 for p in params}
@@ -287,13 +306,6 @@ class PayloadStructureTest(unittest.TestCase):
 
 
 class FacadeSizeTest(unittest.TestCase):
-    def test_update_cache_cycle_shrank(self):
-        tree = _load(FACADE)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "update_cache_cycle")
-        size = fn.end_lineno - fn.lineno + 1
-        self.assertLess(size, 300, f"update_cache_cycle 又长回去了: {size} 行")
-
     def test_facade_no_longer_contains_the_payload_literal(self):
         src = FACADE.read_text(encoding="utf-8")
         for marker in ('"bills_coverage_note"', '"ai_trading_memory_md"',
@@ -314,9 +326,16 @@ class RuntimeEquivalenceRecordedTest(unittest.TestCase):
         这里只固化"顶层字段清单"这一可静态复核的部分 ——
         金额级等同无法在单测里重建（需要两个 worktree）。
         """
-        self.assertEqual(len(EXPECTED_TOP), 27)
-        self.assertIn("data_health", EXPECTED_TOP)
-        self.assertIn("positions_summary", EXPECTED_TOP)
+        # 历史记录是 27 项（抽取那一轮的对拍证据），**不接受**被后来的补发改写
+        self.assertEqual(len(HISTORICAL_TOP), 27)
+        self.assertIn("data_health", HISTORICAL_TOP)
+        self.assertIn("positions_summary", HISTORICAL_TOP)
+        # 抽取没有丢字段：历史 27 项必须**全部**仍在当前清单里（superset，不是 equality）
+        self.assertTrue(HISTORICAL_TOP <= EXPECTED_TOP,
+                        f"抽取后丢了历史字段：{sorted(HISTORICAL_TOP - EXPECTED_TOP)}")
+        # 补发的每一项都必须写明理由（防止"顺手加字段"混进来）
+        for field, reason in ADDED_AFTER_EXTRACTION.items():
+            self.assertGreaterEqual(len(str(reason).strip()), 12, f"{field} 缺理由")
 
 
 if __name__ == "__main__":

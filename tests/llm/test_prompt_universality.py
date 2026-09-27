@@ -20,9 +20,26 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from tests.risk_test_env import pin_baseline_risk_env  # noqa: E402
 
 
+_READ_SCOPE = None
+
+
 def setUpModule():
+    """第二百三十六刀：本文件断言**线上**方案快照/池措辞的健康度（如"不含绝对金额"、
+    "池规模措辞未硬编码"）—— **有意的线上守卫**。只读、不改；显式声明，把
+    「依赖线上配置内容」从静默变成可审计（未声明时严格模式会报错）。同时锁 risk 基线。"""
+    global _READ_SCOPE
+    from tests import allow_real_data_reads
+    _READ_SCOPE = allow_real_data_reads()
+    _READ_SCOPE.__enter__()
     # risk_budget 渲染断言锁定基线（5% 日亏/2% 单笔）；隔离生产 .env 当前套件值
     pin_baseline_risk_env()
+
+
+def tearDownModule():
+    global _READ_SCOPE
+    if _READ_SCOPE is not None:
+        _READ_SCOPE.__exit__(None, None, None)
+        _READ_SCOPE = None
 
 # 绝对法币金额：数字或区间 + U/USDT
 _ABS_MONEY = re.compile(r"(?<![\d.%])\d{2,5}(?:\.\d+)?\s*(?:~|～|至|-)\s*\d{2,5}(?:\.\d+)?\s*(?:USDT|U)\b|(?<![\d.])\d{3,5}\s*(?:USDT|U)\b")
@@ -132,10 +149,10 @@ class AdaptiveRiskLimitTests(unittest.TestCase):
 
     def test_limits_are_env_overridable(self):
         import os, importlib
-        import r20_backend.config as backend_config
+        import astra_backend.config as backend_config
         import risk_constants
         import ai_factor_trader as aft
-        os.environ["R20_MAX_DAILY_LOSS_USDT"] = "99"
+        os.environ["ASTRA_MAX_DAILY_LOSS_USDT"] = "99"
         original_loader = backend_config.load_dotenv
         backend_config.load_dotenv = lambda path: None  # 屏蔽仓库 .env 覆盖测试环境变量
         try:
@@ -144,7 +161,7 @@ class AdaptiveRiskLimitTests(unittest.TestCase):
             self.assertEqual(aft.MAX_DAILY_LOSS_USDT, 99.0)
         finally:
             backend_config.load_dotenv = original_loader
-            del os.environ["R20_MAX_DAILY_LOSS_USDT"]
+            del os.environ["ASTRA_MAX_DAILY_LOSS_USDT"]
             importlib.reload(risk_constants)
             importlib.reload(aft)
 

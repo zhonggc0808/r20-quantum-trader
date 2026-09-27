@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-R20 High-Alpha Quantitative Factor Library Engine (factor_library.py)
+ASTRA High-Alpha Quantitative Factor Library Engine (factor_library.py)
 Calculates and normalizes 5 core factor pillars for crypto perpetuals:
 1. Momentum & Trend (ADX, RSI, EMA slope, KDJ)
 2. Volatility & Channel (ATR%, Bollinger Bandwidth)
@@ -12,6 +12,8 @@ Calculates and normalizes 5 core factor pillars for crypto perpetuals:
 import os
 import sys
 from pathlib import Path
+
+from astra_backend.math_utils import safe_float as _shared_safe_float
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parent
@@ -35,11 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 _BJ = timezone(timedelta(hours=8))
 
 WORKSPACE_DIR = str(_PROJECT_ROOT)
-#: ⚠️ `R20_DATA_DIR` 是**测试沙箱专用环境变量**（由 tests/config_sandbox.isolate_config
+#: ⚠️ `ASTRA_DATA_DIR` 是**测试沙箱专用环境变量**（由 tests/config_sandbox.isolate_config
 #: 设置、由 `run_script` 拉起的子进程继承）：跑测试时把 data/ 写入重定向到沙箱，
 #: **生产从不设置该变量 → 取值与原先逐位相同**。修复"测试经子进程写生产文件"
 #: 的泄漏（§88/§91.6），不改任何业务行为。
-DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.environ.get("ASTRA_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
 FACTOR_LIB_CACHE_FILE = os.path.join(DATA_DIR, "factor_library_snapshot.json")
 
 from instrument_pool import load_instruments
@@ -48,11 +50,13 @@ from market_data_service import fetch_orderbook_depth, fetch_indicators_batch, f
 TARGET_INSTRUMENTS = load_instruments()
 
 def safe_float(val: Any, default: float = 0.0) -> float:
-    try:
-        f = float(val)
-        return f if f == f and abs(f) != float("inf") else default
-    except (TypeError, ValueError):
-        return default
+    """薄壳：转调单一事实源（`astra_backend.math_utils.safe_float`，第一百五十刀）。
+
+    本函数与 `scripts/ai_brain_trader.safe_float`、`scripts/calculus/regime._safe_float`
+    原为**三份**逐条等价的实现（按 14 组输入行为对拍一致），现收敛到一处：
+    `nan`/`±inf`/不可转 ⇒ `default`；`bool` 按 `float()` 语义（`True→1.0`）。
+    """
+    return _shared_safe_float(val, default)
 
 def _resolve_calculate_calculus():
     """按需（并缓存）解析微积分引擎。

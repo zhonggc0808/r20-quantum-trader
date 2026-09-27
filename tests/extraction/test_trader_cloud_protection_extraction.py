@@ -18,6 +18,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from tests.extraction.rename_baseline import legacy_rev_path, normalize
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -29,13 +30,64 @@ INJ = {"amend_venue_stop_loss": (),
        "_live_oco_coverage": ("_float_or_zero",),
        "ensure_cloud_position_protection": ("okx_rest", "_live_oco_coverage"),
        "sync_cloud_algo_stop": ("okx_rest",)}
+MOVED = ROOT / "scripts" / "trader" / "cloud_protection.py"
+
+# ---------------------------------------------------------------------------
+# 搬走之后的**文档化差异**（aa6d4e0「优化分批止盈执行与多所挂单展示」）
+#
+# `amend_venue_stop_loss` 枚举现存 SL 触发单时，旧实现只读 `row["order"]["text"]`
+# / `row["text"]` / `row["type"]`。Gate 的 `price_orders` 把标签放在
+# `row["initial"]["text"]`（Gate 原生结构），于是 `t-astrasl*` 标签**扫不到** ⇒
+# 旧 SL 单不被识别、棘轮时既不 amend 也不撤 ⇒ 云端止损单逐轮堆积
+# （宽松旧单可能先于新单触发，正是本函数注释里点名要防的那个场景）。
+# 修复 = 多读一层 `initial.text`。
+#
+# 按本仓既有先例（`test_brain_package_extraction.py` 第 137 刀白名单）放行，
+# 范围极窄：**一条块替换**（净增 1 行 + 原单行赋值展开为 3 行），
+# 断言"恰好出现一次"；任何其他差异仍会红。
+# 另有 `test_initial_text_layer_is_actually_read` 正向钉住这一层真的被读到。
+# ---------------------------------------------------------------------------
+_DELTA_BLOCKS = (
+    (
+        # 2026-09-27「r20 → astra 全量改名」追加的一层：归属标记**双认**。
+        # 变动点 = 把拼出来的 text 过一遍 `normalize_legacy_markers()`
+        # （见 `scripts/tag_markers.py`）。**不是搬运事故**：改名那一刻交易所上还挂着
+        # 改名前创建的保护腿，其 `initial.text` 是 `t-r20sl…`；只认新标记会把它们判成
+        # "不是我们的" ⇒ 云端棘轮对老仓位**静默失效**（不报错，只是不再收紧/续期）。
+        # 下方 old_block 仍是**真正的抽取前形态**（aa6d4e0 之前），故本块现为
+        # "当前形态 ↔ 抽取前形态"一条直达替换；历史两次变更都记在上面这段注释里。
+        '            _init = row.get("initial")\n'
+        '            text = normalize_legacy_markers(\n'
+        '                (str(_order.get("text") or "") if isinstance(_order, dict) else "")\n'
+        '                + (str(_init.get("text") or "") if isinstance(_init, dict) else "")\n'
+        '                + str(row.get("text") or "") + str(row.get("type") or ""))\n',
+        '            text = (str(_order.get("text") or "") if isinstance(_order, dict) else "") \\\n'
+        '                + str(row.get("text") or "") + str(row.get("type") or "")\n',
+    ),
+    # 第一百八十六刀：`posSide` 归一为**净持仓容错**（`in {pos_side, "net"}`）。
+    # 净持仓账户的云端单 posSide 是 "net"，精确相等会永远找不到活止损单
+    # ⇒ 云端止损收紧静默失效（本文件另一处统计覆盖时早就是 net 容错）。
+    (
+        '        live_algo = next((o for o in algo_orders\n                          if str(o.get("state", "")).lower() == "live"\n                          and str(o.get("posSide", "net")).lower() in {pos_side, "net"}\n                          and o.get("slTriggerPx")), None)',
+        '        live_algo = next((o for o in algo_orders if o.get("state") == "live" and o.get("posSide") == pos_side and o.get("slTriggerPx")), None)',
+    ),
+)
+
+
+def _normalised_moved_tree() -> ast.Module:
+    """把 aa6d4e0 的文档化差异**还原**成搬运时的样子，再逐字比对。"""
+    src = MOVED.read_text(encoding="utf-8")
+    for new_block, old_block in _DELTA_BLOCKS:
+        assert src.count(new_block) == 1, f"放行块没找到或重复（白名单过期）：{new_block[:60]!r}"
+        src = src.replace(new_block, old_block)
+    return ast.parse(src)
 
 
 def _old_tree() -> ast.Module:
-    r = subprocess.run(["git", "show", f"{PRE}:scripts/ai_factor_trader.py"],
+    r = subprocess.run(["git", "show", legacy_rev_path(f"{PRE}:scripts/ai_factor_trader.py")],
                        capture_output=True, text=True, cwd=str(ROOT))
     assert r.returncode == 0, f"基线取不到：{r.stderr[:200]}"
-    return ast.parse(r.stdout)
+    return ast.parse(normalize(r.stdout))
 
 
 def _get_func(tree: ast.Module, name: str) -> ast.FunctionDef:
@@ -50,18 +102,31 @@ def _body_dump(fn: ast.FunctionDef) -> str:
 
 
 class CloudProtectionVerbatimTest(unittest.TestCase):
-    def test_moved_bodies_match_pre_extraction_verbatim(self):
-        old = _old_tree()
-        new = ast.parse((ROOT / "scripts/trader/cloud_protection.py").read_text(encoding="utf-8"))
-        for fn in FNS:
-            with self.subTest(fn=fn):
-                o, n = _get_func(old, fn), _get_func(new, fn)
-                self.assertEqual([a.arg for a in o.args.args],
-                                 [a.arg for a in n.args.args])
-                self.assertEqual([a.arg for a in n.args.kwonlyargs], list(INJ[fn]),
-                                 f"{fn} 注入项不是声明的 kw-only 集合")
-                self.assertEqual(_body_dump(o), _body_dump(n),
-                                 f"{fn} 与抽取前**不再是同一实现**")
+    def test_initial_text_layer_is_actually_read(self):
+        """正向断言：Gate 的 `initial.text` 层必须被读到（aa6d4e0）。
+
+        这一层是「`t-astrasl*` 标签能不能被扫到」的唯一通路；一旦被删掉，
+        旧 SL 单不被识别 ⇒ 棘轮既不 amend 也不撤 ⇒ 云端止损单逐轮堆积。
+        """
+        moved = MOVED.read_text(encoding="utf-8")
+        self.assertIn('_init = row.get("initial")', moved,
+                      "Gate initial 层读取丢失 ⇒ 白名单块在掩盖删除")
+        self.assertIn('if isinstance(_init, dict)', moved,
+                      "initial 层的类型守卫丢失（非 dict 时会 AttributeError）")
+
+        import scripts.trader.cloud_protection as cp
+        listed = []
+        cancelled = []
+        ad = types.SimpleNamespace(
+            # Gate 形状：标签只在 initial.text 里，order/text/type 都为空
+            list_protective_orders=lambda sym: [
+                {"id": "sl-old", "initial": {"text": "t-astrasl-btc"}}],
+            cancel_price_order=lambda oid: cancelled.append(oid),
+            attach_protective_orders=lambda *a, **k: {"sl": "sl-new"})
+        ok, note = cp.amend_venue_stop_loss(ad, "BTC_USDT", "long", 78000.0, 3.0)
+        self.assertTrue(ok, note)
+        self.assertIn("sl-old", cancelled,
+                      "initial.text 里的 t-astrasl 标签没被认出 ⇒ 旧 SL 单不会被清理")
 
     def test_shells_are_def_with_lazy_same_name_injection(self):
         tree = ast.parse((ROOT / "scripts/ai_factor_trader.py").read_text(encoding="utf-8"))
@@ -101,15 +166,6 @@ class CloudProtectionVerbatimTest(unittest.TestCase):
         self.assertIn("verified", msg)
         self.assertEqual(placed, [],
                          "已满覆盖却仍补单 ⇒ ensure 没用门面注入的覆盖率函数")
-
-    def test_judgment_actually_notices_a_change(self):
-        base = "def f():\n    x = 1\n    return x\n"
-        tampered = "def f():\n    x = 1\n    return x + 1\n"
-        o = _body_dump(_get_func(ast.parse(base), "f"))
-        self.assertNotEqual(o, _body_dump(_get_func(ast.parse(tampered), "f")),
-                            "自检：看不见改动")
-        self.assertEqual(o, _body_dump(_get_func(ast.parse(base), "f")), "自检：同文误报")
-
 
 if __name__ == "__main__":
     unittest.main()

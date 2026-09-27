@@ -25,7 +25,7 @@
 | `venue_registry` / `current_environment` / `amend_venue_stop_loss` | 多所路径 |
 
 全部**调用期注入**：门面会被 `pin_baseline_risk_env()` 原地重载，
-import 期绑定会变成过期快照（`r20_backend/README.md` §5）。
+import 期绑定会变成过期快照（`astra_backend/README.md` §5）。
 
 > 平仓置信度阈值 **85 是原实现里的字面量**（不是 `risk_constants` 常量，全仓查无
 > `AI_CLOSE_CONFIDENCE_MIN`）。本次搬运**刻意保持字面量不变** —— 重构不得改业务阈值。
@@ -59,7 +59,26 @@ def execute_ai_position_management(real_pos_dict, trackers, timestamp_full, exec
         confidence = float(instruction.get("confidence", 0) or 0)
         reason = str(instruction.get("reason", "AI持仓管理"))[:120]
         position = real_pos_dict.get(inst_id)
-        if not position or action == "HOLD":
+        if not position:
+            # ⚠️ 第一百一十七刀：旧实现在这里**静默** `continue` —— AI 明明对一笔
+            # **外所**持仓写了 CLOSE_MARKET / UPDATE_SL，面板与日志里毫无痕迹，
+            # 看起来像"本轮无事可做"（假阴性）。
+            #
+            # 实测（2026-09-20）：AI 指令文件里唯一一条就是 `UNI-USDT-SWAP`（HOLD），
+            # 而它正是 **binance** 的 UNI 空仓；`real_pos_dict` 由
+            # `cycle_stages.fetch_positions_and_reconcile` 用 **OKX 直签链**的
+            # `query_positions()` 构建 ⇒ 外所持仓**永远不在**这个字典里，
+            # 这条缺口**实际可达**（只要 AI 把 HOLD 换成 CLOSE_MARKET/UPDATE_SL）。
+            #
+            # 本刀只**如实留痕**、不改任何交易行为：真正的执行能力（把外所持仓并入
+            # 本路径管理）属改变实盘行为的改动，须单独决策。
+            if action != "HOLD":
+                _nm = inst_id.replace("-USDT-SWAP", "") or inst_id
+                executed_actions.append(
+                    f"[{_nm}] AI{action}指令未执行：{inst_id} 不在本路径持仓字典"
+                    f"（该字典仅 OKX 直签链；外所持仓由云端保护腿链路管理）")
+            continue
+        if action == "HOLD":
             continue
 
         pos_side = str(position.get("posSide", "net")).lower()
@@ -92,7 +111,7 @@ def execute_ai_position_management(real_pos_dict, trackers, timestamp_full, exec
             old_sl = 0.0
             if pos_venue != "okx":
                 try:
-                    from r20_backend.close_intent import adapter_environment as _sl_env
+                    from astra_backend.close_intent import adapter_environment as _sl_env
                     ad = venue_registry.get_adapter(pos_venue,
                         environment=_sl_env(pos_venue, str(current_environment().mode)))  # 审计 C2+C3
                     # 审计 C3（后半）：棘轮而非堆单——原生改单优先，回退先挂新再撤旧
@@ -111,7 +130,13 @@ def execute_ai_position_management(real_pos_dict, trackers, timestamp_full, exec
                 except Exception as exc:
                     executed_actions.append(f"[{name}] 云端止损收紧失败，原保护单保持不变（查询异常：{exc}）")
                     continue
-                live_algo = next((o for o in algo_orders if o.get("state") == "live" and o.get("posSide") == pos_side and o.get("slTriggerPx")), None)
+                # 第一百八十六刀：同 cloud_protection —— 净持仓账户的云端单 `posSide` 是
+                # `"net"`，精确相等会永远找不到 ⇒ 只会打印"未找到真实云端止损单"，
+                # 云端止损上移静默不生效。统一为 net 容错。
+                live_algo = next((o for o in algo_orders
+                                  if str(o.get("state", "")).lower() == "live"
+                                  and str(o.get("posSide", "net")).lower() in {pos_side, "net"}
+                                  and o.get("slTriggerPx")), None)
                 if not live_algo:
                     executed_actions.append(f"[{name}] 未找到真实云端止损单，无法更新")
                     continue

@@ -36,7 +36,7 @@ def _recent_entry_intent(inst_id: str, side: str, now_ms: int) -> Dict[str, Any]
     The intent is evidence of the accepted order, not proof of fill. It is
     copied into the tracker only after the exchange position snapshot exists.
     """
-    data_dir = os.environ.get("R20_DATA_DIR") or os.path.join(
+    data_dir = os.environ.get("ASTRA_DATA_DIR") or os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "data")
     path = os.path.join(data_dir, "open_order_intents.json")
     wanted_side = "buy" if str(side).lower() == "long" else "sell"

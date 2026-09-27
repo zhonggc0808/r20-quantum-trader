@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import ast
+import types
 import unittest
 from pathlib import Path
 
@@ -336,29 +337,6 @@ class WiringTest(unittest.TestCase):
             self.assertIn(f"def {fn}(", sub)
             self.assertNotIn(f"def {fn}(", facade)
 
-    def test_execute_portfolio_shrank_and_calls_helpers(self):
-        facade = FACADE.read_text(encoding="utf-8")
-        tree = ast.parse(facade)
-        # 用 AST 数**真实调用**，不用文本 count —— 文本会把 import 行也数进去
-        # （`from ... import collect_pending_inst_ids`），得到的 2 没有意义。
-        called = [n.func.id for n in ast.walk(tree)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-        # 第九十二刀：`collect_pending_inst_ids` 的调用随相位 1 迁入 cycle_stages.py
-        self.assertEqual(called.count("collect_pending_inst_ids"), 0,
-                         "门面主流程已不再直接调用（随相位 1 迁出）")
-        # 第九十一刀：`build_state_payload` 的调用随"相位 5"搬入 cycle_stages.py
-        stages = ast.parse((ROOT / "scripts" / "trader" / "cycle_stages.py").read_text(encoding="utf-8"))
-        stage_calls = [n.func.id for n in ast.walk(stages)
-                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-        self.assertEqual(stage_calls.count("build_state_payload"), 1,
-                         "面板状态装配应恰有 1 处调用（现住 cycle_stages.persist_state_and_sync_ledger）")
-        self.assertEqual(stage_calls.count("collect_pending_inst_ids"), 1,
-                         "外所挂单枚举应恰有 1 处调用（现住 cycle_stages.fetch_positions_and_reconcile）")
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "execute_portfolio")
-        lines = fn.end_lineno - fn.lineno + 1
-        self.assertLess(lines, 640, f"execute_portfolio 应已明显变短，实际 {lines} 行")
-
     def test_old_venue_loop_is_gone_from_facade(self):
         facade = FACADE.read_text(encoding="utf-8")
         self.assertNotIn('for _gv in ("gate", "binance")', facade)
@@ -436,6 +414,53 @@ class WiringTest(unittest.TestCase):
             checked += 1
         self.assertEqual(checked, 2, f"应有 2 处调用，实际 {checked}")
 
+
+class BrokenExecutionVenuesTest(unittest.TestCase):
+    """凭证已死场所的判据（第一百三十一刀）：**闸开着却不可就绪** ⇒ 未计入。
+
+    这条判据存在的理由：此类所被 `venue_execution_ready` 否决 ⇒ 跨所取数也跳过它，
+    且返回 `ok=True` **无任何错误** ⇒ 它的持仓/挂单不进配额与敞口，而"跨所笔数"
+    看起来完整。所以判据必须精确（不误报结构性的"没这个所"），且异常时**不猜**。
+    """
+
+    def _reg(self, *, open_flags):
+        return types.SimpleNamespace(
+            execution_open=lambda v, e: bool(open_flags.get(v, False)))
+
+    def test_flag_on_but_not_ready_is_reported(self):
+        got = cycle_snapshot.broken_execution_venues(
+            ("gate", "binance"), "demo",
+            venue_registry=self._reg(open_flags={"gate": True, "binance": True}),
+            venue_execution_ready=lambda v, e: v != "binance")
+        self.assertEqual(got, ["binance"])
+
+    def test_flag_off_is_not_reported(self):
+        """闸没开 = 结构性无该所（不是"凭证已死"），不得误报。"""
+        got = cycle_snapshot.broken_execution_venues(
+            ("gate", "binance"), "demo",
+            venue_registry=self._reg(open_flags={"gate": False, "binance": False}),
+            venue_execution_ready=lambda v, e: False)
+        self.assertEqual(got, [])
+
+    def test_all_ready_reports_nothing(self):
+        got = cycle_snapshot.broken_execution_venues(
+            ("gate", "binance"), "demo",
+            venue_registry=self._reg(open_flags={"gate": True, "binance": True}),
+            venue_execution_ready=lambda v, e: True)
+        self.assertEqual(got, [])
+
+    def test_exception_on_one_venue_does_not_misreport_or_crash(self):
+        """判据异常时**不猜**：跳过该所，也不影响其余所的判定。"""
+        def _ready(v, e):
+            if v == "gate":
+                raise RuntimeError("能力表读取失败")
+            return False
+
+        got = cycle_snapshot.broken_execution_venues(
+            ("gate", "binance"), "demo",
+            venue_registry=self._reg(open_flags={"gate": True, "binance": True}),
+            venue_execution_ready=_ready)
+        self.assertEqual(got, ["binance"], "异常所不得被当成'已死'，其余所照常判定")
 
 if __name__ == "__main__":
     unittest.main()

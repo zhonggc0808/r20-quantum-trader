@@ -20,7 +20,7 @@
 ## 可以直接导入的
 
 `calc_*`（6 个）与 `effective_risk_per_trade` / `quantize_size` 都来自
-`r20_backend.execution` —— 与门面**同一个对象**，因此
+`astra_backend.execution` —— 与门面**同一个对象**，因此
 `test_audit_config_p1_alignment` 的 `assertIs(getattr(trader, name), getattr(sizing, name))`
 照旧成立。`calculate_multi_timeframe` 保持原样在函数内延迟导入
 （它来自 `calculus_engine`，测试环境里不一定可导入）。
@@ -32,7 +32,7 @@ import warnings
 
 from scripts.direction_observation import candle_timestamp, four_hour_range
 
-from r20_backend.execution import (
+from astra_backend.execution import (
     calc_atr,
     calc_bollinger_squeeze,
     calc_ema,
@@ -145,6 +145,9 @@ def fetch_single_instrument_data(item, all_positions, usdt_available, *,
                     "protectionStatus": p.get("protectionStatus"),
                     "protectionAlgoId": p.get("protectionAlgoId"),
                     "protectionCoveragePct": p.get("protectionCoveragePct"),
+                    "venue": str(p.get("venue") or p.get("exchange") or "okx").lower(),
+                    "exchange": str(p.get("venue") or p.get("exchange") or "okx").lower(),
+                    "raw": p.get("raw", {}),
                 }
                 break
 

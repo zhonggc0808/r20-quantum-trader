@@ -15,7 +15,7 @@ from typing import Mapping
 def runtime_data_dir(default):
     """Resolve the account-state data directory exactly like the rest of the repo.
 
-    ``R20_DATA_DIR`` always wins. Six other modules already honour it —
+    ``ASTRA_DATA_DIR`` always wins. Six other modules already honour it —
     ``factor_library`` / ``news_sentiment_harvester`` / ``sync_full_ledger`` /
     ``self_improvement_engine`` / ``trader.order_lease`` / ``trader.position_exit``
     — and ``tests/config_sandbox.isolate_config`` sets it so that both in-process
@@ -28,7 +28,7 @@ def runtime_data_dir(default):
     "此实例固定为 live" — taking ~70 unrelated cases down with it. Anyone reading
     account state must resolve the directory through here, never through ``ROOT``.
     """
-    override = os.environ.get("R20_DATA_DIR")
+    override = os.environ.get("ASTRA_DATA_DIR")
     return Path(override) if override else Path(default)
 
 
@@ -52,7 +52,7 @@ def validate_environment_update(data_dir, values: Mapping, *, removing=False):
     scope = load_scope(data_dir)
     if not scope:
         return
-    for key in ('R20_OKX_ENV', 'OKX_IS_SIMULATED'):
+    for key in ('ASTRA_OKX_ENV', 'OKX_IS_SIMULATED'):
         if key not in values:
             continue
         if removing:
@@ -60,7 +60,7 @@ def validate_environment_update(data_dir, values: Mapping, *, removing=False):
         value = values[key]
         if value is None:
             continue
-        mode = str(value).lower() if key == 'R20_OKX_ENV' else ('demo' if str(value).lower() in ('1','true','yes') else 'live')
+        mode = str(value).lower() if key == 'ASTRA_OKX_ENV' else ('demo' if str(value).lower() in ('1','true','yes') else 'live')
         assert_environment(data_dir, mode)
 
 

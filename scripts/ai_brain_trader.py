@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-R20 AI Brain Six-Crypto Quantitative Trading Decision Engine (ai_brain_trader.py)
+ASTRA AI Brain Six-Crypto Quantitative Trading Decision Engine (ai_brain_trader.py)
 Batch ingests six crypto perpetuals into one macro-context LLM call.
 Maintains a validated live decision cache and durable Web audit history.
 """
@@ -8,6 +8,8 @@ Maintains a validated live decision cache and durable Web audit history.
 import os
 import sys
 from pathlib import Path
+
+from astra_backend.math_utils import safe_float as _shared_safe_float
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = Path(PROJECT_ROOT)
@@ -58,12 +60,12 @@ POSITION_ACTIONS = {"HOLD", "CLOSE_MARKET", "UPDATE_SL"}
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from r20_backend.config import settings as standalone_settings
+    from astra_backend.config import settings as standalone_settings
 except ImportError:
     standalone_settings = None
 
 try:
-    from r20_backend.version import __version__
+    from astra_backend.version import __version__
 except Exception:
     __version__ = "7.6.0"
 
@@ -84,7 +86,7 @@ from scripts.direction_observation import (
 from scripts.trader.order_lease import record_keep, remove_lease
 # 结构优化阶段4·B3 第二块：跨所采集/健康度/提示词组装已搬入 scripts/brain/xvenue.py。
 # 依赖面较宽（适配器缝、safe_float、VENUE_HEALTH_FILE、atomic_write_json、_XV_HEALTH），
-# 全部走**调用期注入**，理由见该模块 docstring 与 r20_backend/README.md §5。
+# 全部走**调用期注入**，理由见该模块 docstring 与 astra_backend/README.md §5。
 from scripts.brain.prompt import (
     construct_full_market_prompt as _construct_full_market_prompt_impl,
 )
@@ -184,16 +186,16 @@ PROMPT_OVERRIDE_FILE = os.path.join(DATA_DIR, "system_prompt_override.txt")
 AI_BRAIN_LOCK_FILE = os.path.join(DATA_DIR, ".ai_brain_cycle.lock")
 DECISION_MAX_AGE_SECONDS = 300
 
-from r20_backend.version import __version__
+from astra_backend.version import __version__
 from instrument_pool import load_instruments
 from prompt_library import active_profile, append_layer, apply_module_layout
-from r20_gateway.telemetry import ModelCallTelemetry
+from astra_gateway.telemetry import ModelCallTelemetry
 from llm_credentials import get_cpa_client_config as _get_cpa_client_config  # noqa: E402
 
 TARGET_INSTRUMENTS = load_instruments()
 
 try:  # 跨所符号归一（审计 P2-12）：把 BINANCE:BTCUSDT / BTC_USDT / BTC 统一成 OKX 形态
-    from r20_backend.exchanges.base import canonical_base as _canonical_base_name
+    from astra_backend.exchanges.base import canonical_base as _canonical_base_name
 except Exception:  # pragma: no cover - scripts/ 直接运行时走兜底
     try:
         from exchanges.base import canonical_base as _canonical_base_name  # type: ignore
@@ -246,11 +248,12 @@ def single_brain_cycle(func):
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        result = float(value)
-        return result if result == result and abs(result) != float("inf") else default
-    except (TypeError, ValueError):
-        return default
+    """薄壳：转调单一事实源（`astra_backend.math_utils.safe_float`，第一百五十刀）。
+
+    语义与既有实现逐条一致（`nan`/`±inf`/不可转 ⇒ `default`；`bool` 按 `float()`）——
+    只是不再各写一份（三份等价实现的漂移代价是"因子与风控静默算出不同的数"）。
+    """
+    return _shared_safe_float(value, default)
 
 
 def is_same_direction_scale_request(position_side: str, action: str) -> bool:
@@ -263,7 +266,7 @@ def is_same_direction_scale_request(position_side: str, action: str) -> bool:
 def get_cpa_client_config() -> Tuple[str, str]:
     """薄壳：调用时解析门面全局，使测试的 patch / 直接赋值生效。
 
-    实现已迁往 r20_backend.llm.credentials（结构优化阶段 4·B3 第四十六刀）。
+    实现已迁往 astra_backend.llm.credentials（结构优化阶段 4·B3 第四十六刀）。
     ⚠️ `standalone_settings` 必须**在这里**读取后传入 —— 门面全局会被测试
     patch / 原地 reload，子模块 import 期绑定会读到陈旧副本。
     """
@@ -286,6 +289,19 @@ def read_prompt_override() -> str:
 _SL_ATR_BY_ASSET_CLASS = {"commodity": 1.3, "index": 1.2, "stock": 1.3, "crypto": 1.4}
 
 
+def _prefer_pool_inst(candidate: str, current: str) -> bool:
+    """同币多合约时的**确定性**优选（顺序无关）：USDT 永续优先，其次字典序更小。
+
+    为什么需要它：`setdefault` 的"首值优先"会把选择权交给 `TARGET_INSTRUMENTS` 的排列顺序，
+    那是**静默的任意选择**（改一行配置就换了合约）。本函数让它可解释、可复现。
+    """
+    cand_swap = str(candidate).endswith("-USDT-SWAP")
+    curr_swap = str(current).endswith("-USDT-SWAP")
+    if cand_swap != curr_swap:
+        return cand_swap
+    return str(candidate) < str(current)
+
+
 def canonical_position_inst_id(raw: Any) -> str:
     """跨所持仓符号 → OKX 形态（审计 P2-12，模块级便于直接测试）。
 
@@ -296,15 +312,32 @@ def canonical_position_inst_id(raw: Any) -> str:
     if not text:
         return ""
     bare = text.split(":")[-1]
+    # 第一百八十三刀：这里原本是 `pool_by_base.setdefault(base, iid)` —— **首值优先**，
+    # 于是"同一个币有多个池内合约"时选哪个**取决于 TARGET_INSTRUMENTS 的顺序**（静默的
+    # 任意选择；增删一个条目就会换合约，进而换下单标的）。真机核对：当前 9 个目标合约
+    # **同币重复为 0**，所以这是潜在风险而非现行错误。改成**与顺序无关的确定性优选**：
+    #   1) 优先标准 USDT 永续（`BASE-USDT-SWAP`）；
+    #   2) 其余按字典序取最小。
     pool_by_base: Dict[str, str] = {}
     for item in (TARGET_INSTRUMENTS if isinstance(TARGET_INSTRUMENTS, list) else []):
         iid = str((item or {}).get("instId") or "").strip().upper()
-        if iid:
-            pool_by_base.setdefault(_canonical_base_name(iid), iid)
+        if not iid:
+            continue
+        base = _canonical_base_name(iid)
+        current = pool_by_base.get(base)
+        if current is None or _prefer_pool_inst(iid, current):
+            pool_by_base[base] = iid
     base = _canonical_base_name(bare)
-    if base in pool_by_base:
+    # 第一百八十五刀：`canonical_base` 修好"非 USDT 计价"的提取后（`BTC-USDC` → `BTC`、
+    # `BTC-USD-SWAP` → `BTC`），**池查找必须加一道"标准形态"闸**，否则币本位/日期合约
+    # 会因为币种相同而被映射到池内的 **USDT 永续**（`BTC-USD-SWAP` → `BTC-USDT-SWAP`）——
+    # 那是**换了下单标的**，直接违背本函数"其余原样保留，绝不假装认识"的契约
+    # （既有用例 `test_unknown_forms_are_preserved_verbatim` 当场判红，救回一刀）。
+    standard = bool(base) and bare in (base, f"{base}USDT", f"{base}_USDT",
+                                       f"{base}-USDT", f"{base}-USDT-SWAP")
+    if standard and base in pool_by_base:
         return pool_by_base[base]
-    if base and bare in (base, f"{base}USDT", f"{base}_USDT", f"{base}-USDT", f"{base}-USDT-SWAP"):
+    if standard:
         return f"{base}-USDT-SWAP"
     return text
 
@@ -375,7 +408,7 @@ def fetch_single_instrument_package(item: Dict[str, Any]) -> Dict[str, Any]:
 #    保证「提示词口径 == 执行层口径」，模型永远不会被告知过期规则；
 # 3) JSON 契约段含花括号，作为独立普通字符串，不参与 format 插值。
 _SYSTEM_CORE = """==== 【系统角色定位与核心使命】 ====
-你是 R20 Quantum Trader 的首席 AI 交易官，负责 1H~4H 加密合约多空双向波段的高胜率交易裁决。你的使命按优先级排列：
+你是 AstraQuant 的首席 AI 交易官，负责 1H~4H 加密合约多空双向波段的高胜率交易裁决。你的使命按优先级排列：
 1. 捍卫本金：单笔风险有界、日亏有熔断、敞口有上限，任何单笔损失都不得伤及账户根基；
 2. 捕捉正期望：只在数学期望为正（概率优势 × 盈亏比 > 摩擦成本）的机会上下注，用高确定性波段积累复利；
 3. 拒绝懈怠与恐惧：当空仓且存在至少一个合法顺势候选时（符合顺势高胜率形态）并通过全部硬门禁，必须果断在候选标的池中选优输出限价进场指令，不得无故放弃合规机会——空仓不是风控，无优势硬开才是风险。
@@ -490,7 +523,7 @@ _SYSTEM_JSON_CONTRACT = """==== 【严格 JSON 规范契约与完整输出骨架
 # ---------------------------------------------------------------------------
 # 跨所比对矩阵（Phase 2 · 币安/Gate 只读备源）
 # 纯证据增益：任何失败一律 fail-soft，绝不阻塞决策主循环。
-# 熔断开关 R20_XVENUE_PROMPT=0 时整段跳过（网络故障预案/测试封闭性）。
+# 熔断开关 ASTRA_XVENUE_PROMPT=0 时整段跳过（网络故障预案/测试封闭性）。
 # ---------------------------------------------------------------------------
 
 # 跨所取数健康度状态：**刻意留在门面**（不是实现细节）——
@@ -861,6 +894,21 @@ def _jev_shadow_side(value: Any) -> str:
     return text
 
 
+def _jev_position_side(position: Mapping[str, Any], fallback: Any = "") -> str:
+    side = _jev_shadow_side(position.get("side"))
+    if side in {"long", "short"}:
+        return side
+    pos_side = _jev_shadow_side(position.get("posSide"))
+    if pos_side in {"long", "short"}:
+        return pos_side
+    size = _jev_shadow_float(position.get("pos"), 0.0)
+    if size > 0:
+        return "long"
+    if size < 0:
+        return "short"
+    return _jev_shadow_side(fallback)
+
+
 def _jev_shadow_timestamp(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value) if float(value) < 10_000_000_000 else float(value) / 1000.0
@@ -1108,10 +1156,10 @@ def _jev_shadow_update_position_outcomes(position_proposals: List[Dict[str, Any]
     """Persist counterfactual exit snapshots and update fixed post-review horizons."""
     path = os.path.join(DATA_DIR, "jev_shadow_position_outcomes.jsonl")
     now_ts = float(review.get("timestamp") or time.time())
-    fee_rate = max(0.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
-    slippage_bps = max(0.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
-    cycle_seconds = max(60.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
-    horizon_seconds = max(3600.0, _jev_shadow_float(os.environ.get("R20_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
+    fee_rate = max(0.0, _jev_shadow_float(os.environ.get("ASTRA_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
+    slippage_bps = max(0.0, _jev_shadow_float(os.environ.get("ASTRA_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
+    cycle_seconds = max(60.0, _jev_shadow_float(os.environ.get("ASTRA_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
+    horizon_seconds = max(3600.0, _jev_shadow_float(os.environ.get("ASTRA_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
     review_by_inst = {str(item.get("instId")): item for item in position_reviews if isinstance(item, dict)}
 
     ledger = []
@@ -1172,9 +1220,9 @@ def _jev_shadow_update_position_outcomes(position_proposals: List[Dict[str, Any]
         return None
 
     try:
-        from r20_backend.file_locks import file_lock
-        retention_days = max(14, min(int(os.environ.get("R20_JEV_POSITION_RETENTION_DAYS", "60")), 180))
-        max_records = max(500, min(int(os.environ.get("R20_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
+        from astra_backend.file_locks import file_lock
+        retention_days = max(14, min(int(os.environ.get("ASTRA_JEV_POSITION_RETENTION_DAYS", "60")), 180))
+        max_records = max(500, min(int(os.environ.get("ASTRA_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
         cutoff = int(time.time()) - retention_days * 24 * 60 * 60
         with file_lock(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1428,7 +1476,7 @@ def _jev_shadow_entry_order_chain(record: Dict[str, Any], ledger_item: Dict[str,
     """Match a legacy fill to a review through a bounded local order intent."""
     try:
         entry_association_window = max(600.0, min(float(os.environ.get(
-            "R20_JEV_ENTRY_ASSOCIATION_WINDOW_S", "3600")), 7200.0))
+            "ASTRA_JEV_ENTRY_ASSOCIATION_WINDOW_S", "3600")), 7200.0))
     except (TypeError, ValueError):
         entry_association_window = 3600.0
     review_ts = _jev_shadow_timestamp(record.get("review_timestamp"))
@@ -1488,13 +1536,13 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
     path = os.path.join(DATA_DIR, "jev_shadow_entry_outcomes.jsonl")
     now_ts = float(review.get("timestamp") or time.time())
     fee_rate = max(0.0, _jev_shadow_float(
-        os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
+        os.environ.get("ASTRA_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005))
     slippage_bps = max(0.0, _jev_shadow_float(
-        os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
+        os.environ.get("ASTRA_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0))
     cycle_seconds = max(60.0, _jev_shadow_float(
-        os.environ.get("R20_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
+        os.environ.get("ASTRA_JEV_SHADOW_CYCLE_SECONDS", "900"), 900.0))
     horizon_seconds = max(3600.0, _jev_shadow_float(
-        os.environ.get("R20_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
+        os.environ.get("ASTRA_JEV_SHADOW_HORIZON_4H_SECONDS", "14400"), 14400.0))
     package_by_inst = {str(p.get("instId")): p for p in proposals if isinstance(p, dict)}
     review_by_inst = {
         str(item.get("instId")): item for item in instrument_reviews
@@ -1524,7 +1572,7 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
             return None
         for position in active_positions:
             if (_jev_shadow_base(position.get("instId")) == base and
-                    _jev_shadow_side(position.get("side") or position.get("posSide")) == side):
+                    _jev_position_side(position) == side):
                 return position
         return None
 
@@ -1593,11 +1641,11 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
         return True
 
     try:
-        from r20_backend.file_locks import file_lock
+        from astra_backend.file_locks import file_lock
         retention_days = max(14, min(int(os.environ.get(
-            "R20_JEV_POSITION_RETENTION_DAYS", "60")), 180))
+            "ASTRA_JEV_POSITION_RETENTION_DAYS", "60")), 180))
         max_records = max(500, min(int(os.environ.get(
-            "R20_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
+            "ASTRA_JEV_POSITION_MAX_RECORDS", "20000")), 50000))
         cutoff = int(time.time()) - retention_days * 24 * 60 * 60
         with file_lock(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1698,7 +1746,7 @@ def _jev_shadow_update_entry_outcomes(proposals: List[Dict[str, Any]],
                         (candidate for candidate in active_positions
                          if _jev_shadow_base(candidate.get("instId")) ==
                          _jev_shadow_base(item.get("instId")) and
-                         _jev_shadow_side(candidate.get("side") or candidate.get("posSide")) ==
+                         _jev_position_side(candidate) ==
                          _jev_shadow_side(item.get("main_action"))),
                         None,
                     )
@@ -2308,7 +2356,7 @@ _JEV_ENFORCEMENT_MODES = ("shadow", "review", "soft_veto", "hard_veto")
 
 
 def _jev_resolve_enforcement(configured: Any) -> Dict[str, Any]:
-    """把 `R20_JEV_ENFORCEMENT` 解析成合法档位。
+    """把 `ASTRA_JEV_ENFORCEMENT` 解析成合法档位。
 
     方案 §6 要求 `shadow` / `review` / `soft_veto` **可配置回滚、不得通过修改代码
     切换**。此前的实现把 `enforcement_mode` 硬编码成 `"shadow"`，只把环境变量记进
@@ -2499,7 +2547,7 @@ def _jev_shadow_provider_payload(model: str, state: Dict[str, Any],
     """Build one isolated provider request; no state is shared between lanes."""
     payload = {"model": model, "state": state, "questions": questions}
     if provider == "vercel_gateway":
-        configured_order = os.environ.get("R20_JEV_GATEWAY_PROVIDER_ORDER", "typesafe-ai")
+        configured_order = os.environ.get("ASTRA_JEV_GATEWAY_PROVIDER_ORDER", "typesafe-ai")
         provider_order = [item.strip() for item in configured_order.split(",") if item.strip()]
         if provider_order:
             payload["providerOptions"] = {"gateway": {"order": provider_order}}
@@ -2526,7 +2574,7 @@ def _jev_shadow_request(endpoint: str, api_key: str, payload: Dict[str, Any],
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": f"R20-Quantum-Trader/Jev-Shadow/{channel}",
+                "User-Agent": f"AstraQuant/Jev-Shadow/{channel}",
             },
             method="POST",
         )
@@ -2598,37 +2646,37 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
                            pending_orders_detail: Optional[List[Dict[str, Any]]] = None,
                            trader_factors: Optional[List[Dict[str, Any]]] = None) -> None:
     """Run Jev as an observe-only review; never alter the trading decision."""
-    enabled = str(os.environ.get("R20_JEV_SHADOW_ENABLED", "1")).strip().lower()
+    enabled = str(os.environ.get("ASTRA_JEV_SHADOW_ENABLED", "1")).strip().lower()
     if enabled in {"0", "false", "no", "off"}:
         return
-    independent_enabled = str(os.environ.get("R20_JEV_INDEPENDENT_ENABLED", "1")).strip().lower()
+    independent_enabled = str(os.environ.get("ASTRA_JEV_INDEPENDENT_ENABLED", "1")).strip().lower()
     if independent_enabled in {"0", "false", "no", "off"}:
         print("[AI Brain Jev Shadow] 独立双通道已关闭，跳过本轮影子复核")
         return
-    configured_provider = str(os.environ.get("R20_JEV_PROVIDER", "")).strip().lower()
-    configured_endpoint = str(os.environ.get("R20_JEV_SHADOW_URL", "")).strip()
+    configured_provider = str(os.environ.get("ASTRA_JEV_PROVIDER", "")).strip().lower()
+    configured_endpoint = str(os.environ.get("ASTRA_JEV_SHADOW_URL", "")).strip()
     direct_typesafe = configured_provider in {"typesafe", "typesafe-ai", "direct"}
     direct_typesafe = direct_typesafe or bool(
-        os.environ.get("R20_JEV_TYPESAFE_API_KEY") or os.environ.get("TYPESAFE_API_KEY"))
+        os.environ.get("ASTRA_JEV_TYPESAFE_API_KEY") or os.environ.get("TYPESAFE_API_KEY"))
     if configured_endpoint:
         direct_typesafe = direct_typesafe or "api.typesafe.ai" in configured_endpoint.lower()
     if direct_typesafe:
         provider = "typesafe"
-        api_key = (os.environ.get("R20_JEV_TYPESAFE_API_KEY") or
+        api_key = (os.environ.get("ASTRA_JEV_TYPESAFE_API_KEY") or
                    os.environ.get("TYPESAFE_API_KEY") or
-                   os.environ.get("R20_JEV_API_KEY") or "").strip()
+                   os.environ.get("ASTRA_JEV_API_KEY") or "").strip()
         endpoint = configured_endpoint or "https://api.typesafe.ai/v1/systemone"
-        model = (os.environ.get("R20_JEV_MODEL") or "jev-latest").strip()
+        model = (os.environ.get("ASTRA_JEV_MODEL") or "jev-latest").strip()
     else:
         provider = "vercel_gateway"
-        api_key = (os.environ.get("R20_JEV_API_KEY") or
+        api_key = (os.environ.get("ASTRA_JEV_API_KEY") or
                    os.environ.get("AI_GATEWAY_API_KEY") or "").strip()
         endpoint = configured_endpoint or "https://ai-gateway.vercel.sh/v1/evaluate"
-        model = (os.environ.get("R20_JEV_MODEL") or "typesafe-ai/jev").strip()
+        model = (os.environ.get("ASTRA_JEV_MODEL") or "typesafe-ai/jev").strip()
     if not api_key:
         return
     try:
-        timeout = max(1.0, min(float(os.environ.get("R20_JEV_SHADOW_TIMEOUT", "6")), 15.0))
+        timeout = max(1.0, min(float(os.environ.get("ASTRA_JEV_SHADOW_TIMEOUT", "6")), 15.0))
     except (TypeError, ValueError):
         timeout = 6.0
 
@@ -2647,7 +2695,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         enriched = dict(position)
         try:
             algo_rows = okx_rest.pending_algo_orders(inst_id=inst_id, timeout=2.5) or []
-            side = _jev_shadow_side(position.get("side") or position.get("posSide"))
+            side = _jev_position_side(position)
             live_rows = [row for row in algo_rows
                          if str(row.get("state", "live")).lower() in {"live", "effective"}
                          and str(row.get("posSide", "net")).lower() in {side, "net"}
@@ -2724,8 +2772,8 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         decision_margin = _jev_shadow_float(decision.get("margin_usdt"), 0.0)
         decision_leverage = _jev_shadow_float(decision.get("leverage"), 0.0)
         risk_budget = _jev_shadow_float(p.get("risk_per_trade_usd"), 0.0)
-        configured_margin = str(os.environ.get("R20_JEV_SHADOW_MARGIN_USDT", "")).strip()
-        configured_leverage = str(os.environ.get("R20_JEV_SHADOW_LEVERAGE", "")).strip()
+        configured_margin = str(os.environ.get("ASTRA_JEV_SHADOW_MARGIN_USDT", "")).strip()
+        configured_leverage = str(os.environ.get("ASTRA_JEV_SHADOW_LEVERAGE", "")).strip()
         if main_action != "WAIT" and decision_margin > 0:
             shadow_margin = decision_margin
             shadow_margin_source = "main_decision"
@@ -2737,7 +2785,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             shadow_margin_source = "risk_per_trade_usd"
         else:
             shadow_margin = max(0.01, _jev_shadow_float(
-                os.environ.get("R20_JEV_SHADOW_DEFAULT_MARGIN_USDT", "15"), 15.0))
+                os.environ.get("ASTRA_JEV_SHADOW_DEFAULT_MARGIN_USDT", "15"), 15.0))
             shadow_margin_source = "default_shadow_margin"
         if main_action != "WAIT" and decision_leverage > 0:
             shadow_leverage = decision_leverage
@@ -2758,7 +2806,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             direction_layers(trader_factor.get("calculus"))
         )
         matching_side = any(
-            _jev_shadow_side(position.get("side") or position.get("posSide")) ==
+            _jev_position_side(position) ==
             _jev_shadow_side(main_action)
             for position in active_for_inst
         )
@@ -2864,7 +2912,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "entryTs": position.get("entryTs"),
             "entry_venue": position.get("entry_venue", position.get("venue", "okx")),
             "venue": position.get("venue", "okx"),
-            "side": position.get("side", position.get("posSide", "")),
+            "side": position.get("side", position.get("posSide", "net")),
             "pos": position.get("pos", 0),
             "avgPx": position.get("avgPx", 0),
             "markPx": position.get("markPx", position.get("last", 0)),
@@ -2963,9 +3011,9 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         "positions": neutral_positions,
         "execution": {
             "fee_rate": _jev_shadow_float(
-                os.environ.get("R20_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005),
+                os.environ.get("ASTRA_JEV_SHADOW_FEE_RATE", "0.0005"), 0.0005),
             "slippage_bps": _jev_shadow_float(
-                os.environ.get("R20_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0),
+                os.environ.get("ASTRA_JEV_SHADOW_SLIPPAGE_BPS", "2"), 2.0),
             # 本轮候选的中位价差，来自已持有的盘口快照。
             "spread_bps": spread_bps,
             # 深度需要额外 REST 取数（每轮 ×10 标的），本周期未取，故显式缺失。
@@ -3178,12 +3226,12 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
     # 执行档位（方案 §6）必须在 `review` 字典之前解析：`review["enforcement_mode"]`
     # 会被候选/持仓评审读取，且档位要求可配置回滚、不得靠改代码切换。
     enforcement_resolution = _jev_resolve_enforcement(
-        os.environ.get("R20_JEV_ENFORCEMENT", "shadow"))
+        os.environ.get("ASTRA_JEV_ENFORCEMENT", "shadow"))
     enforcement_mode = enforcement_resolution["mode"]
-    # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
+    # §6 的 `ASTRA_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
     # 硬否决只允许来自代码门禁（默认 1，即最保守）。
     hard_veto_code_only = str(
-        os.environ.get("R20_JEV_HARD_VETO_ONLY_CODE_GATES", "1")
+        os.environ.get("ASTRA_JEV_HARD_VETO_ONLY_CODE_GATES", "1")
     ).strip().lower() not in {"0", "false", "no", "off"}
     started = time.perf_counter()
     review_started_timestamp = time.time()
@@ -3217,16 +3265,16 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         "audit_state_hash": _state_hash(audit_state),
         "independent_state": neutral_state,
         "audit_state": audit_state,
-        # 档位由 `R20_JEV_ENFORCEMENT` 决定（方案 §6 要求可配置回滚、不得靠改代码切换）。
+        # 档位由 `ASTRA_JEV_ENFORCEMENT` 决定（方案 §6 要求可配置回滚、不得靠改代码切换）。
         # 非法/未知值 fail-closed 回 `shadow`——那是唯一在结构上不可能改变主脑执行的
         # 档位，因此环境变量笔误只会让观察者保持观察。
         "configured_enforcement": (
-            os.environ.get("R20_JEV_ENFORCEMENT", "shadow").strip().lower() or "shadow"
+            os.environ.get("ASTRA_JEV_ENFORCEMENT", "shadow").strip().lower() or "shadow"
         ),
         "enforcement_mode": enforcement_mode,
         "enforcement_mode_valid": enforcement_resolution["valid"],
         "enforcement_mode_reason": enforcement_resolution["reason"],
-        # §6 的 `R20_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
+        # §6 的 `ASTRA_JEV_HARD_VETO_ONLY_CODE_GATES`：置 1 时 Jev 自身最高只能软否决，
         # 硬否决只允许来自代码门禁。
         "hard_veto_code_only": hard_veto_code_only,
     }
@@ -3268,29 +3316,29 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
     # WAIT/no_edge 只是在影子层声明「市场平淡」，不直接发单，因此保留 0.54 门槛，
     # 避免所有中等强度 WAIT 都退化成 ABSTAIN、让 no_edge 标签失去可观测性。
     # 两者都必须同时通过同一个 action margin 门槛。
-    min_confidence = _threshold("R20_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.70)
-    no_edge_min_confidence = _threshold("R20_JEV_NO_EDGE_MIN_CONFIDENCE", 0.54)
-    min_margin = _threshold("R20_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
+    min_confidence = _threshold("ASTRA_JEV_INDEPENDENT_MIN_CONFIDENCE", 0.70)
+    no_edge_min_confidence = _threshold("ASTRA_JEV_NO_EDGE_MIN_CONFIDENCE", 0.54)
+    min_margin = _threshold("ASTRA_JEV_INDEPENDENT_MIN_ACTION_MARGIN", 0.15)
     # no_edge 的分类门槛只服务观测；否决资格必须单独过更严格的 enforcement 门槛。
     veto_wait_min_confidence = _threshold(
-        "R20_JEV_VETO_WAIT_MIN_CONFIDENCE", 0.70)
-    veto_min_margin = _threshold("R20_JEV_VETO_MIN_ACTION_MARGIN", 0.15)
-    # `R20_JEV_DATA_VALID_MIN_PROBABILITY` 已随拆分移除：独立通道不再对模型的
+        "ASTRA_JEV_VETO_WAIT_MIN_CONFIDENCE", 0.70)
+    veto_min_margin = _threshold("ASTRA_JEV_VETO_MIN_ACTION_MARGIN", 0.15)
+    # `ASTRA_JEV_DATA_VALID_MIN_PROBABILITY` 已随拆分移除：独立通道不再对模型的
     # 数据有效性自述设门禁（完整性/一致性改由代码判定），因此该配置项不再读取。
     # 留着一个读取了却不生效的环境变量比删掉它更危险 —— 它会让人以为改得动。
     execution_ready_min = _threshold(
-        "R20_JEV_EXECUTION_READY_MIN_PROBABILITY", 0.44)
+        "ASTRA_JEV_EXECUTION_READY_MIN_PROBABILITY", 0.44)
     audit_data_valid_min = _threshold(
-        "R20_JEV_AUDIT_DATA_VALID_MIN_PROBABILITY", 0.50)
-    protection_min = _threshold("R20_JEV_PROTECTION_MIN_PROBABILITY", 0.50)
+        "ASTRA_JEV_AUDIT_DATA_VALID_MIN_PROBABILITY", 0.50)
+    protection_min = _threshold("ASTRA_JEV_PROTECTION_MIN_PROBABILITY", 0.50)
     # 审计旗标的判定分界（正向证据 >= 此值、风险项 < 此值即置旗）。默认 0.5
     # 保持既有行为不变；审计通道的答案分布与独立通道不同，因此单独可调。
-    audit_flag_min = _threshold("R20_JEV_AUDIT_FLAG_MIN_PROBABILITY", 0.50)
+    audit_flag_min = _threshold("ASTRA_JEV_AUDIT_FLAG_MIN_PROBABILITY", 0.50)
     position_min_confidence = _threshold(
-        "R20_JEV_POSITION_MIN_CONFIDENCE", min_confidence)
+        "ASTRA_JEV_POSITION_MIN_CONFIDENCE", min_confidence)
     position_min_margin = _threshold(
-        "R20_JEV_POSITION_MIN_ACTION_MARGIN", min_margin)
-    audit_min_confidence = _threshold("R20_JEV_AUDIT_MIN_CONFIDENCE", 0.70)
+        "ASTRA_JEV_POSITION_MIN_ACTION_MARGIN", min_margin)
+    audit_min_confidence = _threshold("ASTRA_JEV_AUDIT_MIN_CONFIDENCE", 0.70)
 
     def _candidate_review(index: int, proposal: Dict[str, Any]) -> Dict[str, Any]:
         prefix = f"candidate_{index}"
@@ -3511,7 +3559,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
                 management_warranted),
             # §9 阶段 D 的硬不变量：**平仓保护、止损与交易所安全门禁始终由代码
             # 控制**，任何档位下 Jev 都不得否决它们。因此持仓通道的判定恒为
-            # SHADOW、恒不影响执行 —— 即使有人把 R20_JEV_ENFORCEMENT 设成
+            # SHADOW、恒不影响执行 —— 即使有人把 ASTRA_JEV_ENFORCEMENT 设成
             # soft_veto/hard_veto，也改变不了保护单与止损。
             "jev_enforcement": "SHADOW",
             "jev_enforcement_decision": "SHADOW",
@@ -3628,13 +3676,13 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
 
     path = os.path.join(DATA_DIR, "jev_shadow_reviews.jsonl")
     try:
-        from r20_backend.file_locks import file_lock
+        from astra_backend.file_locks import file_lock
         try:
-            retention_days = max(1, min(int(os.environ.get("R20_JEV_SHADOW_RETENTION_DAYS", "7")), 30))
+            retention_days = max(1, min(int(os.environ.get("ASTRA_JEV_SHADOW_RETENTION_DAYS", "7")), 30))
         except (TypeError, ValueError):
             retention_days = 7
         try:
-            max_records = max(100, min(int(os.environ.get("R20_JEV_SHADOW_MAX_RECORDS", "1000")), 5000))
+            max_records = max(100, min(int(os.environ.get("ASTRA_JEV_SHADOW_MAX_RECORDS", "1000")), 5000))
         except (TypeError, ValueError):
             max_records = 1000
         cutoff = int(time.time()) - retention_days * 24 * 60 * 60
@@ -3684,15 +3732,15 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
     # 减少磁盘占用，完整响应仍在上面的短期文件中。
     evaluation_path = os.path.join(DATA_DIR, "jev_shadow_evaluation.jsonl")
     try:
-        from r20_backend.file_locks import file_lock
+        from astra_backend.file_locks import file_lock
         try:
             evaluation_days = max(14, min(
-                int(os.environ.get("R20_JEV_EVALUATION_RETENTION_DAYS", "60")), 180))
+                int(os.environ.get("ASTRA_JEV_EVALUATION_RETENTION_DAYS", "60")), 180))
         except (TypeError, ValueError):
             evaluation_days = 60
         try:
             evaluation_max_records = max(200, min(
-                int(os.environ.get("R20_JEV_EVALUATION_MAX_RECORDS", "5000")), 20000))
+                int(os.environ.get("ASTRA_JEV_EVALUATION_MAX_RECORDS", "5000")), 20000))
         except (TypeError, ValueError):
             evaluation_max_records = 5000
         evaluation_record = dict(review)
