@@ -26,6 +26,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,26 @@ from scripts import factor_library as FL
 from scripts.factors.defaults import build_default_factors
 
 _ITEM = {"instId": "BTC-USDT-SWAP", "name": "BTC", "ccy": "BTC"}
+
+
+class ScriptBootstrapTests(unittest.TestCase):
+    def test_direct_script_load_bootstraps_the_project_root(self):
+        """调度器按绝对路径拉脚本；启动时不能依赖 cwd 或外部 PYTHONPATH。"""
+        script = ROOT / "scripts" / "factor_library.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["ASTRA_DATA_DIR"] = str(Path(tmp) / "data")
+            result = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import runpy,sys; runpy.run_path(sys.argv[1], run_name='bootstrap_probe')",
+                 str(script)],
+                cwd=tmp,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class _Resp:
