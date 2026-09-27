@@ -50,6 +50,15 @@ def _pkg(inst_id: str) -> Dict[str, Any]:
     return {"instId": inst_id, "name": inst_id.split("-")[0], "price": 100.0,
             "bidPx": 99.9, "askPx": 100.1, "ctVal": 1.0, "minSz": 1.0,
             "base_sz": 1.0, "data_quality": "valid",
+            "calculus": {
+                "valid": True, "regime": "RANGE_LOW_VELOCITY",
+                "acceleration": 0.0, "power": 0.0,
+                "power_regime": "STEADY_FLUX",
+                "probability_theory": {
+                    "continuation_prob_pct": 50.0,
+                    "breakdown_prob_pct": 50.0,
+                },
+            },
             "direction_observation": {
                 "status": "ALIGNED_BULL", "brain_candle_ts_4h": 1000,
                 "trader_candle_ts_4h": 1000, "price_position_in_range": 0.5,
@@ -155,9 +164,15 @@ class _Harness(unittest.TestCase):
                 "request_id": "", "latency_ms": 1}
 
     def run_review(self, mapping: Dict[str, str], **kwargs) -> Dict[str, Any]:
+        package_overrides = kwargs.pop("package_overrides", {})
+        packages = []
+        for key in mapping:
+            package = _pkg(key)
+            package.update(package_overrides.get(key, {}))
+            packages.append(package)
         abt._run_jev_shadow_review(
             standard_cache={k: _cache(k, v) for k, v in mapping.items()},
-            packages=[_pkg(k) for k in mapping],
+            packages=packages,
             time_str="2026-09-26 08:00:00",
             active_positions_detail=kwargs.pop("positions", []),
             position_management=kwargs.pop("management", []),
@@ -584,6 +599,67 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
         self.assertEqual(row["jev_audit_verdict"], "NOT_APPLICABLE")
         self.assertEqual(row["jev_relation_to_main"], "MAIN_WAIT_JEV_ENTRY",
                          "审计不适用不得覆盖独立通道的潜在机会关系")
+
+
+class IndependentMomentumGateTest(_Harness):
+    probabilities = {
+        "edge_present": 0.95,
+        "execution_ready": 0.95,
+        "would_buy_long": 0.90,
+        "would_sell_short": 0.05,
+        "would_wait": 0.20,
+    }
+
+    def test_bear_acceleration_preserves_raw_long_but_effective_action_waits(self):
+        review = self.run_review(
+            {"ETH-USDT-SWAP": "WAIT"},
+            package_overrides={"ETH-USDT-SWAP": {
+                "calculus": {
+                    "valid": True, "regime": "BEAR_ACCELERATING",
+                    "acceleration": -0.4, "power": 0.2,
+                    "power_regime": "KINETIC_ACCELERATING",
+                    "probability_theory": {
+                        "continuation_prob_pct": 20.0,
+                        "breakdown_prob_pct": 80.0,
+                    },
+                },
+            }},
+        )
+        row = review["instrument_reviews"][0]
+        self.assertEqual(row["raw_suggested_action"], "BUY_LONG")
+        self.assertEqual(row["suggested_action"], "WAIT")
+        self.assertEqual(row["jev_action_status"], "code_hard_gate_reject")
+        self.assertFalse(row["momentum_gate_passed"])
+        self.assertEqual(row["momentum_gate_rejection_code"],
+                         "bear_acceleration_blocks_long")
+        self.assertEqual(row["jev_enforcement_decision"], "HARD_VETO")
+        self.assertFalse(row["jev_enforcement_affects_execution"])
+
+    def test_bull_acceleration_preserves_raw_short_but_effective_action_waits(self):
+        self.probabilities = {
+            **self.probabilities,
+            "would_buy_long": 0.05,
+            "would_sell_short": 0.90,
+        }
+        review = self.run_review(
+            {"ETH-USDT-SWAP": "WAIT"},
+            package_overrides={"ETH-USDT-SWAP": {
+                "calculus": {
+                    "valid": True, "regime": "BULL_ACCELERATING",
+                    "acceleration": 0.4, "power": 0.2,
+                    "power_regime": "KINETIC_ACCELERATING",
+                    "probability_theory": {
+                        "continuation_prob_pct": 80.0,
+                        "breakdown_prob_pct": 20.0,
+                    },
+                },
+            }},
+        )
+        row = review["instrument_reviews"][0]
+        self.assertEqual(row["raw_suggested_action"], "SELL_SHORT")
+        self.assertEqual(row["suggested_action"], "WAIT")
+        self.assertEqual(row["momentum_gate_rejection_code"],
+                         "bull_acceleration_blocks_short")
 
 
 class IndependentVoteScaleGuardTest(unittest.TestCase):

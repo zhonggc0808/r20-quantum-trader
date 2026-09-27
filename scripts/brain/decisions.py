@@ -217,6 +217,7 @@ def assemble_decision_cache(
                 "raw_confidence": raw_confidence,
                 "decision_outcome_source": decision_trace.get("outcome_source", "unknown"),
                 "decision_rejection_code": decision_trace.get("rejection_code", ""),
+                "decision_rejection_evidence": decision_trace.get("rejection_evidence", {}),
                 "leverage": ai_leverage,
                 "margin_usdt": ai_margin,
                 "entry_price": entry,

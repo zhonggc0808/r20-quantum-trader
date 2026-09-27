@@ -324,13 +324,15 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
     raw_action = str(decision.get("action", "WAIT") or "WAIT").strip().upper()
 
     def _finish(final_action: str, reason: str, rr: float,
-                outcome_source: str, rejection_code: str) -> tuple[str, str, float]:
+                outcome_source: str, rejection_code: str,
+                rejection_evidence: Optional[dict[str, Any]] = None) -> tuple[str, str, float]:
         # Preserve the public tuple contract; context carries structured telemetry.
         context["_decision_trace"] = {
             "raw_action": raw_action,
             "final_action": final_action,
             "outcome_source": outcome_source,
             "rejection_code": rejection_code,
+            "rejection_evidence": rejection_evidence or {},
         }
         return final_action, reason, rr
 
@@ -375,7 +377,18 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         return _finish("WAIT", quote_reason, rr,
                        "interceptor_reject", quote_code)
 
-    # 3. Non-Bypassable Core Safety Floor: Confidence threshold (per-instrument conf_floor from pool, global default 75%)
+    # 3. Directional momentum veto: do not open against accelerating evidence.
+    from scripts.trader.momentum_gate import evaluate_directional_momentum_gate
+    momentum_passed, momentum_code, momentum_reason, momentum_evidence = (
+        evaluate_directional_momentum_gate(package, raw_action)
+    )
+    if not momentum_passed:
+        return _finish(
+            "WAIT", momentum_reason, rr,
+            "interceptor_reject", momentum_code, momentum_evidence,
+        )
+
+    # 4. Non-Bypassable Core Safety Floor: Confidence threshold (per-instrument conf_floor from pool, global default 75%)
     try:
         conf = float(decision.get("confidence", 0) or 0)
     except (TypeError, ValueError):
@@ -387,7 +400,7 @@ def run_interceptor_pipeline(package: dict[str, Any], decision: dict[str, Any], 
         return _finish("WAIT", f"核心风控拦截：置信度低于安全底线 ({conf:.1f}% < {conf_floor:.1f}%)", rr,
                        "interceptor_reject", "confidence_below_floor")
 
-    # 4. Pipeline Execution across all enabled plugins (with input isolation & fail-closed)
+    # 5. Pipeline Execution across all enabled plugins (with input isolation & fail-closed)
     plugins = list_plugins(create_if_missing=False)
     for p_info in plugins:
         if not p_info.get("enabled"):

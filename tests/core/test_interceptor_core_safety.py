@@ -15,6 +15,7 @@ from scripts.order_risk import (
     validate_quote_geometry_and_rr, validate_quote_geometry_and_rr_detailed,
 )
 import astra_backend.interceptor_manager as im
+from scripts.trader.momentum_gate import evaluate_directional_momentum_gate
 
 
 class CoreRiskAndInterceptorTests(unittest.TestCase):
@@ -141,6 +142,56 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         self.assertEqual(ctx["_decision_trace"]["outcome_source"], "accepted_entry")
         self.assertEqual(ctx["_decision_trace"]["rejection_code"], "")
 
+    def test_directional_momentum_gate_rejects_all_four_countertrend_cases(self):
+        im.save_config({"pipeline_order": [], "enabled": {}})
+        ctx = {"active_inst_ids": set(), "active_position_sides": {}}
+        long_decision = {
+            "action": "BUY_LONG", "confidence": 85.0,
+            "entry_price": 100.0, "take_profit_price": 125.0,
+            "stop_loss_price": 90.0,
+        }
+        short_decision = {
+            "action": "SELL_SHORT", "confidence": 85.0,
+            "entry_price": 100.0, "take_profit_price": 75.0,
+            "stop_loss_price": 110.0,
+        }
+        cases = [
+            (long_decision, {"regime": "BEAR_ACCELERATING"},
+             "bear_acceleration_blocks_long"),
+            (long_decision, {
+                "regime": "MIXED_TRANSITION", "acceleration": -0.31,
+                "probability_theory": {
+                    "continuation_prob_pct": 35.0,
+                    "breakdown_prob_pct": 65.0,
+                },
+            }, "breakdown_dominance_blocks_long"),
+            (short_decision, {"regime": "BULL_ACCELERATING"},
+             "bull_acceleration_blocks_short"),
+            (short_decision, {
+                "regime": "MIXED_TRANSITION", "acceleration": 0.05,
+                "power": 0.01, "power_regime": "STEADY_FLUX",
+            }, "positive_momentum_blocks_short"),
+        ]
+
+        for decision, calculus, rejection_code in cases:
+            with self.subTest(rejection_code=rejection_code):
+                package = {
+                    "instId": "BTC-USDT-SWAP", "data_quality": "valid",
+                    "calculus": calculus,
+                }
+                action, reason, rr = im.run_interceptor_pipeline(
+                    package, decision, ctx)
+                self.assertEqual(action, "WAIT")
+                self.assertTrue(reason)
+                self.assertGreaterEqual(rr, 2.0)
+                self.assertEqual(
+                    ctx["_decision_trace"]["rejection_code"], rejection_code)
+                self.assertEqual(
+                    ctx["_decision_trace"]["rejection_evidence"]["action"],
+                    decision["action"],
+                )
+
+
     def test_pipeline_fail_closed_when_plugin_missing_file_or_entry(self):
         # Configure an enabled plugin that does not exist on disk
         im.save_config({
@@ -191,6 +242,53 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         self.assertEqual(act, "BUY_LONG")
         # Ensure dec was not mutated by the plugin
         self.assertEqual(dec, dec_copy)
+
+
+class DirectionalMomentumGateTests(unittest.TestCase):
+    def test_missing_or_neutral_calculus_does_not_create_a_new_data_gate(self):
+        for package in ({}, {"calculus": {}}, {
+            "calculus": {
+                "regime": "RANGE_LOW_VELOCITY", "acceleration": 0.0,
+                "power": 0.0,
+                "probability_theory": {
+                    "continuation_prob_pct": 50.0,
+                    "breakdown_prob_pct": 50.0,
+                },
+            },
+        }):
+            for action in ("BUY_LONG", "SELL_SHORT", "WAIT"):
+                with self.subTest(package=package, action=action):
+                    passed, code, reason, _evidence = (
+                        evaluate_directional_momentum_gate(package, action)
+                    )
+                    self.assertTrue(passed)
+                    self.assertEqual((code, reason), ("", ""))
+
+    def test_probability_boundary_is_inclusive_but_acceleration_is_strict(self):
+        package = {"calculus": {
+            "regime": "MIXED_TRANSITION", "acceleration": -0.30,
+            "probability_theory": {
+                "continuation_prob_pct": 35.0,
+                "breakdown_prob_pct": 65.0,
+            },
+        }}
+        self.assertTrue(evaluate_directional_momentum_gate(
+            package, "BUY_LONG")[0])
+        package["calculus"]["acceleration"] = -0.3001
+        passed, code, _reason, _evidence = evaluate_directional_momentum_gate(
+            package, "BUY_LONG")
+        self.assertFalse(passed)
+        self.assertEqual(code, "breakdown_dominance_blocks_long")
+
+    def test_bearish_kinetic_acceleration_does_not_block_a_short(self):
+        package = {"calculus": {
+            "regime": "BEAR_ACCELERATING", "acceleration": -0.4,
+            "power": 0.3, "power_regime": "KINETIC_ACCELERATING",
+        }}
+        passed, code, _reason, _evidence = evaluate_directional_momentum_gate(
+            package, "SELL_SHORT")
+        self.assertTrue(passed)
+        self.assertEqual(code, "")
 
 
 if __name__ == "__main__":

@@ -84,6 +84,7 @@ from scripts.direction_observation import (
     enrich_brain_package,
 )
 from scripts.trader.order_lease import record_keep, remove_lease
+from scripts.trader.momentum_gate import evaluate_directional_momentum_gate
 # 结构优化阶段4·B3 第二块：跨所采集/健康度/提示词组装已搬入 scripts/brain/xvenue.py。
 # 依赖面较宽（适配器缝、safe_float、VENUE_HEALTH_FILE、atomic_write_json、_XV_HEALTH），
 # 全部走**调用期注入**，理由见该模块 docstring 与 astra_backend/README.md §5。
@@ -2805,6 +2806,22 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             trader_factor.get("direction_layers") or
             direction_layers(trader_factor.get("calculus"))
         )
+        calculus_source = p.get("calculus") or trader_factor.get("calculus") or {}
+        if not isinstance(calculus_source, Mapping):
+            calculus_source = {}
+        probability_source = calculus_source.get("probability_theory") or {}
+        if not isinstance(probability_source, Mapping):
+            probability_source = {}
+        momentum_calculus = {
+            "regime": calculus_source.get("regime"),
+            "acceleration": calculus_source.get("acceleration"),
+            "power": calculus_source.get("power"),
+            "power_regime": calculus_source.get("power_regime"),
+            "probability_theory": {
+                "continuation_prob_pct": probability_source.get("continuation_prob_pct"),
+                "breakdown_prob_pct": probability_source.get("breakdown_prob_pct"),
+            },
+        }
         matching_side = any(
             _jev_position_side(position) ==
             _jev_shadow_side(main_action)
@@ -2842,6 +2859,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "data_quality": row.get("data_quality"),
             "macro_4h": direction.get("macro_4h"),
             "calculus_regime": direction.get("calculus_regime"),
+            "calculus": momentum_calculus,
             # `trend_4h_bullish` / `trend_4h_bearish` 已删除：这两个键只存在于
             # trader 因子路径（scripts/trader/factors.py），brain package 从不产生，
             # 因此 710/710 行恒为 null —— 白名单在宣称一个永远填不上的字段。
@@ -2968,7 +2986,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         key: proposal.get(key)
         for key in (
             "instId", "cycle_id", "decision_id", "decision_timestamp", "data_quality",
-            "macro_4h", "calculus_regime",
+            "macro_4h", "calculus_regime", "calculus",
             "direction_observation", "direction_layers", "price", "bidPx", "askPx",
             "price_position_in_range", "price_position_basis", "candle_ts_4h",
             # 代码侧的完整性与一致性判定结论。模型被告知「这不是你的事」，
@@ -3379,6 +3397,14 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         # 的成因。等它有足够样本、能按已结算结果标定后，再考虑升级为门槛
         # （方案 §5.1 本就把它定位为「解释维度和门槛」，先做前者）。
 
+        raw_suggested_action = action
+        momentum_passed, momentum_code, momentum_reason, momentum_evidence = (
+            evaluate_directional_momentum_gate(proposal, raw_suggested_action)
+        )
+        if not momentum_passed:
+            action = "WAIT"
+            action_status = "code_hard_gate_reject"
+
         # Mirror the question-side gate: a WAIT proposal has no audit answers, so
         # every flag would be "missing" and the verdict would be a meaningless
         # REJECT. Short-circuit to NOT_APPLICABLE instead of running the flag logic.
@@ -3442,6 +3468,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             audit=audit,
             enforcement=review["enforcement_mode"],
             entry_mode=str(proposal.get("entry_mode") or "initial"),
+            hard_gates_passed=momentum_passed,
             hard_veto_code_only=review.get("hard_veto_code_only", True),
             veto_wait_min_confidence=veto_wait_min_confidence,
             veto_min_margin=veto_min_margin,
@@ -3471,6 +3498,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "edge_probability": edge_probability,
             "execution_ready_probability": _jev_policy_probability(execution_ready),
             "suggested_action": action,
+            "raw_suggested_action": raw_suggested_action,
             "suggested_action_votes": {
                 "BUY_LONG": independent_answers.get(f"{prefix}_would_buy_long"),
                 "SELL_SHORT": independent_answers.get(f"{prefix}_would_sell_short"),
@@ -3482,6 +3510,10 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "jev_raw_max_vote": vote_result.get("raw_max_vote", -1.0),
             "jev_vote_sum": vote_result.get("vote_sum", 0.0),
             "jev_action_status": action_status,
+            "momentum_gate_passed": momentum_passed,
+            "momentum_gate_rejection_code": momentum_code,
+            "momentum_gate_rejection_reason": momentum_reason,
+            "momentum_gate_evidence": momentum_evidence,
             "jev_confidence_threshold": vote_result.get("confidence_threshold", min_confidence),
             "quote_source": "okx",
             "audit_proposal_complete": audit_complete,
