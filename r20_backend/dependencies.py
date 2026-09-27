@@ -15,7 +15,7 @@ from r20_backend.admin_auth import AdminAuthStore
 from r20_backend.okx_client import OKXClient
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+DATA_DIR = ROOT / "data"
 SCRIPTS_DIR = ROOT / "scripts"
 VUE_DIST = ROOT / "frontend" / "dist"
 BACKUP_LOG_FILE = ROOT / "logs" / "r20_backup_manual.log"

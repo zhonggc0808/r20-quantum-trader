@@ -248,8 +248,7 @@ class BaseExchangeAdapter:
         per_contract = price * (spec.ct_val or 1.0)
         if per_contract <= 0:
             return 0.0
-        contracts = int((Decimal(str(notional_usdt)) / Decimal(str(per_contract)))
-                        .to_integral_value(rounding=ROUND_DOWN))
+        contracts = int(round(notional_usdt / per_contract))
         if contracts < int(spec.min_size or 1) or contracts < 1:
             return 0.0
         return float(contracts)

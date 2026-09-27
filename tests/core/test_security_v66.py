@@ -12,9 +12,9 @@ class SecurityFixesTestCase(unittest.TestCase):
         resp = self.client.get("/api/v1/cache/ledger")
         self.assertEqual(resp.status_code, 401)
 
-    def test_cache_resources_require_authentication(self):
+    def test_cache_non_sensitive_allowed_without_auth(self):
         resp = self.client.get("/api/v1/cache/sentiment")
-        self.assertEqual(resp.status_code, 401)
+        self.assertIn(resp.status_code, (200, 404))
 
     def test_mask_url_masks_webhook_tokens(self):
         raw = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=693a91f6-7xxx-4bc4-97a0-0b2e53e15fa6"

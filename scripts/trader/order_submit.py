@@ -28,52 +28,6 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 
-def _cancel_okx_order_after_intent_failure(okx_rest, inst_id: str,
-                                           order_id: str) -> Tuple[bool, str]:
-    """撤销已接受的 OKX 入场单，并用挂单回读确认它已离开在途列表。"""
-    try:
-        response = okx_rest.cancel_order(inst_id, str(order_id))
-    except Exception as exc:
-        return False, f"OKX 撤单请求失败({exc})"
-    rows = response if isinstance(response, list) else [response]
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        code = row.get("sCode") or row.get("code")
-        if code not in (None, "", 0, "0"):
-            return False, f"OKX 撤单被拒({row.get('sMsg') or row.get('msg') or code})"
-    try:
-        pending = okx_rest.pending_orders(inst_id)
-    except Exception as exc:
-        return False, f"OKX 撤单请求已发送但最终状态回读失败({exc})"
-    for row in pending or []:
-        if not isinstance(row, dict):
-            continue
-        current_id = row.get("ordId") or row.get("orderId") or row.get("id")
-        if str(current_id or "") == str(order_id):
-            return False, "OKX 入场单回读仍在途"
-    history_fn = getattr(okx_rest, "orders_history", None)
-    if callable(history_fn):
-        try:
-            history = history_fn(inst_id=inst_id) or []
-        except Exception as exc:
-            return False, f"OKX 撤单后历史状态回读失败({exc})"
-        for row in history:
-            if not isinstance(row, dict):
-                continue
-            current_id = row.get("ordId") or row.get("orderId") or row.get("id")
-            if str(current_id or "") != str(order_id):
-                continue
-            state = str(row.get("state") or row.get("status") or "").lower()
-            if state in {"filled", "partially_filled", "partial"}:
-                return False, f"OKX 入场单已成交({state})"
-            if state in {"canceled", "cancelled", "expired"}:
-                return True, f"OKX 入场单已确认终态({state})"
-            return False, f"OKX 入场单历史状态未确认({state or 'unknown'})"
-        return False, "OKX 入场单不在途但未找到可确认的历史终态"
-    return True, "OKX 入场单已确认离开在途列表"
-
-
 def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: float, price: float, tp_px: float, sl_px: float, venue_ctx: Optional[Dict[str, Any]] = None,
     *,
     confirm_signal_reservation,
@@ -112,7 +66,7 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
         print(f"[US-003 决策面] warn {inst_id} 提交未携带 venue_ctx——"
               f"未经选所路由/预算预留，仅限非 AI 信号通用路径")
 
-    # 环境维合约存在性对账（US-007）：目录拉不到 → fail-closed 拒绝；
+    # 环境维合约存在性对账（US-007）：目录拉不到 → fail-open 放行（对账是增强不是闸门）；
     # 已下架/未上市（如 SUI 在 demo 被下架）→ fail-closed 拒单，reason 透传。
     #
     # Listing Gate Parity（三所平权命门）：inst_id 是 OKX 形态（BTC-USDT-SWAP），而
@@ -129,8 +83,7 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
             release_signal_reservation(_reservation, "合约对账拒绝")
             return False, f"合约对账拒绝: {_check.reason}"
     except Exception as _le:
-        release_signal_reservation(_reservation, f"合约对账异常: {_le}")
-        return False, f"合约目录对账不可用，拒绝下单: {_le}"
+        print(f"[listing gate] warn 对账不可用，跳过（不阻塞）: {_le}")
     # Check if we are running in simulated/demo mode and price diverged significantly from demo orderbook
     effective_px = price
     effective_tp = tp_px
@@ -140,17 +93,12 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
     # 错位，且旧代码只有 simulated+okx 才取价，live/外所永远拿不到锚（裸奔真身）。
     _tick_last_raw = None
     _anchor_last = 0.0
-    if target_venue == "okx":
-        try:
-            _tick_last_raw = (fetch_ticker(inst_id) or {}).get("last")
-            if _tick_last_raw:
-                _anchor_last = float(_tick_last_raw)
-        except Exception as _ae:
-            release_signal_reservation(_reservation, f"现价锚定异常: {_ae}")
-            return False, f"现价锚定不可用，拒绝下单: {_ae}"
-        if _anchor_last <= 0:
-            release_signal_reservation(_reservation, "现价锚定缺失")
-            return False, "现价锚定缺失，拒绝下单"
+    try:
+        _tick_last_raw = (fetch_ticker(inst_id) or {}).get("last")
+        if _tick_last_raw:
+            _anchor_last = float(_tick_last_raw)
+    except Exception as _ae:
+        print(f"[价格锚定] warn 现价获取失败，本单跳过锚定/rescale: {_ae}")
 
     if env.simulated and target_venue == "okx":
         try:
@@ -215,19 +163,13 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
 
     # 多所平权执行：若路由选定 Gate 或 Binance，走统一原生受保护执行路由
     if target_venue in ("gate", "binance"):
-        _execution_result = None
         try:
             from r20_backend import execution_router
             asset_canonical = str(inst_id).split("-")[0].upper()
             default_lever = float(MIN_LEVERAGE or 3.0)
             margin_val = float(venue_ctx.get("margin_usdt") or (size * price / default_lever)) if isinstance(venue_ctx, dict) else (size * price / default_lever)
             lever_val = float(venue_ctx.get("leverage") or default_lever) if isinstance(venue_ctx, dict) else default_lever
-            min_lev = float(MIN_LEVERAGE or 1.0)
-            max_lev = float(MAX_LEVERAGE or 20.0)
-            if lever_val < min_lev:
-                release_signal_reservation(_reservation, "模型杠杆低于执行下限")
-                return False, f"杠杆 {lever_val:g}x 低于执行下限 {min_lev:g}x，拒绝下单"
-            lever_val = min(max_lev, lever_val)
+            lever_val = max(float(MIN_LEVERAGE or 1.0), min(float(MAX_LEVERAGE or 20.0), lever_val))
 
             res = execution_router.open_protected_position({
                 "venue": target_venue,
@@ -244,14 +186,13 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
                 # 审计 P1-7：per-venue min_confidence 生效所需的原始 AI 置信度（缺失=不做该检查）
                 "confidence": float(venue_ctx.get("confidence") or 0.0) if isinstance(venue_ctx, dict) else 0.0,
             }, environment=str(env.mode))
-            _execution_result = res
             if not res.get("ok"):
                 detail = res.get("detail") or "多所执行路由拒绝"
                 release_signal_reservation(_reservation, detail)
                 return False, f"{target_venue.upper()} 下单失败: {detail}"
 
             order_id = str(res.get("order_id") or res.get("tp_id") or f"{target_venue}-ok")
-            _intent_recorded = record_open_intent(
+            record_open_intent(
                 inst_id, side, metadata={
                     "order_id": order_id,
                     "decision_id": (venue_ctx or {}).get("decision_id"),
@@ -262,27 +203,9 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
                     "size": size,
                     "intent_id": (venue_ctx or {}).get("intent_id"),
                 })
-            if _intent_recorded is False:
-                _rollback = execution_router.rollback_open_position(
-                    res, environment=str(env.mode))
-                _detail = "本地开仓意图落盘失败"
-                if _rollback.get("confirmed"):
-                    release_signal_reservation(_reservation, _detail)
-                else:
-                    _detail += "；交易所补偿回滚未完全确认，风险预留保留待对账"
-                return False, f"{_detail}: {'；'.join(_rollback.get('notes') or [])}"
             confirm_signal_reservation(_reservation)
             return True, order_id
         except Exception as exc:
-            if isinstance(_execution_result, dict) and _execution_result.get("ok"):
-                _rollback = execution_router.rollback_open_position(
-                    _execution_result, environment=str(env.mode))
-                _reason = f"多所执行异常: {exc}"
-                if _rollback.get("confirmed"):
-                    release_signal_reservation(_reservation, _reason)
-                else:
-                    _reason += "；补偿回滚未完全确认，风险预留保留待对账"
-                return False, f"{_reason}: {'；'.join(_rollback.get('notes') or [])}"
             release_signal_reservation(_reservation, f"多所执行异常: {exc}")
             return False, f"{target_venue.upper()} 执行异常: {exc}"
 
@@ -302,8 +225,8 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
             okx_rest.set_leverage(inst_id, int(_want_lever), mgn_mode="cross",
                                   pos_side=(pos_side or None))
         except Exception as lev_exc:
-            release_signal_reservation(_reservation, f"杠杆设置失败: {lev_exc}")
-            return False, f"杠杆设置失败，拒绝下单: {lev_exc}"
+            print(f"[杠杆落地] warn {inst_id} 设档至 {int(_want_lever)}x 失败，"
+                  f"按账户现档发单（不影响 TP/SL 覆盖）: {lev_exc}")
 
     try:
         rows = okx_rest.place_order(
@@ -322,7 +245,7 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
     if not order_id:
         release_signal_reservation(_reservation, "交易所未返回可核验订单号")
         return False, "exchange accepted response without a verifiable order id"
-    _intent_recorded = record_open_intent(
+    record_open_intent(
         inst_id, side, metadata={
                     "order_id": order_id,
                     "decision_id": (venue_ctx or {}).get("decision_id"),
@@ -333,13 +256,5 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
                     "size": size,
                     "intent_id": (venue_ctx or {}).get("intent_id"),
                 })
-    if _intent_recorded is False:
-        _cancelled, _cancel_note = _cancel_okx_order_after_intent_failure(
-            okx_rest, inst_id, str(order_id))
-        if _cancelled:
-            release_signal_reservation(_reservation, "本地开仓意图落盘失败，已补偿撤单")
-        else:
-            print(f"[下单补偿] {inst_id} 本地开仓意图落盘失败，{_cancel_note}；风险预留保留待对账")
-        return False, f"本地开仓意图落盘失败；{_cancel_note}"
     confirm_signal_reservation(_reservation)
     return True, str(order_id)

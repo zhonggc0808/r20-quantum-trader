@@ -342,8 +342,8 @@ class RouterMarginClampTests(_SandboxBase):
         self.assertTrue(r["ok"], r.get("detail"))
         self.assertEqual(r["margin_usdt"], 200.0)
         self.assertEqual(r["margin_clamped_from_usdt"], 5000.0)
-        # 200U × 3x = 600U 名义 @79000、每张面值 0.0001 → 75.94 → 向下取整 75 张
-        self.assertEqual([c for c in ad.calls if c[0] == "place"][0][3], 75)
+        # 200U × 3x = 600U 名义 @79000、每张面值 0.0001 → 75.95 → 76 张
+        self.assertEqual([c for c in ad.calls if c[0] == "place"][0][3], 76)
 
     def test_router_applies_absolute_cap_even_without_caller_cap(self):
         ad = self._stub_adapter()

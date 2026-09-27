@@ -7,9 +7,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import os
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+DATA_DIR = ROOT / "data"
 ARCHIVE_DIR = DATA_DIR / "policy_archives"
 ARCHIVE_INDEX_FILE = ARCHIVE_DIR / "index.json"

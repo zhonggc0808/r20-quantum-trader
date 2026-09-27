@@ -112,18 +112,9 @@ class RiskReservationManager:
             "WHERE account_key = ? AND released = 0", (key_str,)).fetchone()
         return float(row[0] or 0.0)
 
-    @staticmethod
-    def _active_total_for_environment(conn, environment: str) -> float:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(amount_usdt), 0) FROM risk_reservations "
-            "WHERE environment = ? AND released = 0", (str(environment),)).fetchone()
-        return float(row[0] or 0.0)
-
     # ---- 核心原子预留 ----
     def reserve(self, account_key, intent_id: str, amount_usdt: float,
-                state: str, total_limit_usdt: Optional[float] = None,
-                portfolio_limit_usdt: Optional[float] = None,
-                portfolio_environment: Optional[str] = None) -> dict:
+                state: str, total_limit_usdt: Optional[float] = None) -> dict:
         """原子预留/状态推进。同 (account_key, intent_id) 幂等：
         - 新意图：state 须为占用态（pending/partial/unknown），预算足够则插入，
           越界抛 ReservationExceeded；
@@ -161,14 +152,6 @@ class RiskReservationManager:
                             raise ReservationExceeded(
                                 f"预算越界: 已占 {cur_total} + 新增 {amount_usdt} "
                                 f"> 上限 {limit} (account_key={key_str})")
-                    if portfolio_limit_usdt is not None:
-                        env = str(portfolio_environment or environment)
-                        portfolio_total = self._active_total_for_environment(conn, env)
-                        if portfolio_total + amount_usdt > float(portfolio_limit_usdt) + 1e-9:
-                            conn.rollback()
-                            raise ReservationExceeded(
-                                f"组合预算越界: 环境 {env} 已占 {portfolio_total} + 新增 {amount_usdt} "
-                                f"> 上限 {portfolio_limit_usdt}")
                     conn.execute(
                         "INSERT INTO risk_reservations "
                         "(account_key, venue, environment, intent_id, amount_usdt, state, released)"
@@ -188,15 +171,6 @@ class RiskReservationManager:
                             raise ReservationExceeded(
                                 f"预算越界: 其他占用 {others} + 调整后 {new_amount} "
                                 f"> 上限 {limit} (account_key={key_str})")
-                    if portfolio_limit_usdt is not None:
-                        env = str(portfolio_environment or environment)
-                        portfolio_others = (self._active_total_for_environment(conn, env)
-                                            - float(row["amount_usdt"]))
-                        if portfolio_others + new_amount > float(portfolio_limit_usdt) + 1e-9:
-                            conn.rollback()
-                            raise ReservationExceeded(
-                                f"组合预算越界: 环境 {env} 其他占用 {portfolio_others} + 调整后 {new_amount} "
-                                f"> 上限 {portfolio_limit_usdt}")
                     if state in TERMINAL_STATES:
                         conn.execute(
                             "UPDATE risk_reservations SET amount_usdt = ?, state = ?, "
@@ -348,31 +322,22 @@ class RiskReservationManager:
 
 # ---- 模块级默认实例（对齐 db_manager 的模块级 DB_PATH 用法）----
 #: 默认落点跟随 data/（生产）；测试一律自建 manager 传临时路径，绝不写 data/**
-def _default_db_path() -> str:
-    """按调用时环境解析默认库，避免沙箱/实例复用生产数据库。"""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_dir = os.environ.get("R20_DATA_DIR") or os.path.join(root, "data")
-    return os.path.join(data_dir, "risk_reservation.db")
-
-
-# 保留公开常量兼容旧调用方；默认管理器实际使用上面的动态解析函数。
-DEFAULT_DB_PATH = _default_db_path()
+DEFAULT_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "risk_reservation.db")
 
 _default_manager: Optional[RiskReservationManager] = None
 _default_manager_lock = threading.Lock()
-_default_manager_path: Optional[str] = None
 
 
 def get_manager(db_path: Optional[str] = None,
                 total_limit_usdt: Optional[float] = None) -> RiskReservationManager:
     """取默认管理器（db_path 缺省 DEFAULT_DB_PATH）；传 db_path 则返回独立实例。"""
-    global _default_manager, _default_manager_path
+    global _default_manager
     if db_path is not None:
         return RiskReservationManager(db_path, total_limit_usdt)
-    resolved_path = _default_db_path()
     with _default_manager_lock:
-        if _default_manager is None or _default_manager_path != resolved_path:
-            _default_manager = RiskReservationManager(resolved_path,
+        if _default_manager is None:
+            _default_manager = RiskReservationManager(DEFAULT_DB_PATH,
                                                       total_limit_usdt)
-            _default_manager_path = resolved_path
         return _default_manager

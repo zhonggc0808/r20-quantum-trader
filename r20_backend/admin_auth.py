@@ -13,8 +13,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
-DB_PATH = DATA_DIR / "r20_admin.db"
+DB_PATH = ROOT / "data" / "r20_admin.db"
 BJ_TZ = timezone(timedelta(hours=8))
 PBKDF2_ITERATIONS = 600_000
 SESSION_SECONDS = 12 * 60 * 60

@@ -62,41 +62,6 @@ def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None
         print(f"[挂单对账] 记录开仓意图失败（不影响本单交易）: {e}")
 
 
-def record_open_intent_checked(inst_id: str, side: str, ts_ms: int = None, metadata=None, *,
-                               OPEN_INTENT_FILE: str, OPEN_INTENT_TTL_MS: int) -> bool:
-    """写入并验证本地开仓意图。
-
-    ``record_open_intent`` 保留历史的 best-effort 兼容语义；下单主路径需要知道
-    写盘是否真正完成，才能在交易所已接受订单时执行补偿撤单。因此这里复用写入
-    实现后按订单/意图 ID 回读确认，读取失败或找不到刚写入的记录都返回 False。
-    """
-    record_open_intent(inst_id, side, ts_ms, metadata,
-                       OPEN_INTENT_FILE=OPEN_INTENT_FILE,
-                       OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS)
-    try:
-        with open(OPEN_INTENT_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        if not isinstance(rows, list):
-            return False
-        expected_order_id = str((metadata or {}).get("order_id") or "")
-        expected_intent_id = str((metadata or {}).get("intent_id") or "")
-        for row in reversed(rows):
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("instId")) != str(inst_id):
-                continue
-            if str(row.get("side", "")).lower() != str(side).lower():
-                continue
-            if expected_order_id and str(row.get("order_id") or "") != expected_order_id:
-                continue
-            if expected_intent_id and str(row.get("intent_id") or "") != expected_intent_id:
-                continue
-            return True
-    except Exception as exc:
-        print(f"[挂单对账] 验证开仓意图失败: {exc}")
-    return False
-
-
 
 def record_trade(trade_data, *, LEDGER_JSON_FILE: str, _atomic_write_json,
                  record_trade_sqlite, current_environment, __version__: str):

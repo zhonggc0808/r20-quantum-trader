@@ -117,8 +117,7 @@ def admin_test_council_debate(payload: CouncilTestRequest, x_r20_session: str | 
         snap_ts = ""
         instruments = []
         try:
-            from r20_backend.dependencies import DATA_DIR
-            factor_snap_file = DATA_DIR / "factor_library_snapshot.json"
+            factor_snap_file = ROOT / "data" / "factor_library_snapshot.json"
             if factor_snap_file.is_file():
                 payload_snap = json.loads(factor_snap_file.read_text(encoding="utf-8"))
                 if isinstance(payload_snap, dict):

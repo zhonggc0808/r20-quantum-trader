@@ -175,7 +175,7 @@ async function downloadArchive(archiveName: string) {
   toast.ok(t('admin.backup.connecting', undefined, { file: clean }))
 
   const token = auth.token || localStorage.getItem('r20.admin.session.id') || ''
-  const directUrl = `/api/v1/admin/backups/download/${encodeURIComponent(clean)}`
+  const directUrl = `/api/v1/admin/backups/download/${encodeURIComponent(clean)}${token ? `?token=${encodeURIComponent(token)}` : ''}`
 
   try {
     // 双通道策略 1：通过 Fetch Blob 在内存中获取并检查状态

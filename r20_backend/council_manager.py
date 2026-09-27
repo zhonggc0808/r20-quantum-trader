@@ -67,7 +67,7 @@ from r20_backend.file_locks import file_lock
 _BJ = timezone(timedelta(hours=8))
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+DATA_DIR = ROOT / "data"
 COUNCIL_CONFIG_FILE = DATA_DIR / "council_config.json"
 
 # 审计 P2-14：CIO 裁决最低预算（秒）——唯一会被真正执行的输出

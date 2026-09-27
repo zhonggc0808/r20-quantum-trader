@@ -10,7 +10,7 @@ from r20_gateway.events import GatewayEvent
 from r20_gateway.store import GatewayStore
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = Path(os.environ.get("R20_GATEWAY_DB") or (Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "r20_gateway.db"))
+DB_PATH = Path(os.environ.get("R20_GATEWAY_DB", ROOT / "data" / "r20_gateway.db"))
 
 
 def publish(

@@ -10,7 +10,7 @@ from typing import Any
 
 from .config import ROOT
 
-BASELINE_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "account_initial_state.json"
+BASELINE_FILE = ROOT / "data" / "account_initial_state.json"
 BJ_TZ = timezone(timedelta(hours=8))
 DEFAULT_CAPITAL = 10_000.0
 MIN_CAPITAL = 1.0

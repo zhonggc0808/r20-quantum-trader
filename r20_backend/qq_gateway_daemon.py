@@ -36,7 +36,7 @@ RUNNING = True
 # check-then-act，并发调用（前端轮询/测试/多 worker）会同时 spawn 一批 daemon，
 # 每个都持有一条 QQ 官方网关长连接（实测曾积累 111 个孤儿、3.4GB RSS）。
 # 这里用 flock 兜底：fd 永不关闭，进程退出（含崩溃）自动释放；抢不到锁的实例立即退出。
-LOCK_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / ".qq_gateway_daemon.lock"
+LOCK_FILE = ROOT / "data" / ".qq_gateway_daemon.lock"
 _LOCK_FD: Optional[int] = None
 
 

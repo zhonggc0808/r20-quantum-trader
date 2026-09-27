@@ -103,7 +103,6 @@ from scripts.trader.order_lifecycle import (
 )
 from scripts.trader.ledger_writer import (
     record_open_intent as _ledger_writer_intent,
-    record_open_intent_checked as _ledger_writer_intent_checked,
     record_trade as _ledger_writer_trade,
 )
 from scripts.trader.signal_snapshot import (
@@ -204,7 +203,7 @@ from risk_constants import (
 )
 
 WORKSPACE_DIR = str(_PROJECT_ROOT)
-DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
 LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
@@ -622,11 +621,11 @@ RECONCILE_REASON_SIDE_MISMATCH = "方向不一致"
 RECONCILE_REASON_INTENT_STALE = "周期意图已失效"
 
 
-def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None) -> bool:
+def record_open_intent(inst_id: str, side: str, ts_ms: int = None, metadata=None) -> None:
     """壳（第八十三刀搬至 `scripts/trader/ledger_writer.py`，调用期同名注入）。"""
-    return _ledger_writer_intent_checked(inst_id, side, ts_ms, metadata,
-                                         OPEN_INTENT_FILE=OPEN_INTENT_FILE,
-                                         OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS)
+    return _ledger_writer_intent(inst_id, side, ts_ms, metadata,
+                                 OPEN_INTENT_FILE=OPEN_INTENT_FILE,
+                                 OPEN_INTENT_TTL_MS=OPEN_INTENT_TTL_MS)
 
 def load_open_intents() -> List[Dict[str, Any]]:
     """读取原始本地开仓意图（不做 TTL 过滤，过期判定交给对账语义分层）。"""
@@ -792,6 +791,7 @@ def reservation_manager():
     """
     budget = portfolio_risk_budget_usdt()
     return risk_reservation.get_manager(
+        db_path=risk_reservation.DEFAULT_DB_PATH,
         total_limit_usdt=budget if budget > 0 else None)
 
 

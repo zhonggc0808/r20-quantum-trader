@@ -157,12 +157,12 @@ class ListingGateTest(unittest.TestCase):
         self.assertEqual(second.source, "cache")
         self.assertEqual(len(net.requests), 1)  # TTL 内二次调用零出网
 
-    def test_09_fetch_failure_fail_closed(self):
+    def test_09_fetch_failure_fail_open(self):
         net = _FakeNet([TimeoutError("network down")])
         self.mock_urlopen.side_effect = net
         chk = ensure_contract_listed("okx", "live", "SUI-USDT-SWAP")
-        self.assertFalse(chk.ok)
-        self.assertIn("拒绝发送", chk.reason)
+        self.assertTrue(chk.ok)  # fail-open：不阻塞交易
+        self.assertEqual(chk.reason, "行情目录不可用，跳过对账")
 
     def test_10_ttl_expiry_refetches(self):
         net = _FakeNet([OKX_LIVE, OKX_DELISTED])

@@ -2,8 +2,6 @@
 from __future__ import annotations
 import time
 from pathlib import Path
-import os
-
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +21,7 @@ def agent_statuses(job_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         latest_by_job.setdefault(str(run.get("job_name")), run)
     result = []
     for agent in AGENTS:
-        output = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / agent["output"] if agent["output"] else None
+        output = ROOT / "data" / agent["output"] if agent["output"] else None
         age = max(0, int(time.time() - output.stat().st_mtime)) if output and output.exists() else None
         run = latest_by_job.get(agent["job"], {})
         health = "healthy"

@@ -1,13 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useI18n } from '../composables/useI18n'
-import { useAuthStore } from './auth'
 import type { DashboardResponse, InstrumentFactor, PositionItem, PendingOrderItem } from '../types/dashboard'
 
 export const useDashboardStore = defineStore('dashboard', () => {
   // 批 76：回落文案改走 i18n（useI18n 只读模块级 locale ref，在 store 作用域调用是安全的）
   const { t } = useI18n()
-  const auth = useAuthStore()
   const activeTab = ref<'trading' | 'factors' | 'news' | 'lab' | 'history'>('trading')
   const data = ref<DashboardResponse | null>(null)
   const loading = ref<boolean>(false)
@@ -98,7 +96,6 @@ export const useDashboardStore = defineStore('dashboard', () => {
       const resp = await fetch(`/api/all?_t=${Date.now()}`, {
         headers: {
           'Accept-Encoding': 'gzip, deflate, br',
-          ...(auth.token ? { 'X-R20-Session': auth.token } : {}),
         },
       })
       if (!resp.ok) {

@@ -11,9 +11,8 @@ from typing import Mapping
 from cryptography.fernet import Fernet, InvalidToken
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
-KEY_FILE = DATA_DIR / ".r20_secret_key"
-STORE_FILE = DATA_DIR / "r20_secrets.enc"
+KEY_FILE = ROOT / "data" / ".r20_secret_key"
+STORE_FILE = ROOT / "data" / "r20_secrets.enc"
 SECRET_KEYS = {
     "OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE",
     "OKX_LIVE_API_KEY", "OKX_LIVE_SECRET_KEY", "OKX_LIVE_PASSPHRASE",

@@ -48,7 +48,6 @@
 | `okx_runtime.py` | 87 | OKX 实盘/模拟盘凭证的单一来源 |
 | `sync_full_ledger.py` | 724 | OKX 持仓历史 → 本地台账同步 |
 | `archive_ledger.py` | 198 | 台账分片归档（**默认 dry-run**） |
-| `jev_shadow_evaluator.py` | 950 | Jev 影子复核样本关联、成熟度与收益评估（只读） |
 | `risk_constants.py` | 175 | 执行层风控参数单一事实源 |
 | `policy_snapshot.py` | 53 | 策略快照代理模块 |
 | `evolution_shield.py` | 551 | 演化盾：防投毒认知守护 |

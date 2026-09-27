@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEDULE_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "notification_schedule.json"
+SCHEDULE_FILE = ROOT / "data" / "notification_schedule.json"
 DEFAULT_SCHEDULE = {
     "timezone": "Asia/Shanghai",
     "briefing_times": ["08:00", "20:00"],

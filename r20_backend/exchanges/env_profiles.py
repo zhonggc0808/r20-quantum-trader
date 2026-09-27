@@ -32,7 +32,7 @@ from .base import ExchangeCapabilityError
 
 ROOT = Path(__file__).resolve().parents[2]
 #: 选择结果持久化文件（测试必须 patch 本模块属性钉到临时目录）
-PROFILE_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "venue_env_profile.json"
+PROFILE_FILE = ROOT / "data" / "venue_env_profile.json"
 
 PROBE_PATH = "/api/v4/futures/usdt/contracts"   # Gate 公共端点：无凭证、只读
 PROBE_TIMEOUT_SECONDS = 4.0

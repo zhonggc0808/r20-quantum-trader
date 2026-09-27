@@ -82,7 +82,7 @@ from fastapi.templating import Jinja2Templates
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 仓库根
 DASHBOARD_DIR = os.path.join(BASE_DIR, "r20_backend")                    # 本包（模板/静态资源所在）
 WORKSPACE_DIR = BASE_DIR
-DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
 LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
@@ -516,72 +516,30 @@ start_dashboard_background_worker()
 # /favicon.svg 四条路由）搬到 r20_backend/web_shell.py 与 routers/dashboard.py。
 # 本文件自此是**纯库**：提供实现，不持有 app。
 
-def public_dashboard_payload(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the intentionally small anonymous dashboard projection.
-
-    The live cache contains account balances, positions, prompts, model traces and
-    strategy memory. It must never be treated as a public API response. Keep the
-    public projection explicit so adding a private field to CACHE_DATA cannot leak it
-    by accident.
-    """
-    health = data.get("data_health") if isinstance(data.get("data_health"), dict) else {}
-    public_factors = []
-    for raw in data.get("factors") or []:
-        if not isinstance(raw, dict):
-            continue
-        row = {}
-        for key in (
-            "instId", "name", "price", "bidPx", "askPx", "chg24h", "vol24h",
-            "adx_1h", "atr_1h", "atr_pct", "volatility_regime", "macro_4h",
-            "market_data_valid", "data_quality",
-        ):
-            if key in raw:
-                row[key] = raw[key]
-        public_factors.append(row)
-    return {
-        "public_view": True,
-        "timestamp": data.get("timestamp"),
-        "date": data.get("date"),
-        "data_health": {
-            "status": health.get("status", "UNKNOWN"),
-            "partial": bool(health.get("partial")),
-            "timezone": health.get("timezone", "Asia/Shanghai"),
-            "cycle_minutes": health.get("cycle_minutes"),
-        },
-        "market_regime": data.get("market_regime"),
-        "factors": public_factors,
-        "news_intelligence": {"available": bool(data.get("news_intelligence"))},
-        "account": {},
-        "positions": [],
-        "positions_summary": {"total": 0, "active_count": 0, "items": []},
-        "pending_orders": [],
-        "_meta": {"private_fields": "omitted", "authentication": "required for full dashboard"},
-    }
-
-
-async def get_all_data(full: bool = False, public: bool = False):
+async def get_all_data(full: bool = False):
     global CACHE_DATA, LAST_CACHE_TIME
+    # Return pre-warmed in-memory snapshot immediately (<1ms)
     if not CACHE_DATA or time.time() - LAST_CACHE_TIME > 5.0:
         data = await refresh_cache_if_needed(1.5)
     else:
         data = CACHE_DATA
-    if public:
-        payload = public_dashboard_payload(data)
-        headers = {"Cache-Control": "public, max-age=5, s-maxage=5"}
-    else:
-        payload = data if full else slim_payload(data)
-        headers = {"Cache-Control": "private, no-store, max-age=0"}
-    return JSONResponse(payload, headers=headers)
+    # 审计#1：默认瘦身（省略项在 _meta.omitted 里逐项留痕）；full=1 与旧版逐字节一致
+    payload = data if full else slim_payload(data)
+    # Realtime data: strictly never cache in browser (max-age=0), micro-cache at edge for 2s with fast revalidation
+    return JSONResponse(
+        payload,
+        headers={"Cache-Control": "public, max-age=0, s-maxage=2, stale-while-revalidate=5"},
+    )
 
 
-async def get_overview(public: bool = False):
+async def get_overview():
     global CACHE_DATA, LAST_CACHE_TIME
     if not CACHE_DATA or time.time() - LAST_CACHE_TIME > 12.0:
         data = await refresh_cache_if_needed(2.5)
     else:
         data = CACHE_DATA
-    if public:
-        return JSONResponse(public_dashboard_payload(data),
-                            headers={"Cache-Control": "public, max-age=5, s-maxage=5"})
-    return JSONResponse(data, headers={"Cache-Control": "private, no-store, max-age=0"})
+    return JSONResponse(
+        data,
+        headers={"Cache-Control": "public, max-age=1, s-maxage=3, stale-while-revalidate=5"},
+    )
 

@@ -43,22 +43,19 @@ if [ ! -f "data/instrument_pool.json" ]; then
     fi
 fi
 
-# 4. Ensure frontend dependencies exist, then build when the production bundle is absent.
-# A checked-in dist directory must not hide missing Vue dependencies from tests or
-# development commands. `npm ci` uses package-lock.json for reproducibility.
-if [ ! -d "frontend/node_modules" ] || [ ! -d "frontend/dist" ]; then
-    echo "📦 Preparing Vue 3 frontend dependencies..."
+# 4. Check Node.js and build frontend if dist doesn't exist
+if [ ! -d "frontend/dist" ]; then
+    echo "📦 Frontend production bundle not detected. Building Vue 3 SPA..."
     if command -v npm &> /dev/null; then
         cd frontend
-        npm ci
+        npm install
         npm run build
         cd "$ROOT_DIR"
     else
-        echo "⚠️ Warning: npm is not installed. Please run 'cd frontend && npm ci && npm run build'."
+        echo "⚠️ Warning: npm is not installed. Please build frontend manually via 'cd frontend && npm install && npm run build'."
     fi
 fi
 
 # 5. Start Backend Engine
-echo "✨ Launching R20 Quantum Trader on http://${DASHBOARD_HOST:-127.0.0.1}:${DASHBOARD_PORT:-8080} ..."
-export R20_GATEWAY_EMBEDDED="${R20_GATEWAY_EMBEDDED:-1}"
-exec "$PYTHON_BIN" -m uvicorn r20_backend.app:app --host "${DASHBOARD_HOST:-127.0.0.1}" --port "${DASHBOARD_PORT:-8080}"
+echo "✨ Launching R20 Quantum Trader on http://0.0.0.0:8080 ..."
+exec "$PYTHON_BIN" -m uvicorn r20_backend.app:app --host 0.0.0.0 --port 8080

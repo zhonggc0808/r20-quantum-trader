@@ -23,11 +23,8 @@ router = APIRouter(tags=["exchanges"])
 
 
 @router.get("/api/v1/account/positions")
-def positions(
-    x_r20_admin_token: str | None = Header(default=None),
-    x_r20_session: str | None = Header(default=None, alias="X-R20-Session"),
-) -> dict[str, Any]:
-    require_admin_header(x_r20_admin_token, x_r20_session)
+def positions(x_r20_admin_token: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin_header(x_r20_admin_token)
     from scripts.okx_runtime import current_environment
     from r20_backend.dependencies import okx
     env = current_environment()

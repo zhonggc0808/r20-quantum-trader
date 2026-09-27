@@ -25,7 +25,7 @@ logger = logging.getLogger("r20_interceptors")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PLUGINS_DIR = ROOT_DIR / "plugins" / "interceptors"
-CONFIG_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT_DIR / "data")) / "interceptor_plugins.json"
+CONFIG_FILE = ROOT_DIR / "data" / "interceptor_plugins.json"
 
 DEFAULT_ORDER = [
     "01_macro_trend_filter.py",

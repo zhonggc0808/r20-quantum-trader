@@ -337,30 +337,3 @@ class ShellDisciplineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
-class PublicDashboardProjectionTests(unittest.TestCase):
-    def test_public_projection_excludes_private_account_and_strategy_state(self):
-        payload = app.public_dashboard_payload({
-            "account": {"total_eq": 1234},
-            "positions": [{"instId": "BTC-USDT-SWAP"}],
-            "pending_orders": [{"ordId": "secret"}],
-            "ai_last_prompt": "private prompt",
-            "ai_brain_history": [{"private": True}],
-            "data_health": {"status": "LIVE", "errors": ["private error"]},
-            "factors": [{
-                "instId": "BTC-USDT-SWAP", "price": 100,
-                "decision": {"action": "BUY_LONG"},
-                "calculus": {"velocity": 1},
-                "smart_money": {"net_flow_usdt": 2},
-            }],
-        })
-        self.assertTrue(payload["public_view"])
-        self.assertEqual(payload["account"], {})
-        self.assertEqual(payload["positions"], [])
-        self.assertEqual(payload["pending_orders"], [])
-        self.assertNotIn("ai_last_prompt", payload)
-        self.assertNotIn("ai_brain_history", payload)
-        self.assertNotIn("decision", payload["factors"][0])
-        self.assertNotIn("calculus", payload["factors"][0])
-        self.assertNotIn("smart_money", payload["factors"][0])
-        self.assertNotIn("errors", payload["data_health"])

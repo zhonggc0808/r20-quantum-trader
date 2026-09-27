@@ -3,7 +3,6 @@
 > 分支：`refactor/phase4-frontend-modernization`　收口日期：2026-09-15（Asia/Shanghai）
 > 完整逐刀记录（118 刀、约 1.2 万行）：`plan_local/R20_STRUCTURE_OPTIMIZATION_20260914.md`（本地 gitignore）
 > 本文件是**对外的收口说明**：量化结果、问题清单状态、目录约定、后续维护须知。
-> 验证矩阵是 2026-09-15 的历史快照；每次交易链路改动后必须以当前全量回归结果为准。
 
 ## 1. 一句话结论
 

@@ -17,7 +17,7 @@ from r20_backend.execution.cooldowns import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+DATA_DIR = ROOT / "data"
 NEWS_SENTIMENT_FILE = DATA_DIR / "news_sentiment.json"
 CIRCUIT_BREAKER_FILE = DATA_DIR / "circuit_breaker.json"
 LEDGER_JSON_FILE = DATA_DIR / "trading_ledger.json"

@@ -236,23 +236,7 @@ def route_and_reserve_signal(inst_id: str, side: str, size: float, price: float,
     # 幂等豁免：同 (account_key, intent) 重提不是新增占用（reserve 底层本就幂等），
     # 需从 gross_exposure 扣回该 intent 已占额，否则重试会被总闸误杀。
     intent = str(intent_id or f"{inst_id}:{side}:{int(time.time())}")
-    # 风险身份必须使用目标交易所的凭证代际。OKX 的环境指纹只能标识 OKX，
-    # 不能拿来代表 Gate/Binance，否则外所换钥匙后旧预留会和新账户混在一起。
-    try:
-        from r20_backend.exchanges import venue_credentials
-        from r20_backend.exchanges.identity import credential_fingerprint
-        if venue == "okx":
-            # OKX is the frozen environment owner for the legacy trader path.
-            target_fingerprint = str(env.fingerprint)
-        else:
-            target_api_key, _ = venue_credentials(venue, environment)
-            target_fingerprint = credential_fingerprint(target_api_key)
-    except Exception as exc:
-        persist_venue_decision(inst_id, {**payload, "outcome": "identity_error",
-                                         "skip_reason": f"无法确认 {venue} 账户身份: {exc}"})
-        return {"ok": False, "error": f"无法确认 {venue} 账户身份（fail-closed）: {exc}",
-                "venue": venue, "decision": payload, "reservation": None}
-    account_key = (venue, environment, target_fingerprint)
+    account_key = (venue, environment, str(env.fingerprint))
     _prior_same_intent = 0.0
     if budget_total > 0:
         try:
@@ -277,11 +261,7 @@ def route_and_reserve_signal(inst_id: str, side: str, size: float, price: float,
                 "decision": payload, "reservation": None}
 
     try:
-        record = mgr.reserve(
-            account_key, intent, margin_est, state="pending",
-            portfolio_limit_usdt=budget_total if budget_total > 0 else None,
-            portfolio_environment=environment,
-        )
+        record = mgr.reserve(account_key, intent, margin_est, state="pending")
     except risk_reservation.ReservationExceeded as exc:
         payload["budget"] = {"limit_usdt": budget_total, "reserved_before_usdt": budget_used,
                              "margin_usdt": margin_est, "error": str(exc)}
