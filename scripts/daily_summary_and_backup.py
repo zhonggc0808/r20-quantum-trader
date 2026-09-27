@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
 BACKUPS_DIR = os.path.join(WORKSPACE_DIR, "backups")
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
 

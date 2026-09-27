@@ -32,7 +32,7 @@ load_encrypted_secrets()
 @dataclass
 class Settings:
     root: Path = ROOT
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8080
     okx_base_url: str = "https://www.okx.com"
     okx_environment: str = "demo"
@@ -56,7 +56,7 @@ class Settings:
 def refresh_settings() -> Settings:
     load_dotenv(ROOT / ".env")
     load_encrypted_secrets()
-    settings.host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    settings.host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
     settings.port = int(os.getenv("DASHBOARD_PORT", "8080"))
     from scripts.okx_runtime import selected_environment
     selected = selected_environment()

@@ -361,18 +361,17 @@ class AdminApiTests(unittest.TestCase):
             self.assertIn('attachment; filename="test_download_archive.tar.gz"', res_hdr.headers.get("content-disposition", ""))
             self.assertEqual(res_hdr.headers.get("content-type"), "application/gzip")
 
-            # 3. Download via Query parameter ?token=... (for native browser download link) -> 200
+            # 3. Session tokens in query strings are rejected to prevent URL/log leakage.
             res_token = self.client.get(f"/api/v1/admin/backups/download/{test_file.name}?token={token}")
-            self.assertEqual(res_token.status_code, 200)
-            self.assertEqual(res_token.content, b"dummy-tar-gz-content")
+            self.assertEqual(res_token.status_code, 401)
 
-            # 4. Download via relative path "local/test_download_archive.tar.gz"
-            res_rel = self.client.get(f"/api/v1/admin/backups/download/local/{test_file.name}?token={token}")
+            # 4. Download via relative path with the session header.
+            res_rel = self.client.get(f"/api/v1/admin/backups/download/local/{test_file.name}", headers=root)
             self.assertEqual(res_rel.status_code, 200)
             self.assertEqual(res_rel.content, b"dummy-tar-gz-content")
 
             # 5. Non-existent file -> 404
-            res_404 = self.client.get(f"/api/v1/admin/backups/download/does_not_exist_file.tar.gz?token={token}")
+            res_404 = self.client.get(f"/api/v1/admin/backups/download/does_not_exist_file.tar.gz", headers=root)
             self.assertEqual(res_404.status_code, 404)
         finally:
             if test_file.exists():

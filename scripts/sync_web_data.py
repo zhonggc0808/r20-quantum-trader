@@ -23,7 +23,7 @@ import scripts.okx_rest as okx_rest
 import scripts.okx_runtime as okx_runtime
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
 LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
 LEDGER_JSON_FILE = os.path.join(DATA_DIR, "trading_ledger.json")
 SNAPSHOTS_JSON_FILE = os.path.join(DATA_DIR, "snapshots.json")

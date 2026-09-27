@@ -249,3 +249,34 @@ class TestConcurrency(RiskReservationTestBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestPortfolioAtomicLimit(RiskReservationTestBase):
+    def test_portfolio_limit_is_atomic_across_venues(self):
+        """组合上限必须在同一 SQLite 事务内跨账户原子裁决。"""
+        results = []
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def reserve(key, intent):
+            try:
+                barrier.wait(timeout=5)
+                self.mgr.reserve(
+                    key, intent, 75.0, STATE_PENDING,
+                    portfolio_limit_usdt=100.0,
+                    portfolio_environment="live",
+                )
+                results.append(intent)
+            except ReservationExceeded:
+                errors.append(intent)
+
+        threads = [
+            threading.Thread(target=reserve, args=(self.okx_live, "okx-intent")),
+            threading.Thread(target=reserve, args=(self.gate_live, "gate-intent")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertAlmostEqual(self.mgr.gross_exposure("live"), 75.0)

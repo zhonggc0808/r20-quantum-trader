@@ -364,19 +364,11 @@ def run_backup(payload: BackupRequest, x_r20_admin_token: str | None = Header(de
 @router.get("/api/v1/admin/backups/download/{filename:path}")
 def download_backup_archive(
     filename: str,
-    token: str | None = Query(default=None),
-    session: str | None = Query(default=None),
     x_r20_admin_token: str | None = Header(default=None),
     x_r20_session: str | None = Header(default=None, alias="X-R20-Session"),
 ) -> FileResponse:
     refresh_settings()
-    effective_session = (
-        (x_r20_session if isinstance(x_r20_session, str) else None)
-        or (token if isinstance(token, str) else None)
-        or (session if isinstance(session, str) else None)
-    )
-    effective_admin_token = x_r20_admin_token if isinstance(x_r20_admin_token, str) else None
-    require_admin_header(effective_admin_token, effective_session)
+    require_admin_header(x_r20_admin_token, x_r20_session)
     if ".." in Path(filename).parts:
         raise HTTPException(status_code=400, detail="非法文件路径：不能包含 ..")
     clean_name = Path(filename).name

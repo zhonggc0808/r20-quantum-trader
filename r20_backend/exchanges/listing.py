@@ -11,7 +11,7 @@
 - 缓存 = 进程内 dict，key=(venue, environment)，TTL 600s；
 - 判定：不存在 / OKX state!=live / Binance status!=TRADING / Gate
   in_delisting=true → ok=False + 中文 reason；
-- 拉取失败/超时 → **fail-open** + warn（reason='行情目录不可用，跳过对账'）
+- 拉取失败/超时 → **fail-closed** + warn（执行请求直接拒绝）
   ——对账是增强不是风控闸门，不阻塞交易；
 - 域名解析复用 env_profiles 单一入口（binance demo-fapi vs fapi、
   gate testnet 候选域按 registry 环境语义、OKX demo 同域 +
@@ -125,8 +125,7 @@ def ensure_contract_listed(venue: str, environment: str,
     - 不存在 → ok=False（「合约已下架」/「沙盒未上市」按环境措辞）；
     - OKX state!=live / Binance status!=TRADING / Gate in_delisting=true
       → ok=False + 具体 reason；
-    - 目录拉取失败/超时 → fail-open：ok=True + warn +
-      reason='行情目录不可用，跳过对账'。
+    - 目录拉取失败/超时 → fail-closed：ok=False + warn，执行请求拒绝。
     """
     vkey = str(venue or "").strip().lower()
     ekey = str(environment or "").strip().lower()
@@ -135,10 +134,10 @@ def ensure_contract_listed(venue: str, environment: str,
 
     try:
         directory, source = _get_directory(vkey, ekey)
-    except Exception as exc:  # fail-open：对账是增强不是风控闸门
-        warnings.warn(f"[listing-gate] {vkey}/{ekey} 行情目录拉取失败，跳过对账: {exc}")
-        return ListingCheck(ok=True, reason="行情目录不可用，跳过对账",
-                            checked_at=checked_at, source="cache")
+    except Exception as exc:
+        warnings.warn(f"[listing-gate] {vkey}/{ekey} 合约目录不可用，拒绝发送: {exc}")
+        return ListingCheck(ok=False, reason=f"行情目录不可用，拒绝发送: {exc}",
+                            checked_at=checked_at, source="unavailable")
 
     info = directory.get(native)
     if info is None:

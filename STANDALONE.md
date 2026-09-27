@@ -45,9 +45,9 @@ The backend exposes only read-only control-plane endpoints:
 
 - `GET /api/v1/health`
 - `GET /api/v1/status`
-- `GET /api/v1/cache/{decisions|factors|ledger|sentiment|self-improvement}`
+- `GET /api/v1/cache/{decisions|factors|ledger|sentiment|self-improvement}`（管理员会话）
 - `GET /api/v1/market/{instId}`
-- `GET /api/v1/account/positions`
+- `GET /api/v1/account/positions`（管理员会话）
 
 No HTTP trade-trigger endpoint is exposed except the separately enabled, confirmation-protected manual close action. The admin console also supports a protected update check and `git pull --ff-only`; it refuses to update a dirty worktree and never restarts services automatically.
 
@@ -59,11 +59,10 @@ Add the `[program:r20-backend]` block from the container supervisor configuratio
 
 ## systemd
 
-Copy `deploy/r20-quantum.service` and `deploy/r20-gateway.service` to `/etc/systemd/system/`, update `WorkingDirectory` and `EnvironmentFile`, then:
+Use the installer to place the checkout outside `/root`, create the dedicated service user, render matching paths, and disable the legacy scheduler:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now r20-quantum r20-gateway
+sudo ./deploy/install-systemd.sh
 ```
 
 Before enabling `r20-gateway`, disable the old QwenPaw cron jobs to prevent duplicate execution. Do not run both schedulers simultaneously. The current Gateway worker owns the scheduler; the legacy `r20_backend.scheduler` and `deploy/r20-scheduler.service` are retained only for compatibility and must not run alongside it.

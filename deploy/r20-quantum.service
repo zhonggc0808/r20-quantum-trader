@@ -8,10 +8,11 @@ Type=simple
 User=r20
 Group=r20
 Environment=HOME=/home/r20
-Environment=PATH=/root/development/r20-account-isolation/.venv/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=/root/development/r20-account-isolation
-EnvironmentFile=/root/development/r20-account-isolation/.env
-ExecStart=/root/development/r20-account-isolation/.venv/bin/python -m uvicorn r20_backend.app:app --host 0.0.0.0 --port 8080
+Environment=R20_GATEWAY_EMBEDDED=0
+Environment=PATH=/opt/r20-account-isolation/.venv/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/opt/r20-account-isolation
+EnvironmentFile=/opt/r20-account-isolation/.env
+ExecStart=/opt/r20-account-isolation/.venv/bin/python -m uvicorn r20_backend.app:app --host 127.0.0.1 --port 8080
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

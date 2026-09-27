@@ -56,7 +56,7 @@ except ImportError:  # scripts/ 在 sys.path
     from local_lock import local_file_lock  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-LIBRARY_FILE = ROOT / "data" / "prompt_library.json"
+LIBRARY_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "prompt_library.json"
 BJ_TZ = timezone(timedelta(hours=8))
 TEMPLATE_KEYS = ("trading_system", "trading_user", "evolution_system", "evolution_user")
 

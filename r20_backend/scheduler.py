@@ -11,6 +11,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
+
 
 try:
     from r20_backend.schedule_store import load_schedule
@@ -19,7 +21,7 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-DATA = ROOT / "data"
+DATA = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
 LOGS = ROOT / "logs"
 _BJ = timezone(timedelta(hours=8))
 logger = logging.getLogger(__name__)

@@ -32,8 +32,9 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
-LEDGER_FILE = ROOT / "data" / "trading_ledger.json"
-ARCHIVE_DIR = ROOT / "data" / "archive"
+DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+LEDGER_FILE = DATA_DIR / "trading_ledger.json"
+ARCHIVE_DIR = DATA_DIR / "archive"
 BJ_TZ = timezone(timedelta(hours=8))
 
 _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S")

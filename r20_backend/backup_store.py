@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG_FILE = ROOT / "data" / "backup_methods.json"
+CONFIG_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "backup_methods.json"
 BJ_TZ = timezone(timedelta(hours=8))
 MAX_JOBS = 12
 ALLOWED_SCOPES = {"data", "scripts", "dashboard", "r20_backend", "r20_gateway", "tests", "recovery_guide", "agent_profile", "root_configs"}

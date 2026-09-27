@@ -58,15 +58,99 @@ def _fail(stage: str, detail: str, venue: str = "gate", **extra: Any) -> RouteRe
     return r
 
 
+def _protective_order_id(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    order = row.get("order") if isinstance(row.get("order"), dict) else {}
+    value = (row.get("id") or row.get("algo_id") or row.get("order_id")
+             or order.get("id") or raw.get("id") or raw.get("algoId")
+             or raw.get("orderId"))
+    return str(value) if value not in (None, "") else ""
+
+
+def _cancel_protective_leg(ad: Any, asset: str, order_id: str) -> tuple[bool, str]:
+    """撤一条保护腿并回读确认它已从活跃列表消失。"""
+    try:
+        if hasattr(ad, "cancel_algo_order"):
+            response = ad.cancel_algo_order(algo_id=order_id)
+        elif hasattr(ad, "cancel_price_order"):
+            response = ad.cancel_price_order(order_id)
+        elif hasattr(ad, "cancel_order"):
+            response = ad.cancel_order(asset, order_id)
+        else:
+            response = ad.cancel_protective_orders(asset)
+    except Exception as exc:
+        return False, f"撤销请求失败({exc})"
+
+    try:
+        active = ad.list_protective_orders(asset) or []
+    except Exception as exc:
+        return False, f"撤销请求已发送但最终状态回读失败({exc})"
+    if any(_protective_order_id(row) == str(order_id) for row in active):
+        return False, f"撤销请求已发送但保护单仍活跃({str(order_id)})"
+
+    # 某些适配器只返回空响应；最终状态以回读结果为准。
+    return True, "已确认撤销"
+
+
+def _cancel_entry_order(ad: Any, asset: str, order_id: str) -> tuple[bool, str]:
+    """撤入场单并尽量从响应中确认终态，拒绝把 FILLED 当成 CANCELED。"""
+    try:
+        response = ad.cancel_order(asset, order_id)
+    except Exception as exc:
+        return False, f"撤销失败({exc})"
+    rows = response if isinstance(response, list) else [response]
+    states = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        states.append(str(row.get("status") or row.get("state") or
+                          row.get("orderStatus") or "").lower())
+        raw = row.get("raw")
+        if isinstance(raw, dict):
+            states.append(str(raw.get("status") or raw.get("state") or "").lower())
+    if any(state in {"filled", "partially_filled", "partial", "executed"}
+           for state in states):
+        return False, f"撤单响应显示订单已成交({','.join(states)})"
+    if any(state in {"canceled", "cancelled", "expired", "closed"}
+           for state in states) or any(
+               isinstance(row, dict) and row.get("cancelled") is True for row in rows):
+        return True, "已确认撤销"
+    return False, "撤销请求已发送但入场单最终状态未确认"
+
+
+def rollback_open_position(result: Dict[str, Any], *, adapter: Any = None,
+                           environment: Optional[str] = None) -> Dict[str, Any]:
+    """回滚已接受的多所开仓，并返回可用于风险台账决策的确认结果。"""
+    venue = str(result.get("venue") or "").lower()
+    asset = str(result.get("asset") or "")
+    ad = adapter or get_adapter(venue, environment=environment)
+    notes = []
+    all_confirmed = True
+    seen = set()
+    for leg in ("tp", "sl"):
+        order_id = str(result.get(f"{leg}_id") or "")
+        if not order_id or order_id in seen:
+            continue
+        seen.add(order_id)
+        ok, note = _cancel_protective_leg(ad, asset, order_id)
+        all_confirmed = all_confirmed and ok
+        notes.append(f"{leg.upper()}腿 {order_id} {note}")
+    ok, note = _cancel_entry_order(ad, asset, str(result.get("order_id") or ""))
+    all_confirmed = all_confirmed and ok
+    notes.append(f"入场单 {note}")
+    return {"confirmed": all_confirmed, "notes": notes}
+
+
 def _load_venue_pool_soft(venue: str) -> Dict[str, Any]:
-    """读取该所池配置；读取失败只告警返回 {}（池门禁是加固，不制造新的阻塞点）。"""
+    """读取交易池配置；读取失败返回错误标记，执行层随后拒绝发送。"""
     try:
         from .exchanges.routing_policy import load_venue_pool
         pool = load_venue_pool(venue)
         return pool if isinstance(pool, dict) else {}
     except Exception as exc:
-        print(f"[所池门禁] {venue.upper()} 池配置读取失败，按无限制继续（仅告警）: {exc}")
-        return {}
+        return {"_config_error": f"{type(exc).__name__}: {exc}"}
 
 
 def open_protected_position(decision: Dict[str, Any], *,
@@ -116,11 +200,17 @@ def open_protected_position(decision: Dict[str, Any], *,
     # **零消费者** —— 管理员以为设了 per-venue 闸门其实没有。这里读一次，供下方
     # 保证金夹取与池准入判定共用。
     pool = _load_venue_pool_soft(venue)
+    if pool.get("_config_error"):
+        return _fail("venue_pool", f"{venue.upper()} 交易池配置不可用，拒绝发送: {pool['_config_error']}", venue=venue)
 
     _cur_min_lev = float(os.getenv("R20_MIN_LEVERAGE", "") or MIN_LEVERAGE or 2.0)
     _cur_max_lev = float(os.getenv("R20_MAX_LEVERAGE", "") or MAX_LEVERAGE or 5.0)
     if _cur_min_lev > _cur_max_lev:
         _cur_min_lev = _cur_max_lev
+    if leverage < _cur_min_lev:
+        return _fail("risk_gate",
+                     f"杠杆 {leverage:g}x 低于执行下限 {_cur_min_lev:g}x，拒绝下单",
+                     venue=venue)
 
     leverage, decision = _clamp_leverage(
         venue=venue, asset=asset, decision=decision, leverage=leverage,
@@ -210,8 +300,8 @@ def open_protected_position(decision: Dict[str, Any], *,
             ad.native_symbol(asset))
         if not _check.ok:
             return _fail("listing", f"合约对账拒绝: {_check.reason}", venue=venue)
-    except Exception:  # 对账自身异常一律 fail-open（含目录缓存污染等未知面）
-        pass
+    except Exception as exc:
+        return _fail("listing", f"合约目录对账不可用，拒绝发送: {exc}", venue=venue)
 
     spec = ad.fetch_instrument_spec(asset)
     if spec is None:
@@ -254,6 +344,16 @@ def open_protected_position(decision: Dict[str, Any], *,
     existing = [p for p in _all_positions
                 if str(p.get("base") or "").upper() == asset
                 and abs(float(p.get("size_signed") or 0)) > 1e-9]
+    asset_margin_cap = min(
+        float(MAX_SINGLE_ASSET_MARGIN or 0.0) if float(MAX_SINGLE_ASSET_MARGIN or 0.0) > 0 else float("inf"),
+        float(max_margin_usdt) if max_margin_usdt and float(max_margin_usdt) > 0 else float("inf"),
+    )
+    existing_margin = sum(float(p.get("margin") or p.get("margin_usdt") or 0.0)
+                          for p in existing)
+    if asset_margin_cap != float("inf") and existing_margin + margin > asset_margin_cap + 1e-9:
+        return _fail("risk_gate",
+                     f"{asset} 累计保证金将达 {existing_margin + margin:.4f}U，超上限 {asset_margin_cap:.4f}U",
+                     venue=venue)
     # 该所池上限（审计 P1-7）：复用上面这一次探针结果，不额外触网
     if pool:
         pool_max_open = int(pool.get("max_open") or 0)
@@ -302,9 +402,25 @@ def open_protected_position(decision: Dict[str, Any], *,
             legs = ad.attach_protective_orders(asset, side, tp_px=tp, sl_px=sl,
                                                expiration=trigger_expiration)
         open_orders = ad.list_protective_orders(asset)
-        open_ids = {str(o.get("id") or o.get("algo_id")) for o in open_orders if isinstance(o, dict)}
-        if str(legs.get("tp")) not in open_ids or str(legs.get("sl")) not in open_ids:
+        open_by_id = {}
+        for row in open_orders:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+            order_id_value = row.get("id") or row.get("algo_id") or row.get("order_id")                 or raw.get("id") or raw.get("algoId") or raw.get("orderId")
+            if order_id_value not in (None, ""):
+                open_by_id[str(order_id_value)] = row
+        if str(legs.get("tp")) not in open_by_id or str(legs.get("sl")) not in open_by_id:
             raise RuntimeError("回读未见双腿触发单")
+        # An ID alone is insufficient: reject a response that points at another
+        # symbol or a non-trigger resource. Optional adapter fields are checked
+        # when present so Gate's legacy response shape remains compatible.
+        for leg_id, row in ((str(legs.get("tp")), open_by_id[str(legs.get("tp"))]),
+                            (str(legs.get("sl")), open_by_id[str(legs.get("sl"))])):
+            raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+            symbol_value = row.get("symbol") or row.get("contract") or raw.get("symbol") or raw.get("contract")
+            if symbol_value and canonical_base(str(symbol_value)) != asset:
+                raise RuntimeError(f"保护单 {leg_id} 标的回读不一致: {symbol_value}")
     except Exception as exc:
         # 审计④#9(2026-09-13)：铁律「任一步失败→已挂触发单回滚+撤入场单」旧实现只
         # 撤入场单——tp 挂成、sl 失败时 tp 孤儿遗留至 expiration（无仓挂保护单不可对账）。
@@ -315,34 +431,29 @@ def open_protected_position(decision: Dict[str, Any], *,
             _lid = str((legs or {}).get(_leg) or "")
             if not _lid or _lid in ("None", ""):
                 continue
-            try:
-                ad.cancel_order(asset, _lid)
-            except Exception as leg_exc:
-                rollback_notes.append(f"{_leg.upper()}腿 {_lid} 撤销失败({leg_exc})")
+            _ok, _note = _cancel_protective_leg(ad, asset, _lid)
+            rollback_notes.append(f"{_leg.upper()}腿 {_lid} {_note}")
         try:
             residue = ad.list_protective_orders(asset) or []
             for row in residue:
                 if not isinstance(row, dict):
                     continue
                 _o = row.get("order") if isinstance(row.get("order"), dict) else row
-                _text = (str(_o.get("text") or "") + str(row.get("text") or "")).lower()
+                _raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+                _text = " ".join(str(_o.get(key) or row.get(key) or _raw.get(key) or "")
+                                  for key in ("text", "clientAlgoId", "clientOrderId",
+                                              "origClientOrderId", "order_id")).lower()
                 if "r20" not in _text:
                     continue  # 只清本系统触发单
                 _rid = str(row.get("id") or row.get("algo_id") or row.get("order_id") or _o.get("id") or "")
                 if not _rid or _rid in ("None",):
                     continue
-                try:
-                    ad.cancel_order(asset, _rid)
-                    rollback_notes.append(f"孤儿触发单 {_rid} 已撤")
-                except Exception as rexc:
-                    rollback_notes.append(f"孤儿触发单 {_rid} 撤销失败({rexc})")
+                _ok, _note = _cancel_protective_leg(ad, asset, _rid)
+                rollback_notes.append(f"孤儿触发单 {_rid} {_note}")
         except Exception as lexc:
             rollback_notes.append(f"孤儿触发单未能枚举({lexc})——依赖交易所侧 OCO/到期/手动兜底")
-        try:
-            ad.cancel_order(asset, order_id)
-            rollback_notes.append("入场单已撤销")
-        except Exception as cexc:
-            rollback_notes.append(f"入场单撤销失败({cexc})——交易所侧 OCO/手动兜底")
+        _entry_ok, _entry_note = _cancel_entry_order(ad, asset, order_id)
+        rollback_notes.append(f"入场单 {_entry_note}")
         detail = f"保护单覆盖失败: {exc}"
         if rollback_notes:
             detail += "；回滚记录: " + "；".join(rollback_notes)

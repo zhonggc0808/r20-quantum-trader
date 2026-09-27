@@ -21,18 +21,26 @@ router = APIRouter(tags=["dashboard"])
 _CANDLES_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
-@router.get("/api/all")
-async def get_all_data(full: bool = Query(False, description="返回完整载荷（含全部历史明细/台账/日志）")):
-    """默认瘦身载荷（体积约为完整版的 1/2），省略项见响应里的 `_meta.omitted`。
+def _dashboard_is_authenticated(request: Request) -> bool:
+    """Require auth when credentials are supplied, otherwise allow safe public view."""
+    session = request.headers.get("X-R20-Session")
+    token = request.headers.get("X-R20-Admin-Token")
+    if not session and not token:
+        return False
+    require_admin_header(token, session)
+    return True
 
-    需要旧版逐字节一致的行为时用 `?full=1`；历史明细走 `/api/v1/cache/brain-history`。
-    """
-    return await dash_app.get_all_data(full=full)
+
+@router.get("/api/all")
+async def get_all_data(request: Request, full: bool = Query(False, description="返回完整载荷（含全部历史明细/台账/日志）")):
+    authenticated = _dashboard_is_authenticated(request)
+    return await dash_app.get_all_data(full=full if authenticated else False, public=not authenticated)
 
 
 @router.get("/api/overview")
-async def get_overview():
-    return await dash_app.get_overview()
+async def get_overview(request: Request):
+    authenticated = _dashboard_is_authenticated(request)
+    return await dash_app.get_overview(public=not authenticated)
 
 
 @router.get("/api/v1/cache/{resource}")
@@ -50,9 +58,9 @@ def cache(resource: str, x_r20_admin_token: str | None = Header(default=None), x
     filename = allowed.get(resource)
     if not filename:
         raise HTTPException(status_code=404, detail="unknown cache resource")
-    if resource == "ledger":
-        require_admin_header(x_r20_admin_token, x_r20_session)
-    return JSONResponse(read_json(filename, {} if resource != "ledger" else []))
+    require_admin_header(x_r20_admin_token, x_r20_session)
+    return JSONResponse(read_json(filename, {} if resource != "ledger" else []),
+                        headers={"Cache-Control": "private, no-store, max-age=0"})
 
 
 @router.get("/api/v1/market/{inst_id}")
@@ -139,12 +147,12 @@ def equity_history(days: int = 14) -> dict[str, Any]:
         out["environment"] = _env_mode or None
         init_cap = None
         try:
-            p_init = ROOT / "data" / "account_initial_state.json"
+            p_init = DATA_DIR / "account_initial_state.json"
             if p_init.exists():
                 init_cap = float(json.loads(p_init.read_text("utf-8")).get("initial_capital") or 0) or None
         except Exception:
             init_cap = None
-        p_led = ROOT / "data" / "trading_ledger.json"
+        p_led = DATA_DIR / "trading_ledger.json"
         daily: dict[str, float] = {}
         excluded_env = 0
         legacy_unlabeled = 0

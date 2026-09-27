@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 from r20_gateway.pidfile import PID_FILE  # noqa: E402  (唯一定义处：pidfile.py)
-LOCK_FILE = ROOT / "data" / ".r20_gateway.lock"
+LOCK_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / ".r20_gateway.lock"
 LOG_FILE = ROOT / "logs" / "r20_gateway_supervisor.log"
 _stop = threading.Event()
 _thread: threading.Thread | None = None

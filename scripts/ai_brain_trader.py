@@ -72,7 +72,7 @@ def _get_system_version_tag() -> str:
     return f"v{__version__}"
 
 WORKSPACE_DIR = PROJECT_ROOT
-DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
+DATA_DIR = os.environ.get("R20_DATA_DIR") or os.path.join(WORKSPACE_DIR, "data")
 from market_data_service import fetch_single_indicator, fetch_ticker, fetch_okx_ticker, fetch_candles
 # 结构优化阶段4·B3：单标的数据包装配已搬入 scripts/brain/packages.py（门面保留薄壳）
 from scripts.brain.packages import fetch_single_instrument_package as _fetch_single_instrument_package

@@ -123,7 +123,7 @@ def sqlite_hot_backups(timestamp: str, retention: int, destination_dir: Path | N
         raise RuntimeError("SQLite 备份目录必须位于 backups/ 目录下")
     destination_dir.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
-    data_dir = ROOT / "data"
+    data_dir = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
     if not data_dir.exists():
         return created
 

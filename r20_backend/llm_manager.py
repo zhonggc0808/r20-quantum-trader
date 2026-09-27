@@ -80,7 +80,7 @@ from r20_backend.llm.store import (
 _BJ = timezone(timedelta(hours=8))
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
 LLM_CONFIG_FILE = DATA_DIR / "llm_models.json"
 LEGACY_PROVIDERS_FILE = DATA_DIR / "llm_providers.json"
 FAILOVER_EVENTS_FILE = DATA_DIR / "llm_failover_events.json"

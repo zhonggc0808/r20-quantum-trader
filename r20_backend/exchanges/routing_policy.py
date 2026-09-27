@@ -40,7 +40,7 @@ from .registry import (execution_open, gate_environment_axis,
                        registered_venues)
 
 ROOT = Path(__file__).resolve().parents[2]
-ROUTING_FILE = ROOT / "data" / "venue_routing.json"
+ROUTING_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "venue_routing.json"
 
 # 审计②1(2026-09-13)：默认池数值不得再硬编码——与 global_risk_defaults 派生同源
 # （旧值 50/72 是 ImportError 静默 fallback 的化石，风控收紧对它无效）。
@@ -116,31 +116,31 @@ def load_venue_pool(venue: str) -> Dict[str, Any]:
         "min_confidence": defaults["min_confidence"],
         "dry_run": False if vkey != "gate" else True,
     }
-    try:
-        if ROUTING_FILE.exists():
+    if ROUTING_FILE.exists():
+        try:
             raw = json.loads(ROUTING_FILE.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("根节点必须是对象")
             v_cfg = raw.get(vkey) or {}
             if isinstance(v_cfg, dict):
                 for k in ("assets", "dry_run"):
                     if k in v_cfg:
                         base_pool[k] = v_cfg[k]
-                # 审计 P2-10：assets 旧实现直接拿配置值去迭代 → 写成字符串 "BTC" 时
-                # 会变成 ['B','C','T']，于是"准入币种"静默变成三个单字母垃圾。
                 base_pool["assets"] = _normalize_assets(base_pool.get("assets"), vkey)
-                # 数值风控参数：若配置且 > 0 则覆盖，未配置或 0/负数则继承全局风控默认值
                 for k in ("margin_per_trade_usdt", "max_open", "min_confidence"):
                     if k in v_cfg and v_cfg[k] not in (None, 0, ""):
                         base_pool[k] = v_cfg[k]
-    except Exception:
-        pass
+        except Exception as exc:
+            # 交易池是执行准入配置。损坏时不能退化成无限制池。
+            base_pool["_config_error"] = f"{type(exc).__name__}: {exc}"
     assets = [str(a).upper() for a in (base_pool.get("assets") or []) if str(a).strip()]
     base_pool["assets"] = sorted(set(assets))
     try:
         base_pool["margin_per_trade_usdt"] = max(0.0, float(base_pool.get("margin_per_trade_usdt") or defaults["margin_per_trade_usdt"]))
         base_pool["max_open"] = max(1, int(base_pool.get("max_open") or defaults["max_open"]))
         base_pool["min_confidence"] = min(100.0, max(0.0, float(base_pool.get("min_confidence") or defaults["min_confidence"])))
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as exc:
+        base_pool["_config_error"] = f"{type(exc).__name__}: {exc}"
     if vkey == "gate" and not _gate_execution_ready():
         base_pool["dry_run"] = True
     return base_pool

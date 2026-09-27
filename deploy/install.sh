@@ -17,6 +17,14 @@ if [ ! -f "$ROOT/.env" ]; then
 fi
 chmod 600 "$ROOT/.env"
 
+# Prepare the checked-in frontend when Node.js is available. The runtime service
+# serves frontend/dist, so skipping this step leaves a stale or incomplete UI.
+if command -v npm >/dev/null 2>&1; then
+  (cd "$ROOT/frontend" && npm ci && npm run build)
+else
+  echo "WARNING: npm is not installed; frontend/dist was not rebuilt." >&2
+fi
+
 # Initialize default instrument pool if not present (prevents untrusted pool blocking entry)
 if [ ! -f "$ROOT/data/instrument_pool.json" ]; then
   mkdir -p "$ROOT/data"

@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+import os
 from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
 DEFAULT_DB_PATH = DATA_DIR / "candle_warehouse.db"
 
 

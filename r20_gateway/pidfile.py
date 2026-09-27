@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Union
 
 ROOT = Path(__file__).resolve().parents[1]
-PID_FILE = ROOT / "data" / "r20_gateway.pid"
+PID_FILE = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data")) / "r20_gateway.pid"
 
 __all__ = ["PID_FILE", "read_pid", "process_running"]
 

@@ -1,6 +1,7 @@
 [Unit]
 Description=R20 Quantum Trader Standalone Scheduler
 After=network-online.target
+Conflicts=r20-gateway.service
 Wants=network-online.target
 
 [Service]

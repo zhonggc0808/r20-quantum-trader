@@ -8,8 +8,9 @@ from typing import Any, Mapping
 from cryptography.fernet import Fernet, InvalidToken
 
 ROOT = Path(__file__).resolve().parents[1]
-KEY_FILE = ROOT / "data" / ".r20_backup_secret_key"
-STORE_FILE = ROOT / "data" / "r20_backup_secrets.enc"
+DATA_DIR = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
+KEY_FILE = DATA_DIR / ".r20_backup_secret_key"
+STORE_FILE = DATA_DIR / "r20_backup_secrets.enc"
 ALLOWED_FIELDS = {
     "access_key_id", "secret_access_key", "session_token", "app_key", "app_secret",
     "refresh_token", "access_token", "username", "password", "client_id", "client_secret", "sign_key",

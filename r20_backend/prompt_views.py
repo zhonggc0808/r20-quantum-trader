@@ -1,10 +1,12 @@
 """Base module skeletons and rendered prompt snapshots for the admin editor."""
 from __future__ import annotations
 from pathlib import Path
+import os
+
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
+DATA = Path(os.environ.get("R20_DATA_DIR") or (ROOT / "data"))
 
 EVOLUTION_USER_TEMPLATE = """======================= 【当前认知复盘基准时间】 =======================
 【复盘基准时间】: {{timestamp_beijing}}

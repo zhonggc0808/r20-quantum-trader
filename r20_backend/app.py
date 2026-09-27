@@ -140,7 +140,11 @@ async def lifespan(_: FastAPI):
             save_instruments(DEFAULT_INSTRUMENTS)
     except Exception:
         pass
-    start_gateway_supervisor()
+    # The Gateway has its own systemd owner in production. Embedded ownership is
+    # opt-in for `start.sh`/single-process development only; this prevents the
+    # backend service and r20-gateway.service from racing over the same worker.
+    if os.getenv("R20_GATEWAY_EMBEDDED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        start_gateway_supervisor()
     try:
         from r20_backend.dashboard_cache import start_dashboard_background_worker
         start_dashboard_background_worker()
@@ -152,7 +156,8 @@ async def lifespan(_: FastAPI):
         stop_dashboard_background_worker()
     except Exception:
         pass
-    stop_gateway_supervisor()
+    if os.getenv("R20_GATEWAY_EMBEDDED", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        stop_gateway_supervisor()
 
 
 app = FastAPI(

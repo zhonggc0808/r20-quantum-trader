@@ -190,13 +190,10 @@ def load_ledger_lifecycle_trades(ledger_file, workspace_dir, autosync_enabled, r
 
     # 逐单挂「数理快照可观测性」标签与真实快照载荷
     # 路径解析：优先使用 ledger_file 同级 data 目录，次选 workspace_dir/data
-    data_dir = os.path.dirname(ledger_file)
-    if not (data_dir and os.path.exists(os.path.join(data_dir, "signal_journal.json"))):
-        ws_data = os.path.join(workspace_dir, "data")
-        if os.path.exists(os.path.join(ws_data, "signal_journal.json")):
-            data_dir = ws_data
-        elif not data_dir:
-            data_dir = workspace_dir
+    # The ledger and its sidecars belong to the same account data directory.
+    # Never fall back to the checkout's production data when R20_DATA_DIR points
+    # at an isolated instance.
+    data_dir = os.path.dirname(ledger_file) or workspace_dir
 
     journal_by_inst = load_signal_journal_by_inst(data_dir)
     trackers = load_position_trackers(data_dir)
