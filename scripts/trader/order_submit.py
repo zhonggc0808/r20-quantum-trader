@@ -71,6 +71,8 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
             return False, str(_routing.get("error") or "路由拒绝")
         _reservation = _routing.get("reservation")
         target_venue = str(_routing.get("venue") or "okx").lower()
+        venue_ctx.setdefault("target_venue", target_venue)
+        venue_ctx.setdefault("venue", target_venue)
     else:
         print(f"[US-003 决策面] warn {inst_id} 提交未携带 venue_ctx——"
               f"未经选所路由/预算预留，仅限非 AI 信号通用路径")
@@ -238,6 +240,7 @@ def submit_protected_limit_order(inst_id: str, side: str, pos_side: str, size: f
                 "take_profit_price": effective_tp,
                 "stop_loss_price": effective_sl,
                 "environment": str(env.mode),
+                "order_mode": order_mode,
                 # 审计 P1-7：per-venue min_confidence 生效所需的原始 AI 置信度（缺失=不做该检查）
                 "confidence": float(venue_ctx.get("confidence") or 0.0) if isinstance(venue_ctx, dict) else 0.0,
             }, environment=str(env.mode))

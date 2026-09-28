@@ -89,12 +89,13 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
     profile = ASSET_CLASS_PROFILES.get(asset_type, ASSET_CLASS_PROFILES["crypto"])
     atr = max(f["atr"], cur_px * 0.005)
     prec = f["precision"]
-    ct_val = f["ctVal"]
+    ct_val = float(curr_pos.get("ctVal") or f["ctVal"])
     
     pos_sz = float(curr_pos["pos"])
     is_long = "long" in curr_pos["side"].lower()
     entry_px = float(curr_pos["avgPx"])
     pos_key = f"{inst_id}_{curr_pos['side']}"
+    pos_venue = str(curr_pos.get("venue") or curr_pos.get("exchange") or "okx").lower()
 
     now_ts = int(time.time())
     entry_intent = _recent_entry_intent(inst_id, curr_pos.get("side", ""), now_ts * 1000)
@@ -184,7 +185,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
         ))
         add_stop_cooldown(inst_id, "long" if is_long else "short", "硬止损")
         if notify_trade_close:
-            notify_trade_close(inst=name, pnl=pnl_val, stage="硬止损平仓", exit_px=cur_px)
+            notify_trade_close(inst=name, pnl=pnl_val, stage="硬止损平仓", exit_px=cur_px, venue=pos_venue)
         trackers.pop(pos_key, None)
         return True, "已硬止损"
 
@@ -210,7 +211,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
         ))
         add_stop_cooldown(inst_id, "long" if is_long else "short", "云端保护失效")
         if notify_trade_close:
-            notify_trade_close(inst=name, pnl=pnl_val, stage="云端保护失效退出", exit_px=cur_px)
+            notify_trade_close(inst=name, pnl=pnl_val, stage="云端保护失效退出", exit_px=cur_px, venue=pos_venue)
         trackers.pop(pos_key, None)
         return True, "保护失效安全退出"
     t["cloudProtection"] = {"verifiedAt": timestamp_full, "detail": protection_detail}
@@ -231,7 +232,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
             remark=f"持仓超 {TIME_STOP_HOURS:g} 小时无突破，主动平仓释放配比",
         ))
         if notify_trade_close:
-            notify_trade_close(inst=name, pnl=float(curr_pos.get("upl", 0.0) or 0.0), stage="时间止损平仓", exit_px=cur_px)
+            notify_trade_close(inst=name, pnl=float(curr_pos.get("upl", 0.0) or 0.0), stage="时间止损平仓", exit_px=cur_px, venue=pos_venue)
         if pos_key in trackers: del trackers[pos_key]
         return True, "时间止损"
 
@@ -280,7 +281,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
                 remark=f"最高 {t['highWaterMark']} 触发阶梯利润锁定线 {dynamic_floor_sl}",
             ))
             if notify_trade_close:
-                notify_trade_close(inst=name, pnl=pnl_val, stage="阶梯锁利平仓", exit_px=cur_px)
+                notify_trade_close(inst=name, pnl=pnl_val, stage="阶梯锁利平仓", exit_px=cur_px, venue=pos_venue)
             if pos_key in trackers: del trackers[pos_key]
             return True, "已阶梯锁利"
 
@@ -300,7 +301,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
                 remark=f"最高 {t['highWaterMark']} 动能回撤触及移动止盈线",
             ))
             if notify_trade_close:
-                notify_trade_close(inst=name, pnl=pnl_val, stage="移动止盈", exit_px=cur_px)
+                notify_trade_close(inst=name, pnl=pnl_val, stage="移动止盈", exit_px=cur_px, venue=pos_venue)
             if pos_key in trackers: del trackers[pos_key]
             return True, "已移动止盈"
 
@@ -339,7 +340,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
                 remark=f"最低 {t['lowWaterMark']} 触发阶梯利润锁定线 {dynamic_floor_sl}",
             ))
             if notify_trade_close:
-                notify_trade_close(inst=name, pnl=pnl_val, stage="阶梯锁利平仓", exit_px=cur_px)
+                notify_trade_close(inst=name, pnl=pnl_val, stage="阶梯锁利平仓", exit_px=cur_px, venue=pos_venue)
             if pos_key in trackers: del trackers[pos_key]
             return True, "已阶梯锁利"
 
@@ -359,7 +360,7 @@ def manage_position_tp_and_trailing(f, curr_pos, trackers, timestamp_full, execu
                 remark=f"最低 {t['lowWaterMark']} 动能反弹触及移动止盈线",
             ))
             if notify_trade_close:
-                notify_trade_close(inst=name, pnl=pnl_val, stage="移动止盈", exit_px=cur_px)
+                notify_trade_close(inst=name, pnl=pnl_val, stage="移动止盈", exit_px=cur_px, venue=pos_venue)
             if pos_key in trackers: del trackers[pos_key]
             return True, "已移动止盈"
 
