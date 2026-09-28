@@ -31,11 +31,22 @@ _SRC = Path(aft.__file__).read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 
 
-def _try_at(lineno: int) -> ast.Try:
+def _try_assigning(name: str) -> ast.Try:
+    """Locate a module-level fallback block by its assigned contract name."""
+    matches = []
     for node in _TREE.body:
-        if isinstance(node, ast.Try) and node.lineno == lineno:
-            return node
-    raise AssertionError(f"未找到行 {lineno} 的 Try 节点")
+        if not isinstance(node, ast.Try):
+            continue
+        assigned = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        }
+        if name in assigned:
+            matches.append(node)
+    if len(matches) != 1:
+        raise AssertionError(f"赋值 {name} 的模块级 Try 节点应恰有一个，实际 {len(matches)} 个")
+    return matches[0]
 
 
 def _exec_node(node, extra=None):
@@ -58,27 +69,27 @@ class ImportFallbackTests(unittest.TestCase):
 
     def test_version_falls_back_when_version_module_unavailable(self):
         with patch.dict(sys.modules, {"astra_backend.version": None}):
-            ns = _exec_node(_try_at(33))
+            ns = _exec_node(_try_assigning("__version__"))
         self.assertEqual(ns["__version__"], "7.6.0")
 
     def test_debounce_falls_back_to_30_minutes_on_bad_env(self):
         for bad in ("not-a-number", ""):
             with patch.dict(aft.os.environ,
                             {"ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_MIN": bad}):
-                ns = _exec_node(_try_at(234))
+                ns = _exec_node(_try_assigning("ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S"))
             self.assertEqual(ns["ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S"], 1800.0, bad)
 
     def test_debounce_reads_env_when_valid(self):
         with patch.dict(aft.os.environ,
                         {"ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_MIN": "5"}):
-            ns = _exec_node(_try_at(234))
+            ns = _exec_node(_try_assigning("ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S"))
         self.assertEqual(ns["ASTRA_VENUE_PROTECTION_WATCHDOG_DEBOUNCE_S"], 300.0)
 
     def test_backend_facade_missing_leaves_six_none_sentinels(self):
         # 六件套缺失时必须是 None 哨兵（调用点据此决定"跳过/降级"），而不是 AttributeError
         poisoned = {"db_manager": None, "qq_notifier": None, "ai_brain_trader": None}
         with patch.dict(sys.modules, poisoned):
-            ns = _exec_node(_try_at(254))
+            ns = _exec_node(_try_assigning("execute_batch_ai_brain_cycle"))
         for name in ("record_trade_sqlite", "notify_trade_open", "notify_trade_close",
                      "execute_batch_ai_brain_cycle", "get_latest_ai_decision",
                      "read_cycle_health"):
