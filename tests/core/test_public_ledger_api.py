@@ -20,8 +20,11 @@ class TestPublicLedgerApi(unittest.TestCase):
         self.assertIn("db_total", data)
         self.assertIsInstance(data["trades"], list)
         self.assertEqual(data["total"], len(data["trades"]))
-        # 不应受常规仪表盘 60 笔硬截断限制
-        self.assertGreaterEqual(data["total"], 60)
+        self.assertLessEqual(
+            data["closed_count"] + data["holding_count"], data["total"])
+        # 本机历史不足 60 笔时也应可测；历史超过 60 时才验证没有旧切片上限。
+        if data["db_total"] > 60:
+            self.assertGreater(data["total"], 60)
         self.assertGreaterEqual(data["db_total"], 0)
 
     def test_public_ledger_all_time_parameter(self):
