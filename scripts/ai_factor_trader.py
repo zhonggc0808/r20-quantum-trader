@@ -671,8 +671,7 @@ def clean_stale_open_orders(keep_ord_ids: Optional[set] = None) -> Tuple[bool, s
         current_environment=current_environment,
         load_instruments=load_instruments,
         okx_rest=okx_rest,
-        venue_registry=venue_registry,
-        data_dir=DATA_DIR)
+        venue_registry=venue_registry)
 
 # =============================================================================
 # US-006 重启接管存量挂单——周期级挂单对账

@@ -73,7 +73,7 @@ class AccountScopeTests(unittest.TestCase):
 
         该变量由 `tests/config_sandbox.isolate_config` 设置，也被独立部署用来
         迁移 data 目录；factor_library / sync_full_ledger / self_improvement_engine /
-        trader.order_lease / trader.position_exit / news_sentiment_harvester 都遵守它。
+        trader.position_exit / news_sentiment_harvester 都遵守它。
         围栏此前直读 `ROOT/'data'`（不可重定向的模块级常量），于是沙箱内也去读
         生产 scope —— 这是那 65 个用例的真正死因。
         """

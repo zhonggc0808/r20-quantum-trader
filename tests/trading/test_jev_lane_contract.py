@@ -601,7 +601,7 @@ class IndependentActionStillDerivedFromVotesTest(_Harness):
                          "审计不适用不得覆盖独立通道的潜在机会关系")
 
 
-class IndependentMomentumGateTest(_Harness):
+class IndependentMomentumEvidenceTest(_Harness):
     probabilities = {
         "edge_present": 0.95,
         "execution_ready": 0.95,
@@ -610,7 +610,7 @@ class IndependentMomentumGateTest(_Harness):
         "would_wait": 0.20,
     }
 
-    def test_bear_acceleration_preserves_raw_long_but_effective_action_waits(self):
+    def test_bear_acceleration_does_not_rewrite_independent_long(self):
         review = self.run_review(
             {"ETH-USDT-SWAP": "WAIT"},
             package_overrides={"ETH-USDT-SWAP": {
@@ -627,15 +627,13 @@ class IndependentMomentumGateTest(_Harness):
         )
         row = review["instrument_reviews"][0]
         self.assertEqual(row["raw_suggested_action"], "BUY_LONG")
-        self.assertEqual(row["suggested_action"], "WAIT")
-        self.assertEqual(row["jev_action_status"], "code_hard_gate_reject")
-        self.assertFalse(row["momentum_gate_passed"])
-        self.assertEqual(row["momentum_gate_rejection_code"],
-                         "bear_acceleration_blocks_long")
-        self.assertEqual(row["jev_enforcement_decision"], "HARD_VETO")
+        self.assertEqual(row["suggested_action"], "BUY_LONG")
+        self.assertEqual(row["jev_action_status"], "accepted")
+        self.assertNotIn("momentum_gate_passed", row)
+        self.assertNotIn("momentum_gate_rejection_code", row)
         self.assertFalse(row["jev_enforcement_affects_execution"])
 
-    def test_bull_acceleration_preserves_raw_short_but_effective_action_waits(self):
+    def test_bull_acceleration_does_not_rewrite_independent_short(self):
         self.probabilities = {
             **self.probabilities,
             "would_buy_long": 0.05,
@@ -657,9 +655,9 @@ class IndependentMomentumGateTest(_Harness):
         )
         row = review["instrument_reviews"][0]
         self.assertEqual(row["raw_suggested_action"], "SELL_SHORT")
-        self.assertEqual(row["suggested_action"], "WAIT")
-        self.assertEqual(row["momentum_gate_rejection_code"],
-                         "bull_acceleration_blocks_short")
+        self.assertEqual(row["suggested_action"], "SELL_SHORT")
+        self.assertEqual(row["jev_action_status"], "accepted")
+        self.assertNotIn("momentum_gate_rejection_code", row)
 
 
 class IndependentVoteScaleGuardTest(unittest.TestCase):

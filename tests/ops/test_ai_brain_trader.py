@@ -42,6 +42,17 @@ def _find_node(pred):
     raise AssertionError("未找到目标 AST 节点")
 
 
+def _find_import_try(module_name, imported_name):
+    return _find_node(
+        lambda node: isinstance(node, ast.Try) and any(
+            isinstance(child, ast.ImportFrom)
+            and child.module == module_name
+            and any(alias.name == imported_name for alias in child.names)
+            for child in node.body
+        )
+    )
+
+
 def _exec_node(node):
     """按**真实文件路径**编译执行单个 AST 节点，使命中行号归属到本模块。"""
     module = ast.Module(body=[node], type_ignores=[])
@@ -55,20 +66,20 @@ class ImportFallbackTests(unittest.TestCase):
     """三处模块级导入兜底：兜底分支必须真的产出可用对象。"""
 
     def test_standalone_settings_is_none_when_config_import_fails(self):
-        node = _find_node(lambda n: isinstance(n, ast.Try) and n.lineno == 57)
+        node = _find_import_try("astra_backend.config", "settings")
         with patch.dict(sys.modules, {"astra_backend.config": None}):
             ns = _exec_node(node)
         self.assertIn("standalone_settings", ns)
         self.assertIsNone(ns["standalone_settings"])
 
     def test_version_falls_back_when_version_import_raises(self):
-        node = _find_node(lambda n: isinstance(n, ast.Try) and n.lineno == 62)
+        node = _find_import_try("astra_backend.version", "__version__")
         with patch.dict(sys.modules, {"astra_backend.version": None}):
             ns = _exec_node(node)
         self.assertEqual(ns["__version__"], "7.6.0")
 
     def test_canonical_base_fallback_chain_strips_usdt_markers(self):
-        node = _find_node(lambda n: isinstance(n, ast.Try) and n.lineno == 186)
+        node = _find_import_try("astra_backend.exchanges.base", "canonical_base")
         with patch.dict(sys.modules, {"astra_backend.exchanges.base": None}):
             ns = _exec_node(node)
         fn = ns["_canonical_base_name"]
@@ -134,7 +145,8 @@ class ThinShellInjectionTests(unittest.TestCase):
             seen["indicator"] = fetch_single_indicator
             return {"ok": True}
 
-        with patch.object(abt, "_fetch_single_instrument_package", fake):
+        with patch.object(abt, "_fetch_single_instrument_package", fake), \
+             patch.object(abt, "enrich_brain_package", lambda package: package):
             self.assertEqual(abt.fetch_single_instrument_package({"instId": "X"}), {"ok": True})
         self.assertEqual(seen["item"], {"instId": "X"})
         self.assertIs(seen["candles"], abt.fetch_candles)
@@ -346,6 +358,9 @@ class ExecuteBatchCycleTests(unittest.TestCase):
             self.calls["dispatch"] = kw
             return {"BTC-USDT-SWAP": {}}
 
+        def _jev(*args, **kw):
+            self.calls["jev"] = (args, kw)
+
         self._patch("get_cpa_client_config", lambda: ("https://api.example", "KEY"))
         self._patch("TARGET_INSTRUMENTS", [{"instId": "BTC-USDT-SWAP"}])
         self._patch("capture_policy_snapshot",
@@ -364,6 +379,7 @@ class ExecuteBatchCycleTests(unittest.TestCase):
                                   "high", lambda *a, **k: {"raw": True}, "model-x", 30))
         self._patch("ModelCallTelemetry", _telemetry)
         self._patch("dispatch_llm_and_persist_decisions", _dispatch)
+        self._patch("_schedule_jev_shadow_review", _jev)
 
     def test_missing_api_key_returns_none_and_records_failure(self):
         health = []
@@ -411,6 +427,56 @@ class ExecuteBatchCycleTests(unittest.TestCase):
         # 各快照步骤都被调用过
         for key in ("xv", "fl", "calc", "snap"):
             self.assertIn(key, self.calls)
+        self.assertIn("jev", self.calls)
+
+    def test_jev_background_submission_uses_isolated_snapshots(self):
+        captured = {}
+
+        class FakeFuture:
+            def result(self):
+                return None
+
+            def add_done_callback(self, callback):
+                callback(self)
+
+        class FakeExecutor:
+            def submit(self, function, *args, **kwargs):
+                captured["function"] = function
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                return FakeFuture()
+
+        cache = {"BTC-USDT-SWAP": {"decision": {"action": "BUY_LONG"}}}
+        packages = [{"instId": "BTC-USDT-SWAP", "price": 100.0}]
+        positions = [{"instId": "BTC-USDT-SWAP", "pos": 1.0}]
+        management = [{"instId": "BTC-USDT-SWAP", "action": "HOLD"}]
+        pending = [{"ordId": "7"}]
+        factors = [{"instId": "BTC-USDT-SWAP", "score": 1.0}]
+
+        with patch.object(abt, "_JEV_SHADOW_EXECUTOR", FakeExecutor()):
+            future = abt._schedule_jev_shadow_review(
+                cache, packages, "2026-09-28 12:00:00",
+                active_positions_detail=positions,
+                position_management=management,
+                usdt_available=1000.0,
+                pending_orders_detail=pending,
+                trader_factors=factors,
+            )
+
+        self.assertIsNotNone(future)
+        self.assertIs(captured["function"], abt._run_jev_shadow_review)
+        cache.clear()
+        packages.clear()
+        positions.clear()
+        management.clear()
+        pending.clear()
+        factors.clear()
+        self.assertIn("BTC-USDT-SWAP", captured["args"][0])
+        self.assertEqual(captured["args"][1][0]["price"], 100.0)
+        self.assertEqual(captured["kwargs"]["active_positions_detail"][0]["pos"], 1.0)
+        self.assertEqual(captured["kwargs"]["position_management"][0]["action"], "HOLD")
+        self.assertEqual(captured["kwargs"]["pending_orders_detail"][0]["ordId"], "7")
+        self.assertEqual(captured["kwargs"]["trader_factors"][0]["score"], 1.0)
 
     def test_smart_money_fills_only_na_placeholders(self):
         self._wire_common([{"instId": "BTC-USDT-SWAP", "ccy": "BTC", "price": 50.0,

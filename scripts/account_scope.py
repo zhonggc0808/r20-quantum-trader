@@ -17,7 +17,7 @@ def runtime_data_dir(default):
 
     ``ASTRA_DATA_DIR`` always wins. Six other modules already honour it —
     ``factor_library`` / ``news_sentiment_harvester`` / ``sync_full_ledger`` /
-    ``self_improvement_engine`` / ``trader.order_lease`` / ``trader.position_exit``
+    ``self_improvement_engine`` / ``trader.position_exit``
     — and ``tests/config_sandbox.isolate_config`` sets it so that both in-process
     code *and spawned subprocesses* stop touching production ``data/``.
 

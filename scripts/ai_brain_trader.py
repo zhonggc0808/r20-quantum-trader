@@ -46,6 +46,7 @@ from risk_constants import (
 )
 import json
 import hashlib
+import copy
 import time
 import datetime
 import urllib.request
@@ -58,6 +59,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 ENTRY_ACTIONS = {"BUY_LONG", "SELL_SHORT"}
 POSITION_ACTIONS = {"HOLD", "CLOSE_MARKET", "UPDATE_SL"}
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_JEV_SHADOW_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="jev-shadow")
 
 try:
     from astra_backend.config import settings as standalone_settings
@@ -83,8 +87,6 @@ from scripts.direction_observation import (
     direction_layers,
     enrich_brain_package,
 )
-from scripts.trader.order_lease import record_keep, remove_lease
-from scripts.trader.momentum_gate import evaluate_directional_momentum_gate
 # 结构优化阶段4·B3 第二块：跨所采集/健康度/提示词组装已搬入 scripts/brain/xvenue.py。
 # 依赖面较宽（适配器缝、safe_float、VENUE_HEALTH_FILE、atomic_write_json、_XV_HEALTH），
 # 全部走**调用期注入**，理由见该模块 docstring 与 astra_backend/README.md §5。
@@ -841,10 +843,9 @@ def fetch_pending_orders_list() -> Optional[List[Dict[str, Any]]]:
 
 
 def execute_brain_pending_cancels(pending_mgmt_list: List[Any]) -> List[Dict[str, Any]]:
-    """执行逐笔 KEEP/CANCEL，并维护 20 分钟 AI 挂单租约。
+    """执行 AI 决策的 CANCEL 清单（V5 直签 REST，US-003）。
 
-    KEEP 只刷新有限租约，不是永久豁免；CANCEL 仅在交易所确认成功后清理租约。
-    单笔失败不影响其余订单，且失败的 KEEP 不会获得隐式保留权。
+    仅当撤单真实成功才打印成功；单笔失败继续处理其余项，并返回审计日志。
     """
     log: List[Dict[str, Any]] = []
     for p_order in pending_mgmt_list or []:
@@ -854,35 +855,14 @@ def execute_brain_pending_cancels(pending_mgmt_list: List[Any]) -> List[Dict[str
         p_ord_id = str(p_order.get("ordId", ""))
         p_inst_id = str(p_order.get("instId", ""))
         p_reason = str(p_order.get("reason", "模型指示撤销该挂单"))
-        if p_act == "KEEP" and p_ord_id and p_inst_id:
-            try:
-                lease = record_keep(p_ord_id, p_inst_id, data_dir=DATA_DIR)
-                print(f"[AI Brain Batch] AI确认维持挂单20分钟: {p_inst_id} "
-                      f"(ordId={p_ord_id}, lease_until={lease['lease_until']}, 原因={p_reason})")
-                log.append({"ok": True, "action": "KEEP", "instId": p_inst_id,
-                            "ordId": p_ord_id, "reason": p_reason,
-                            "lease_until": lease["lease_until"]})
-            except Exception as exc:
-                print(f"[AI Brain Batch] KEEP租约写入失败（按无租约处理）: "
-                      f"{p_inst_id} ordId={p_ord_id}: {exc}")
-                log.append({"ok": False, "action": "KEEP", "instId": p_inst_id,
-                            "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
-            continue
         if p_act == "CANCEL" and p_ord_id and p_inst_id:
             try:
                 okx_rest.cancel_order(p_inst_id, p_ord_id)
-                try:
-                    remove_lease(p_ord_id, data_dir=DATA_DIR)
-                except Exception as lease_exc:
-                    print(f"[AI Brain Batch] warn 撤单成功但租约清理失败: "
-                          f"{p_inst_id} ordId={p_ord_id}: {lease_exc}")
                 print(f"[AI Brain Batch] 🛑 AI自主撤回失效/过时限价单: {p_inst_id} (ordId={p_ord_id}, 原因={p_reason})")
-                log.append({"ok": True, "action": "CANCEL", "instId": p_inst_id,
-                            "ordId": p_ord_id, "reason": p_reason})
+                log.append({"ok": True, "instId": p_inst_id, "ordId": p_ord_id, "reason": p_reason})
             except Exception as exc:
                 print(f"[AI Brain Batch] ⚠️ 撤单失败（直签 REST fail-closed，不做假成功，待下一周期重试）: {p_inst_id} ordId={p_ord_id}: {exc}")
-                log.append({"ok": False, "action": "CANCEL", "instId": p_inst_id,
-                            "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
+                log.append({"ok": False, "instId": p_inst_id, "ordId": p_ord_id, "reason": p_reason, "error": str(exc)})
     return log
 
 
@@ -3411,12 +3391,6 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         # （方案 §5.1 本就把它定位为「解释维度和门槛」，先做前者）。
 
         raw_suggested_action = action
-        momentum_passed, momentum_code, momentum_reason, momentum_evidence = (
-            evaluate_directional_momentum_gate(proposal, raw_suggested_action)
-        )
-        if not momentum_passed:
-            action = "WAIT"
-            action_status = "code_hard_gate_reject"
 
         # Mirror the question-side gate: a WAIT proposal has no audit answers, so
         # every flag would be "missing" and the verdict would be a meaningless
@@ -3481,7 +3455,7 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             audit=audit,
             enforcement=review["enforcement_mode"],
             entry_mode=str(proposal.get("entry_mode") or "initial"),
-            hard_gates_passed=momentum_passed,
+            hard_gates_passed=True,
             hard_veto_code_only=review.get("hard_veto_code_only", True),
             veto_wait_min_confidence=veto_wait_min_confidence,
             veto_min_margin=veto_min_margin,
@@ -3523,10 +3497,6 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
             "jev_raw_max_vote": vote_result.get("raw_max_vote", -1.0),
             "jev_vote_sum": vote_result.get("vote_sum", 0.0),
             "jev_action_status": action_status,
-            "momentum_gate_passed": momentum_passed,
-            "momentum_gate_rejection_code": momentum_code,
-            "momentum_gate_rejection_reason": momentum_reason,
-            "momentum_gate_evidence": momentum_evidence,
             "jev_confidence_threshold": vote_result.get("confidence_threshold", min_confidence),
             "quote_source": "okx",
             "audit_proposal_complete": audit_complete,
@@ -3822,6 +3792,47 @@ def _run_jev_shadow_review(standard_cache: Dict[str, Any], packages: List[Dict[s
         print(f"[AI Brain Jev Shadow] warn 评估台账落盘失败（不影响执行）: {exc}")
 
 
+def _schedule_jev_shadow_review(
+    standard_cache: Dict[str, Any],
+    packages: List[Dict[str, Any]],
+    time_str: str,
+    *,
+    active_positions_detail: Optional[List[Dict[str, Any]]] = None,
+    position_management: Optional[List[Dict[str, Any]]] = None,
+    usdt_available: Optional[float] = None,
+    pending_orders_detail: Optional[List[Dict[str, Any]]] = None,
+    trader_factors: Optional[List[Dict[str, Any]]] = None,
+):
+    """Queue an isolated Jev review without delaying the live decision path."""
+    try:
+        args = (
+            copy.deepcopy(standard_cache),
+            copy.deepcopy(packages),
+            str(time_str),
+        )
+        kwargs = {
+            "active_positions_detail": copy.deepcopy(active_positions_detail),
+            "position_management": copy.deepcopy(position_management),
+            "usdt_available": usdt_available,
+            "pending_orders_detail": copy.deepcopy(pending_orders_detail),
+            "trader_factors": copy.deepcopy(trader_factors),
+        }
+        future = _JEV_SHADOW_EXECUTOR.submit(
+            _run_jev_shadow_review, *args, **kwargs)
+    except Exception as exc:
+        print(f"[AI Brain Jev Shadow] warn 后台复核提交失败（不影响执行）: {exc}")
+        return None
+
+    def _log_failure(done_future) -> None:
+        try:
+            done_future.result()
+        except Exception as exc:
+            print(f"[AI Brain Jev Shadow] warn 后台复核异常（不影响执行）: {exc}")
+
+    future.add_done_callback(_log_failure)
+    return future
+
+
 def execute_batch_ai_brain_cycle(
     pos_summary: str = "[MISSING_CONTEXT:account_positions]",
     active_positions_detail: List[Dict[str, Any]] = None,
@@ -3984,7 +3995,7 @@ def execute_batch_ai_brain_cycle(
                 position_management = _management_payload["instructions"]
         except Exception as _management_exc:
             print(f"[AI Brain Jev Shadow] warn 无法读取本轮持仓管理指令: {_management_exc}")
-        _run_jev_shadow_review(
+        _schedule_jev_shadow_review(
             result,
             packages,
             time_str,

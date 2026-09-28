@@ -275,9 +275,7 @@ def construct_full_market_prompt(packages: List[Dict[str, Any]], pos_summary: st
      • 若出现【1H 结构破位 / 动能加速度严重逆转 / 聪明钱反向出逃】等真实趋势逆转信号且置信度 ≥ 85%，果断输出 CLOSE_MARKET 提前斩仓止损，杜绝死等硬止损；
      • 若底仓浮盈已超过 1.2x 1H ATR 且需锁定利润，输出 UPDATE_SL 并确保新止损与现价保留 0.7x 1H ATR 安全缓冲，严禁贴脸移动止损。
 2. 【在途限价挂单生命周期审查与裁决 (Pending Orders Management)】：
-   - 必须逐笔覆盖【当前在途挂单列表】中的每一个 ordId，且每笔只能输出一次 KEEP 或 CANCEL；遗漏某笔不等于 KEEP。
-   - 若挂单价格已大幅偏离最新盘口、或者行情动能/突发要闻已转变导致原挂单计划失效，输出 CANCEL 立即撤单；若原计划仍然有效且价格合适，输出 KEEP。
-   - 标的级 WAIT、持仓 HOLD 或未提及某挂单都不能替代该笔挂单的 KEEP/CANCEL 裁决。KEEP 只授予 20 分钟有限租约，不能永久保留；达到 60 分钟绝对上限的订单必须撤销，AI 不得豁免。
+   - 仔细审查上述在途未成交挂单：若挂单价格已大幅偏离最新盘口、或者行情动能/突发要闻已转变导致原挂单计划失效，必须在 pending_orders_management 中为该挂单输出 CANCEL 立即撤单指令，防止挂单成交在不利价格；若原计划仍然有效且价格合适，输出 KEEP 维持挂单。
 3. 【多空开仓与顺势浮盈加仓全权裁决 (Opening & Pyramiding)】：
    - 【首发开仓】：自主判断未持仓品种是否具备确定性爆发机会，结合最新资讯、多周期形态与筹码，决定多空方向 (action: BUY_LONG / SELL_SHORT / WAIT)；
    - 【顺势浮盈金字塔加仓申请】：已有多仓仅可输出同向 BUY_LONG，已有空仓仅可输出同向 SELL_SHORT；这只是加仓申请，执行层仍将复核底仓 ROI/保本、最多{max_scale_in_count}次、累计保证金≤【本周期风险预算】单标的上限、置信度≥{min_scale_in_confidence:g}%、加速度与延续/击穿概率门禁。任何不确定均输出 WAIT；
