@@ -79,15 +79,5 @@ def evaluate_directional_momentum_gate(
                 "方向动量门控：多头处于加速阶段，禁止逆势开空。",
                 evidence,
             )
-        if (
-            acceleration is not None and acceleration > 0.0
-            and power is not None and power > 0.0
-        ):
-            return (
-                False,
-                "positive_momentum_blocks_short",
-                "方向动量门控：正加速度与正动能同时成立，禁止开空。",
-                evidence,
-            )
 
     return True, "", "", evidence

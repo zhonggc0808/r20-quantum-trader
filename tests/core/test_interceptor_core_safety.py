@@ -142,7 +142,7 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
         self.assertEqual(ctx["_decision_trace"]["outcome_source"], "accepted_entry")
         self.assertEqual(ctx["_decision_trace"]["rejection_code"], "")
 
-    def test_directional_momentum_gate_rejects_all_four_countertrend_cases(self):
+    def test_directional_momentum_gate_rejects_strong_countertrend_cases(self):
         im.save_config({"pipeline_order": [], "enabled": {}})
         ctx = {"active_inst_ids": set(), "active_position_sides": {}}
         long_decision = {
@@ -167,10 +167,6 @@ class CoreRiskAndInterceptorTests(unittest.TestCase):
             }, "breakdown_dominance_blocks_long"),
             (short_decision, {"regime": "BULL_ACCELERATING"},
              "bull_acceleration_blocks_short"),
-            (short_decision, {
-                "regime": "MIXED_TRANSITION", "acceleration": 0.05,
-                "power": 0.01, "power_regime": "STEADY_FLUX",
-            }, "positive_momentum_blocks_short"),
         ]
 
         for decision, calculus, rejection_code in cases:
@@ -289,6 +285,16 @@ class DirectionalMomentumGateTests(unittest.TestCase):
             package, "SELL_SHORT")
         self.assertTrue(passed)
         self.assertEqual(code, "")
+
+    def test_weak_positive_momentum_does_not_block_a_short(self):
+        package = {"calculus": {
+            "regime": "MIXED_TRANSITION", "acceleration": 0.05,
+            "power": 0.01, "power_regime": "STEADY_FLUX",
+        }}
+        passed, code, reason, _evidence = evaluate_directional_momentum_gate(
+            package, "SELL_SHORT")
+        self.assertTrue(passed)
+        self.assertEqual((code, reason), ("", ""))
 
 
 if __name__ == "__main__":
