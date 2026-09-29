@@ -20,16 +20,11 @@ def _publish(event_type: str, title: str, message: str, payload: dict | None = N
 
 
 def _format_symbol(inst: str, venue: str = "okx") -> str:
-    """Intelligently format symbol according to exchange conventions without hardcoding -SWAP."""
+    """Format the OKX symbol without hardcoding -SWAP."""
     raw = str(inst or "").strip()
     if not raw:
         return "UNKNOWN-SWAP"
     clean = raw.replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "").replace("_USDT", "").upper()
-    v = str(venue or "okx").lower()
-    if "binance" in v:
-        return f"{clean}USDT 永续"
-    elif "gate" in v:
-        return f"{clean}_USDT 永续"
     return f"{clean}-USDT-SWAP"
 
 
@@ -51,7 +46,7 @@ def send_qq_message(text: str) -> bool:
 def notify_trade_open(
     inst: str,
     side: str,
-    sz: int | float,
+    sz: int | float | None,
     px: float,
     strategy: str,
     reason: str,
@@ -97,16 +92,17 @@ def notify_trade_open(
         header_lines.append(f"👥 投委会协同：{' · '.join(c_parts)}")
 
     # Position & Execution details
-    pos_details = [f"{direction_emoji}（{sz} 张 | {leverage}x 杠杆）"]
+    # ⚠️ 2026-09-28 用户拍板：全系统**不再用「张」**表达仓位。各所数量单位不同，
+    # 且各币种的合约面值算法都不一样 ⇒ 张数既不能
+    # 跨场所比、也不能跨币种比。统一只说**保证金 + 杠杆**（+ 名义额）：
+    # 钱是唯一跨场所、跨币种可比的量，也正是交易员判断"这笔占了多少"的依据。
+    # 取不到保证金时**不回落张数**（旧文案把 199.9 XRP 说成 26.87 张、49.9U 说成 6.72U）。
+    pos_details = [f"{direction_emoji}（{leverage}x 杠杆）"]
     if margin_usdt and margin_usdt > 0:
         pos_details.append(f"保证金 {margin_usdt:.2f} U")
-    elif sz and px > 0:
-        # Auto estimate margin if not provided
-        est_notional = float(sz) * px
-        pos_details.append(f"预估保证金 ~{est_notional / max(1, leverage):.2f} U")
 
     if notional_usdt and notional_usdt > 0:
-        pos_details.append(f"货值 ~{notional_usdt:.1f} U")
+        pos_details.append(f"名义敞口 ~{notional_usdt:.1f} U")
 
     exec_lines = [
         f"🧭 决策方向：{' | '.join(pos_details)}",
@@ -171,6 +167,8 @@ def notify_trade_open(
             "instrument": inst,
             "venue": venue,
             "side": side,
+            # `size` 仅为**审计/对账**留档（各所原生数量，单位互不相同），
+            # 绝不参与展示 —— 展示一律用下面的保证金/名义敞口。见 `money_size_text`。
             "size": sz,
             "price": px,
             "strategy": strategy,

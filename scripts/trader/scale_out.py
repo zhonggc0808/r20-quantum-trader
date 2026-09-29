@@ -57,10 +57,8 @@ def execute_scale_out_if_eligible(
     name = str(f.get("name", inst_id.split("-")[0]))
     cur_px = float(f.get("price", 0.0) or 0.0)
     atr = max(float(f.get("atr", 0.0) or 0.0), cur_px * 0.005)
-    # ⚠️ 单位纪律（三所持仓接管）：`ctVal`/`minSz`/尺寸精度对**外所在仓**必须取
-    # 该所自己的值 —— `f[...]` 一律来自 OKX 合约池，而币安的 `pos` 是币数
-    # （OKX 面值 100 会算错 100 倍）、Gate 是自家张数（面值 10，错 10 倍）。
-    # 持仓记录上挂的值优先；缺失时回落 OKX 口径 ⇒ OKX 路径逐位不变。
+    # ⚠️ 单位纪律：`ctVal`/`minSz`/尺寸精度优先取**持仓记录**上挂的值
+    # （`curr_pos`），缺失时才回落 `f[...]`（OKX 合约池口径）⇒ OKX 路径逐位不变。
     # 注意 `prec` 只用于**尺寸**取整（价格精度见下方 `px_prec`，仍取 `f`）。
     _pos_ct = curr_pos.get("ctVal")
     _pos_min = curr_pos.get("minSz")
@@ -72,6 +70,20 @@ def execute_scale_out_if_eligible(
     pos_sz = abs(float(curr_pos.get("pos", 0.0) or 0.0))
     if pos_sz <= 0:
         return False, "无持仓"
+
+    # ── 展示口径：一切对外文案只说**钱**（保证金 / 名义额），不说张 ──────────
+    # 用户 2026-09-28 拍板：OKX 的"张"是合约单位，且**各币种的合约面值算法都不一样**
+    # ⇒ 张数不能跨币种比，交易员无法从它判断"这笔占了我多少钱"。张数仍用于
+    # **切分计算**本身（必须），但绝不进入文案。
+    _lever = float(curr_pos.get("lever", curr_pos.get("leverage", 0.0)) or 0.0) or 1.0
+
+    def _margin_of(_sz):
+        """把原生张数换成该仓的**保证金**（U）。"""
+        return round(_sz * ct_val * cur_px / _lever, 2)
+
+    def _notional_of(_sz):
+        """把原生张数换成**名义额**（U）——各币种面值不同，这里才是可比的量。"""
+        return round(_sz * ct_val * cur_px, 2)
 
     is_long = "long" in str(curr_pos.get("side", "")).lower()
     pos_side = "long" if is_long else "short"
@@ -105,13 +117,15 @@ def execute_scale_out_if_eligible(
             t["stage_desc"] = f"持有中 (首批止盈目标 TP1: {tp1_px:g} · +{gain_pct:.1f}% · 达标平50%保本)"
         return False, "浮盈未达分批止盈门槛"
 
-    # 4. 精度与最小张数防御
-    # 若总持仓不足 2 倍 minSz，无法安全切分为两半，优雅降级
+    # 4. 精度与最小下单量防御
+    # 若总持仓不足 2 倍 minSz，无法安全切分为两半，优雅降级。
+    # 文案用**最小下单名义**表述（`minSz × 面值 × 现价`）—— 那是跨币种可比的额。
     if pos_sz < (2.0 * min_sz - 1e-12):
-        msg = f"[{name}] 持仓张数 {pos_sz:g} 低于分批切分下限 (2*minSz={2*min_sz:g})，自动降级为全仓追踪"
+        msg = (f"[{name}] 持仓名义 {_notional_of(pos_sz):.2f}U 低于分批下限"
+               f"（最小下单名义 {_notional_of(min_sz):.2f}U 的 2 倍），自动降级为全仓追踪")
         executed_actions.append(msg)
         t["scale_out_phase"] = -1  # 标记为已评估但不可切分，防止每轮重复提示
-        return False, "张数不足以切分"
+        return False, "保证金不足以切分"
 
     ratio = max(0.1, min(0.9, float(SCALE_OUT_RATIO or 0.50)))
     raw_close_sz = pos_sz * ratio
@@ -123,10 +137,12 @@ def execute_scale_out_if_eligible(
 
     remaining_sz = round(pos_sz - close_sz, prec)
     if close_sz < min_sz or remaining_sz < min_sz:
-        msg = f"[{name}] 计算平仓切片 {close_sz:g} 或剩余张数 {remaining_sz:g} 低于最小精度 {min_sz:g}，降级全仓追踪"
+        msg = (f"[{name}] 计算平仓名义 {_notional_of(close_sz):.2f}U 或剩余名义 "
+               f"{_notional_of(remaining_sz):.2f}U 低于最小下单名义 "
+               f"{_notional_of(min_sz):.2f}U，降级全仓追踪")
         executed_actions.append(msg)
         t["scale_out_phase"] = -1
-        return False, "切片张数不满足最小精度"
+        return False, "切片名义不满足最小精度"
 
     # 4. 执行定向市价平仓（带有 reduceOnly=True）
     close_side = "sell" if is_long else "buy"
@@ -151,54 +167,12 @@ def execute_scale_out_if_eligible(
         except Exception as exc:
             order_success = False
             order_detail = f"OKX分批平仓异常: {exc}"
-    elif pos_venue == "binance":
-        if venue_registry:
-            try:
-                ad = venue_registry.get_adapter(pos_venue)
-                symbol_native = inst_id.split("-")[0]
-                raw_pos = curr_pos.get("raw") if isinstance(curr_pos.get("raw"), dict) else {}
-                ps = str(curr_pos.get("positionSide") or raw_pos.get("positionSide") or "").upper()
-                if ps in ("LONG", "SHORT"):
-                    res = ad.place_order(symbol_native, close_side, close_sz, position_side=ps)
-                else:
-                    res = ad.place_order(symbol_native, close_side, close_sz, reduce_only=True)
-                order_success = True
-                order_detail = str(res)
-            except Exception as exc:
-                order_success = False
-                order_detail = f"BINANCE分批平仓异常: {exc}"
-        else:
-            order_success = False
-            order_detail = "未提供 BINANCE 适配器注册表"
-    elif pos_venue == "gate":
-        if venue_registry:
-            try:
-                ad = venue_registry.get_adapter(pos_venue)
-                symbol_native = inst_id.split("-")[0]
-                res = ad.place_order(symbol_native, close_side, close_sz, reduce_only=True)
-                order_success = True
-                order_detail = str(res)
-            except Exception as exc:
-                order_success = False
-                order_detail = f"GATE分批平仓异常: {exc}"
-        else:
-            order_success = False
-            order_detail = "未提供 GATE 适配器注册表"
     else:
-        # 多所适配器路径兜底
-        if venue_registry:
-            try:
-                ad = venue_registry.get_adapter(pos_venue)
-                symbol_native = inst_id.split("-")[0]
-                res = ad.place_order(symbol_native, close_side, close_sz, reduce_only=True)
-                order_success = True
-                order_detail = str(res)
-            except Exception as exc:
-                order_success = False
-                order_detail = f"{pos_venue.upper()}分批平仓异常: {exc}"
-        else:
-            order_success = False
-            order_detail = f"未提供 {pos_venue.upper()} 适配器注册表"
+        # 已移除场所的历史持仓：instId 与 OKX 同名，绝不能把它的
+        # instId 交给 OKX 直签接口（平的是别人的仓）。只读留痕跳过，不抛异常、不平仓。
+        executed_actions.append(
+            f"[{name}] 非 OKX 场所({pos_venue})历史持仓，只读跳过分批止盈（不下发任何交易所指令）")
+        return False, f"非 OKX 场所({pos_venue})，只读跳过"
 
     if not order_success:
         executed_actions.append(f"[{name}] ⚠️ 分批止盈市价平仓提交失败: {order_detail}")
@@ -218,15 +192,6 @@ def execute_scale_out_if_eligible(
                 okx_rest.cancel_algo_orders(old_algo_ids[:10], inst_id=inst_id)
         except Exception as cxl_exc:
             print(f"[Scale-Out] 清理 {inst_id} 旧OCO异常（由新保护单覆盖）: {cxl_exc}")
-    elif pos_venue in ("binance", "gate") and venue_registry:
-        try:
-            adapter = venue_registry.get_adapter(pos_venue)
-            if adapter and hasattr(adapter, "cancel_protective_orders"):
-                adapter.cancel_protective_orders(name)
-            elif adapter and hasattr(adapter, "cancel_all_algo_open_orders"):
-                adapter.cancel_all_algo_open_orders(symbol=adapter.native_symbol(name))
-        except Exception as cxl_exc:
-            print(f"[Scale-Out] 清理 {pos_venue.upper()} {name} 旧保护单异常: {cxl_exc}")
 
     # 6. 计算保本止损线并为剩余仓位重建云端 OCO
     breakeven_cushion = 0.0025 * entry_px
@@ -240,16 +205,6 @@ def execute_scale_out_if_eligible(
             )
         except Exception as oco_exc:
             print(f"[Scale-Out] 剩余仓位云端保护更新异常: {oco_exc}")
-    elif pos_venue in ("binance", "gate") and venue_registry:
-        try:
-            adapter = venue_registry.get_adapter(pos_venue)
-            if adapter and hasattr(adapter, "attach_protective_orders"):
-                adapter.attach_protective_orders(
-                    name, pos_side, tp_px=take_profit_px if take_profit_px > 0 else None,
-                    sl_px=breakeven_sl, contracts=remaining_sz
-                )
-        except Exception as oco_exc:
-            print(f"[Scale-Out] 外所 {pos_venue.upper()} 剩余仓位云端保护更新异常: {oco_exc}")
 
     # 7. 更新本地状态机与账本
     t["scale_out_phase"] = 1
@@ -257,13 +212,17 @@ def execute_scale_out_if_eligible(
     t["currentSz"] = remaining_sz
     t["trailingStopPx"] = breakeven_sl
     t["scale_count"] = 999  # 永久互斥锁定金字塔加仓
-    t["stage_desc"] = f"已分批止盈50% (余{remaining_sz:g}张 · 保本止损 {breakeven_sl})"
+    t["stage_desc"] = (f"已分批止盈50% (余仓保证金 ~{_margin_of(remaining_sz):.2f}U"
+                       f" · 保本止损 {breakeven_sl})")
 
     # 8. 记录平仓台账与通知
     realized_pnl = close_sz * ct_val * (cur_px - entry_px if is_long else entry_px - cur_px)
     fee_val = close_fee(close_sz, ct_val, cur_px, TAKER_FEE_RATE) if close_fee else (close_sz * ct_val * cur_px * TAKER_FEE_RATE)
 
-    msg_action = f"[{name}] 🎯 达到首批止盈门槛(+{trigger_threshold:.2f})，已市价平仓 {ratio*100:.0f}% ({close_sz:g}张)，锁定盈利 +{realized_pnl:.2f}U；余 {remaining_sz:g} 张推进至保本位 {breakeven_sl}"
+    msg_action = (f"[{name}] 🎯 达到首批止盈门槛(+{trigger_threshold:.2f})，已市价平仓 "
+                  f"{ratio*100:.0f}% (保证金 {_margin_of(close_sz):.2f}U)，锁定盈利 "
+                  f"+{realized_pnl:.2f}U；余仓保证金 ~{_margin_of(remaining_sz):.2f}U "
+                  f"推进至保本位 {breakeven_sl}")
     executed_actions.append(msg_action)
 
     if record_trade and close_trade_payload:

@@ -9,8 +9,8 @@
 
 1. **通知绝不阻断交易主流程**：`_publish` 吞掉一切异常并返回 `False` ——
    网关挂了不能让一次平仓记录丢失。
-2. **标的格式化不硬编码 `-SWAP`**：按场所约定输出（币安 `BTCUSDT 永续` /
-   Gate `BTC_USDT 永续` / OKX `BTC-USDT-SWAP`）。
+2. **标的格式化按 OKX 约定输出**（`BTC-USDT-SWAP`）：OKX-only 迁移后系统只剩
+   OKX 一个场所，`_format_symbol` 不再按场所分派（币安/Gate 约定已随其适配器删除）。
 3. **平仓状态标签四态互斥且顺序敏感**：分批止盈 → 保本 → 盈利 → 风控止损，
    `is_partial_exit` 与 `is_be` 的判定**先于** `is_win`（否则 +0.01 U 会被报成"盈利落袋"）。
 """
@@ -89,17 +89,6 @@ class FormatSymbolTests(unittest.TestCase):
     def test_an_okx_id_stays_okx_shaped(self):
         self.assertEqual(qn._format_symbol("BTC-USDT-SWAP"), "BTC-USDT-SWAP")
 
-    def test_binance_uses_the_binance_convention(self):
-        self.assertEqual(qn._format_symbol("BTC-USDT-SWAP", "binance"), "BTCUSDT 永续")
-
-    def test_gate_uses_the_gate_convention(self):
-        self.assertEqual(qn._format_symbol("BTC-USDT-SWAP", "gate"), "BTC_USDT 永续")
-
-    def test_the_venue_match_is_case_insensitive_and_substring_based(self):
-        for venue in ("BINANCE", "Binance", "binance-us"):
-            with self.subTest(venue=venue):
-                self.assertEqual(qn._format_symbol("BTC-USDT-SWAP", venue), "BTCUSDT 永续")
-
     def test_a_bare_symbol_is_normalised(self):
         for raw in ("BTC", "BTCUSDT"):
             with self.subTest(raw=raw):
@@ -164,7 +153,7 @@ class TradeOpenTests(_NotifierSandbox, unittest.TestCase):
     def test_the_venue_name_is_upper_cased_in_the_header(self):
         self._open(venue="binance")
         self.assertIn("执行交易所：BINANCE", self.call["message"])
-        self.assertIn("BTCUSDT 永续", self.call["message"])
+        self.assertIn("BTC-USDT-SWAP", self.call["message"])
 
     def test_a_policy_version_suppresses_the_strategy_line(self):
         self._open(policy_version="v7.9.2")
@@ -191,14 +180,20 @@ class TradeOpenTests(_NotifierSandbox, unittest.TestCase):
         self._open(margin_usdt=25.5)
         self.assertIn("保证金 25.50 U", self.call["message"])
 
-    def test_a_zero_margin_falls_back_to_the_estimate(self):
-        # `margin_usdt and margin_usdt > 0` ⇒ 0 是 falsy ⇒ 走预估分支
+    def test_a_zero_margin_never_fabricates_an_estimate(self):
+        """★ 没给保证金就**只说杠杆**，绝不用张数反推金额。
+
+        旧实现用 `sz × px ÷ leverage` 造「预估保证金」—— 三所数量单位不同、
+        各币种面值算法也不同，算出来的是假数（实测把 49.9U 说成 6.72U）。
+        """
         self._open(margin_usdt=0, sz=5, px=100.0, leverage=5)
-        self.assertIn("预估保证金", self.call["message"])
+        self.assertNotIn("预估保证金", self.call["message"])
+        self.assertNotIn("张", self.call["message"])
+        self.assertIn("5x 杠杆", self.call["message"])
 
     def test_the_notional_is_shown_when_positive(self):
         self._open(notional_usdt=1234.5)
-        self.assertIn("货值 ~1234.5 U", self.call["message"])
+        self.assertIn("名义敞口 ~1234.5 U", self.call["message"])
 
     def test_the_long_rr_is_auto_deduced(self):
         self._open(px=100.0, tp_px=110.0, sl_px=95.0)
