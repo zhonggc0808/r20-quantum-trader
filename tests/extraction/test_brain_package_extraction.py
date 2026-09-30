@@ -62,6 +62,8 @@ class MoveIsLosslessTest(unittest.TestCase):
     _LATENCY_START_RE = re.compile(r"^t_okx0 = time\.time\(\)$")
     _LATENCY_PUBLISH_RE = re.compile(
         r'^pkg\["okx_latency_ms"\] = max\(1, int\(round\(\(time\.time\(\) - t_okx0\) \* 1000\)\)\)$')
+    _PACKAGE_META_RE = re.compile(
+        r'^"(?:ctVal|minSz|base_sz|max_leverage|risk_per_trade_usd)": float\(item\.get\(')
 
     def _normalise(self, lines):
         """把第 137 刀与 v8.1.0 的接线**还原**成搬运时的样子，再逐行比对。
@@ -73,7 +75,9 @@ class MoveIsLosslessTest(unittest.TestCase):
         out = []
         for ln in lines:
             stripped = ln.strip()
-            if self._LATENCY_START_RE.match(stripped) or self._LATENCY_PUBLISH_RE.match(stripped):
+            if (self._LATENCY_START_RE.match(stripped)
+                    or self._LATENCY_PUBLISH_RE.match(stripped)
+                    or self._PACKAGE_META_RE.match(stripped)):
                 continue
             if self._NOTE_RE.match(stripped):
                 indent = ln[:len(ln) - len(ln.lstrip())]
@@ -121,6 +125,11 @@ class MoveIsLosslessTest(unittest.TestCase):
                    for n in ast.walk(fn) if isinstance(n, ast.Assign)]
         self.assertIn('pkg["okx_latency_ms"]', targets,
                       "okx_latency_ms 不是对 pkg 的落包赋值")
+
+    def test_execution_metadata_is_carried(self):
+        src = "\n".join(_submodule_function_lines())
+        for field in ("ctVal", "minSz", "base_sz", "max_leverage", "risk_per_trade_usd"):
+            self.assertIn(f'"{field}": float(item.get("{field}")', src)
 
     def test_submodule_takes_the_two_market_functions_as_parameters(self):
         fn = next(n for n in ast.parse(SUBMODULE.read_text(encoding="utf-8")).body

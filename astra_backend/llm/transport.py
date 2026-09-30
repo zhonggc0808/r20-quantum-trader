@@ -56,7 +56,8 @@ def _is_transient_http(code: int, body: str) -> bool:
 def _parse_llm_response(target_format: str, res_json: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
     content = ""
     reasoning_content = ""
-    usage = res_json.get("usage", {}) if isinstance(res_json, dict) else {}
+    raw_usage = res_json.get("usage", {}) if isinstance(res_json, dict) else {}
+    usage = dict(raw_usage) if isinstance(raw_usage, dict) else {}
 
     # Protocol 1: Claude Messages Response
     if target_format == "claude_messages":
@@ -88,6 +89,51 @@ def _parse_llm_response(target_format: str, res_json: Dict[str, Any]) -> Tuple[s
         msg = res_json.get("choices", [{}])[0].get("message", {})
         content = str(msg.get("content", "")).strip()
         reasoning_content = str(msg.get("reasoning_content") or "").strip()
+
+    # 规范化提取各厂商 Prompt Caching 缓存命中指标（OpenAI, DeepSeek, Claude, Gemini, Qwen）
+    #
+    # 三种形态都要认（2026-09-29 实测）：
+    #   1) Chat Completions：usage.prompt_tokens_details.cached_tokens（且**无命中时该字段整段省略**）
+    #   2) Responses：usage.input_tokens_details.cached_tokens（**始终存在**，0 或 N）—— 本仓生产
+    #      切到 /responses 后靠它把"上游说 0"与"上游什么都没说"分开；
+    #   3) Anthropic Messages：usage.cache_read_input_tokens / cache_creation_input_tokens；
+    #      DeepSeek：prompt_cache_hit_tokens；Gemini 原生：cached_content_token_count。
+    prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    input_details = usage.get("input_tokens_details", {}) if isinstance(usage.get("input_tokens_details"), dict) else {}
+    # ⚠️ 不能用 `a or b or c` 串：**显式的 0 是"上报了 0"，不是"没上报"**。
+    # Anthropic 在无命中时给的正是 `cache_read_input_tokens: 0`，用 or 会把"命中 0"
+    # 误判成"上游没上报"，于是又回到"不可判定 ≠ 0"的反面。
+    _candidates = (
+        prompt_details.get("cached_tokens") if "cached_tokens" in prompt_details else None,
+        input_details.get("cached_tokens") if "cached_tokens" in input_details else None,
+        usage.get("prompt_cache_hit_tokens"),
+        usage.get("cache_read_input_tokens"),
+        usage.get("cached_content_token_count"),
+        usage.get("cached_tokens"),
+    )
+    cached_tokens = next((value for value in _candidates if value is not None), None)
+    #: 是否**真的上报过**缓存指标：False ⇒ 上游对本响应只字未提（不可判定 ≠ 0）。
+    usage["cache_reported"] = cached_tokens is not None
+    if cached_tokens is not None:
+        try:
+            usage["cached_tokens"] = int(cached_tokens)
+        except (TypeError, ValueError):
+            pass
+    cache_creation = usage.get("cache_creation_input_tokens")
+    if cache_creation is not None:
+        try:
+            usage["cache_creation_tokens"] = int(cache_creation)
+        except (TypeError, ValueError):
+            pass
+
+    # 截断显性化：Responses 用 status/incomplete_details，Chat 用 finish_reason=length。
+    # 只做标注、不改控制流 —— 硬门禁仍是决策层的 JSON 校验。
+    if target_format == "openai_responses":
+        status = str(res_json.get("status") or "").strip().lower()
+        usage["truncated"] = bool(status and status not in ("completed", "success"))
+    else:
+        finish = str((res_json.get("choices") or [{}])[0].get("finish_reason") or "").strip().lower()
+        usage["truncated"] = finish == "length"
 
     return content, reasoning_content, usage
 
@@ -203,10 +249,13 @@ def build_request_spec(
         # Temperature handling for reasoning models vs normal models
         is_reasoning_model = (
             rtype in ("deepseek_reasoner", "standard_effort")
-            or m_lower.startswith(("o1", "o3", "o4"))
+            or m_lower.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6", "chatgpt-6"))
+            or "gpt-5" in m_lower or "gpt-6" in m_lower or "chatgpt-6" in m_lower
+            or "deepseek-v4" in m_lower or "v4.1" in m_lower
             or "reasoner" in m_lower
             or "-r1" in m_lower
             or "qwen3" in m_lower or "qwen-3" in m_lower or "qwq" in m_lower
+            or "kimi-k" in m_lower or "glm-5" in m_lower
         )
         if not is_reasoning_model:
             if temperature is not None:
@@ -216,10 +265,16 @@ def build_request_spec(
                 payload["temperature"] = temperature
 
         # Standard reasoning effort parameter (supports max, xhigh, high, medium, low, minimal, none)
-        if rtype == "standard_effort" or (rtype == "auto" and ("gemini" in m_lower or "qwen3" in m_lower or "qwen-3" in m_lower or "qwq" in m_lower or m_lower.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6")) or "gpt-5" in m_lower or "gpt-6" in m_lower)):
+        if rtype == "standard_effort" or (rtype == "auto" and (
+            "gemini" in m_lower or "qwen3" in m_lower or "qwen-3" in m_lower or "qwq" in m_lower
+            or m_lower.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6", "chatgpt-6"))
+            or "gpt-5" in m_lower or "gpt-6" in m_lower or "chatgpt-6" in m_lower
+            or "deepseek-v4" in m_lower or "v4.1" in m_lower
+            or "kimi-k" in m_lower or "glm-5" in m_lower
+        )):
             if effort in ("max", "xhigh", "high", "medium", "low", "minimal"):
                 payload["reasoning_effort"] = effort
-            elif effort == "none" and ("gemini" in m_lower or "gpt" in m_lower):
+            elif effort == "none":
                 payload["reasoning_effort"] = "none"
 
         if response_format and rtype != "deepseek_reasoner":

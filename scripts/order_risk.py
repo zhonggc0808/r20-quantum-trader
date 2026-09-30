@@ -14,9 +14,20 @@ except ImportError:  # flat import when scripts/ itself is on sys.path
 
 
 def validate_quote_geometry_and_rr_detailed(
-    action: str, entry: Any, tp: Any, sl: Any, enforce_max_rr: bool = False,
+    action: str,
+    entry: Any,
+    tp: Any,
+    sl: Any,
+    enforce_max_rr: bool = False,
+    confidence: float = 0.0,
+    min_rr_floor: float = 0.0,
 ) -> Tuple[bool, str, float, str]:
-    """Validate quote geometry and return a stable structured failure code."""
+    """Validate geometry and return a stable structured failure code.
+
+    Quotes below the configured R:R floor may pass only when confidence is at
+    least 80%, R:R remains above the absolute/minimum floor, and expected value
+    is at least +0.30R.
+    """
     raw_act = str(action or "").upper()
     if raw_act not in {"BUY_LONG", "SELL_SHORT"}:
         return False, f"不支持的开仓方向: {action}", 0.0, "unsupported_action"
@@ -61,11 +72,22 @@ def validate_quote_geometry_and_rr_detailed(
         return (False, "核心风控拦截：盈亏比计算异常",
                 0.0, "rr_calculation_error")
 
+    absolute_min_rr = 1.2
+    effective_floor = max(absolute_min_rr, float(min_rr_floor or 0.0))
     if rr < MIN_RISK_REWARD_RATIO:
-        return (False,
-                f"核心风控拦截：盈亏比不足 {MIN_RISK_REWARD_RATIO:.1f} "
-                f"(当前 R:R = {rr:.2f}:1，底线 {MIN_RISK_REWARD_RATIO:.1f}:1)",
-                rr, "rr_below_floor")
+        try:
+            conf_val = float(confidence or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            conf_val = 0.0
+        expected_val = -math.inf
+        if conf_val >= 80.0 and rr >= effective_floor:
+            p_win = conf_val / 100.0
+            expected_val = p_win * rr - (1.0 - p_win)
+        if expected_val < 0.30:
+            return (False,
+                    f"核心风控拦截：盈亏比不足 {MIN_RISK_REWARD_RATIO:.1f} "
+                    f"(当前 R:R = {rr:.2f}:1，底线 {MIN_RISK_REWARD_RATIO:.1f}:1)",
+                    rr, "rr_below_floor")
 
     if enforce_max_rr:
         current_max_rr = float(MAX_RISK_REWARD_RATIO or 0.0)
@@ -79,9 +101,22 @@ def validate_quote_geometry_and_rr_detailed(
 
 
 def validate_quote_geometry_and_rr(
-    action: str, entry: Any, tp: Any, sl: Any, enforce_max_rr: bool = False,
+    action: str,
+    entry: Any,
+    tp: Any,
+    sl: Any,
+    enforce_max_rr: bool = False,
+    confidence: float = 0.0,
+    min_rr_floor: float = 0.0,
 ) -> Tuple[bool, str, float]:
     """Backward-compatible three-value quote validation contract."""
     valid, reason, rr, _code = validate_quote_geometry_and_rr_detailed(
-        action, entry, tp, sl, enforce_max_rr=enforce_max_rr)
+        action,
+        entry,
+        tp,
+        sl,
+        enforce_max_rr=enforce_max_rr,
+        confidence=confidence,
+        min_rr_floor=min_rr_floor,
+    )
     return valid, reason, rr

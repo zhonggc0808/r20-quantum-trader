@@ -82,7 +82,8 @@ class BuildStatePayloadTest(unittest.TestCase):
 
     def test_trend_labels_come_from_boolean_flags(self):
         p = self._build(factors=[self._factor(trend_1h_bullish=True,
-                                              trend_4h_bullish=False)])
+                                              trend_4h_bullish=False,
+                                              trend_4h_bearish=True)])
         self.assertEqual(p["instruments"][0]["trend_1h"], "多头")
         self.assertEqual(p["instruments"][0]["trend_4h"], "空头")
 

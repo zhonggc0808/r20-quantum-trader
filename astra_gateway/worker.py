@@ -159,6 +159,14 @@ def run() -> None:
         launched = scheduler.tick()
         for job_name in launched:
             log(f"scheduled job={job_name}")
+        try:
+            # 前缀缓存保活：**默认 off**（2026-09-29 实测该组合下预热净亏，见
+            # astra_gateway/cache_warmer.py 的复盘）。off 模式下这里是纯函数调用、
+            # 不发任何网络请求；只有显式设置 ASTRA_CACHE_WARMUP_MODE=jit 才预热。
+            from astra_gateway.cache_warmer import check_and_warmup_cache
+            check_and_warmup_cache()
+        except Exception:
+            pass
         if time.time() >= _next_prune_at:           # 之后每 6 小时一次
             _next_prune_at = time.time() + PRUNE_INTERVAL_SECONDS
             _prune_job_history(store)

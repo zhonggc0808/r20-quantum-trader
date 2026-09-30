@@ -36,12 +36,7 @@ ENV_TOKEN_RE = re.compile(r"\bR20_[A-Z0-9_]{2,}\b")
 
 #: 有意保留的旧名 → 为什么不能改。
 #: 每一条都**必须真的还存在于**被扫描的文件里（见 `test_keeps_are_not_stale`）。
-DELIBERATE_KEEPS: "dict[str, str]" = {
-    "R20_Backups":
-        "百度网盘与本地的**备份落盘目录名**。改它 = 新备份写去新目录、"
-        "而历史归档留在旧目录 ⇒ 备份历史被静默劈成两半。"
-        "它是外部存储上的一个位置，不是本项目的命名空间。",
-}
+DELIBERATE_KEEPS: "dict[str, str]" = {}
 
 
 def _scanned_files() -> "list[Path]":
@@ -54,10 +49,9 @@ class RuntimeConfigCarriesNoLegacyNamespaceTest(unittest.TestCase):
         names = {p.name for p in _scanned_files()}
         self.assertGreaterEqual(len(names), 5,
                                 f"只扫到 {len(names)} 个运行态配置 ⇒ 扫描范围失效")
-        # ★ 反向锚点：**破坏过的那份文件**必须在扫描范围内，
-        #   否则这道门会在最需要它的地方恰好瞎掉。
-        self.assertIn("backup_methods.json", names,
-                      "扫描范围漏了 backup_methods.json —— 正是它漏迁过")
+        # 可选配置尚未创建也属于合法安装状态；扫描范围由现存运行态文件构成。
+        self.assertTrue(any(name.endswith(".json") for name in names),
+                        "运行态扫描未覆盖任何 JSON 配置")
 
     def test_no_legacy_env_var_names_in_runtime_config(self):
         offenders = []

@@ -71,7 +71,9 @@ def _legacy_intent(*, is_long, inst_id, actual_sz, ct_val, min_sz, limit_px, ai_
                      "confidence": ai_conf,
                      "ct_val": ct_val,
                      "min_sz": min_sz,
-                     "intent_id": f"{inst_id}:BUY_LONG:{int(ai_info.get('timestamp') or __import__('time').time())}"}
+                     "intent_id": f"{inst_id}:BUY_LONG:{int(ai_info.get('timestamp') or __import__('time').time())}",
+                     "decision_id": ai_info.get("decision_id", ""),
+                     "cycle_id": ai_info.get("cycle_id", "")}
         side, pos_side = "buy", "long"
     else:
         venue_ctx = {"notional_usdt": _notional,
@@ -82,7 +84,9 @@ def _legacy_intent(*, is_long, inst_id, actual_sz, ct_val, min_sz, limit_px, ai_
                      "confidence": ai_conf,   # 审计 P1-7：per-venue 置信度门禁
                      "ct_val": ct_val,
                      "min_sz": min_sz,
-                     "intent_id": f"{inst_id}:SELL_SHORT:{int(ai_info.get('timestamp') or __import__('time').time())}"}
+                     "intent_id": f"{inst_id}:SELL_SHORT:{int(ai_info.get('timestamp') or __import__('time').time())}",
+                     "decision_id": ai_info.get("decision_id", ""),
+                     "cycle_id": ai_info.get("cycle_id", "")}
         side, pos_side = "sell", "short"
     return side, pos_side, venue_ctx
 
